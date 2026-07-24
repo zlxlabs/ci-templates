@@ -48,7 +48,7 @@ jobs:
       SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
       KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner joins tailnet to reach the internal host
-      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # read-only PAT to checkout private ci-templates scripts
+      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # repo is public now; kept but unused this version, any placeholder value works
 
 # 前提:根目录 docker-compose.yml 里两个服务都必须用不可变发布变量
 # (Docker Compose v2,`docker compose config --images` 需可用才能过身份门禁),

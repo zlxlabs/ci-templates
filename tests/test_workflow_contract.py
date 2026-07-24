@@ -54,6 +54,28 @@ def test_ci_templates_checkout_uses_org_repo_path_not_legacy_personal_path():
     assert "repository: zlxlabs/ci-templates" in text
 
 
+def test_ci_templates_checkout_does_not_pass_dead_pat_token():
+    # 2026-07-24:ci-templates 迁到 org 后是 public 仓(gh api 实证 visibility=
+    # public;旧个人路径是同一 repo id 的重定向)。这一步过去带
+    # CI_TEMPLATES_PAT 去 checkout,但该 PAT 在仓库转移到 org 后已失效——带
+    # 无效 token 的请求即使对公开仓 GitHub 也回 401,git 转而要求交互输入用户名,
+    # canary 实跑(run 30094192249)直接炸在
+    # "could not read Username ... terminal prompts disabled"。公开仓 checkout
+    # 不需要任何 token,默认 github.token 就够。CI_TEMPLATES_PAT 仍保留在
+    # workflow_call 的 secrets 契约里(全舰队 caller 仍显式传它,见
+    # test_secrets_declared_explicitly_not_inherited),只是这一步不再消费它——
+    # 立即从契约摘除会打破所有 caller 的显式传递校验,留到 v2 大版本一起摘
+    # (见 docs/BACKLOG.md)。
+    text = WORKFLOW.read_text()
+    assert "token: ${{ secrets.CI_TEMPLATES_PAT }}" not in text, (
+        "the ci-templates checkout step must not pass the dead PAT token — "
+        "the repo is public now, the default github.token is enough"
+    )
+    # regression guard: dropping the token line must not turn into silently
+    # dropping the secret from the contract too — that stays a v2 decision.
+    assert "CI_TEMPLATES_PAT" in text
+
+
 def test_secrets_declared_explicitly_not_inherited():
     raw, trigger = _load()
     # strip comments — the contract is about real YAML, not prose

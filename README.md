@@ -89,7 +89,7 @@ jobs:
       SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
       KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner 临时入 tailnet 连内网目标机
-      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # 只读 PAT，拉私有 ci-templates 部署脚本
+      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # 仓库已公开，当前版本此 secret 保留但未使用，传任意占位值即可
 ```
 
 > `host` 自 D3 激活起是 **Tailscale 可达地址**（IP/MagicDNS），不再是 `~/.ssh/config` 别名 ——

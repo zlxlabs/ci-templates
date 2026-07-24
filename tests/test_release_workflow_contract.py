@@ -33,6 +33,8 @@ def test_release_workflow_pins_actions_and_has_atomic_build_gate():
     assert "push_to_acr.sh" in text
     assert "release_deploy.sh" in text
     assert "D3_RELEASE_TAG" in text
+    assert "255" in text
+    assert "ssh " in text
 
 
 def test_ci_templates_checkout_uses_org_repo_path_not_legacy_personal_path():
@@ -45,8 +47,28 @@ def test_ci_templates_checkout_uses_org_repo_path_not_legacy_personal_path():
     text = WORKFLOW.read_text()
     assert "zj1123581321" not in text, "legacy personal repo path must not reappear"
     assert "repository: zlxlabs/ci-templates" in text
-    assert "255" in text
-    assert "ssh " in text
+
+
+def test_ci_templates_checkout_does_not_pass_dead_pat_token():
+    # 2026-07-24 parity with build-deploy.yml: ci-templates is a public repo
+    # now (gh api confirms visibility=public; the legacy personal path is a
+    # redirect onto the same repo id). CI_TEMPLATES_PAT went dead when the
+    # repo moved to the org -- a request bearing an invalid token gets a 401
+    # from GitHub even for a public repo, and git falls back to an
+    # interactive username prompt, which fails non-interactively (canary run
+    # 30094192249: "could not read Username ... terminal prompts disabled").
+    # A public repo checkout needs no token at all; the default github.token
+    # is enough. CI_TEMPLATES_PAT stays declared in the workflow_call secrets
+    # contract (the whole fleet's callers still pass it explicitly, see
+    # test_release_workflow_contract_and_six_secrets) -- only this step stops
+    # consuming it. Dropping it from the contract is a v2 decision (see
+    # docs/BACKLOG.md).
+    text = WORKFLOW.read_text()
+    assert "token: ${{ secrets.CI_TEMPLATES_PAT }}" not in text, (
+        "the ci-templates checkout step must not pass the dead PAT token — "
+        "the repo is public now, the default github.token is enough"
+    )
+    assert "CI_TEMPLATES_PAT" in text
 
 
 def test_release_transfer_paths_are_run_unique_and_failure_notify_is_fail_open():

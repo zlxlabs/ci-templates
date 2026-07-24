@@ -88,7 +88,6 @@ jobs:
         with:
           repository: zlxlabs/ci-templates
           ref: ${{ inputs.ci_templates_ref }}
-          token: ${{ secrets.CI_TEMPLATES_PAT }}
           path: .ci-templates
           persist-credentials: false
 
