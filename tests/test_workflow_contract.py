@@ -337,6 +337,13 @@ def test_run_steps_do_not_directly_expand_inputs():
     # injection surface. `inputs.*` values must be routed through the step's
     # `env:` mapping and referenced as "$VAR" in the script body instead of
     # being spliced directly into `run:` text.
+    #
+    # P1-A follow-up (round 5 leftover, closed out on coordinator direction):
+    # the same text-splice hazard applies to `${{ secrets.* }}` -- the round 5
+    # fix only routed `inputs.*` out of run: text and explicitly left the 3
+    # `secrets.*` splices (ACR login, SSH key setup) in place as an accepted-
+    # risk item. This test now also guards against `${{ secrets.` regressing
+    # back into run: text.
     raw, _ = _load()
     for job_name, job in raw["jobs"].items():
         for step in job.get("steps", []):
@@ -346,6 +353,11 @@ def test_run_steps_do_not_directly_expand_inputs():
             assert "${{ inputs." not in run, (
                 f"step {step.get('name')!r} in job {job_name!r} must not expand "
                 "${{ inputs.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+            assert "${{ secrets." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ secrets.* }} directly in its run: text -- route it through "
                 "env: instead"
             )
 

@@ -139,17 +139,23 @@ jobs:
         run: echo "git_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to ACR
-        # P1-A (codex review round 5): ${{ inputs.* }} is spliced into run: text
-        # as plain text BEFORE the shell ever runs it -- a value containing a
+        # P1-A (codex review round 5, closed out on coordinator direction):
+        # ${{ inputs.* }} / ${{ secrets.* }} are spliced into run: text as
+        # plain text BEFORE the shell ever runs it -- a value containing a
         # newline would make everything after it on that line execute as a new
-        # shell command, at a point where this job already holds ACR credentials.
-        # inputs.acr_registry must go through env: and be read as "$ACR_REGISTRY".
+        # shell command, at a point where this job already holds ACR
+        # credentials. inputs.acr_registry and both ACR secrets must go
+        # through env: and be read as "$VAR". printf '%s' (not echo) avoids
+        # appending a trailing newline to the password piped into
+        # `docker login --password-stdin`.
         env:
           ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
+          printf '%s' "$ACR_PASSWORD" | docker login \
             "$ACR_REGISTRY" \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+            -u "$ACR_USERNAME" --password-stdin
 
       - name: Build & push immutable image
         env:
@@ -168,11 +174,18 @@ jobs:
           authkey: ${{ secrets.TS_AUTHKEY }}
 
       - name: Set up SSH
+        # P1-A (codex review round 5, closed out on coordinator direction):
+        # same run:-text-splice hazard as "Log in to ACR" above. Matches the
+        # release lane's "Set up SSH" step (build-deploy-release.yml) exactly.
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_DEPLOY_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy over SSH (flock + health probe + auto-rollback)

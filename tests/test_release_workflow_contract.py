@@ -233,6 +233,11 @@ def test_run_steps_do_not_directly_expand_inputs():
     # this point in the job the runner already holds ACR/SSH credentials.
     # `inputs.*` values must be routed through the step's `env:` mapping and
     # referenced as "$VAR" instead of being spliced directly into run: text.
+    #
+    # This lane was already clean of `${{ secrets. }}` splices in run: text
+    # (secrets go through env: throughout) -- the assertion below is a
+    # regression guard added for parity with build-deploy.yml's equivalent
+    # test, not a fix.
     raw, _ = load()
     for job_name, job in raw["jobs"].items():
         for step in job.get("steps", []):
@@ -242,6 +247,11 @@ def test_run_steps_do_not_directly_expand_inputs():
             assert "${{ inputs." not in run, (
                 f"step {step.get('name')!r} in job {job_name!r} must not expand "
                 "${{ inputs.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+            assert "${{ secrets." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ secrets.* }} directly in its run: text -- route it through "
                 "env: instead"
             )
 
