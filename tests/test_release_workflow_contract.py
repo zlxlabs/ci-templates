@@ -186,6 +186,24 @@ def test_release_checkouts_do_not_persist_credentials_and_ci_templates_leaves_bu
     )
 
 
+def test_rc3_recheck_cat_escapes_deploy_dir():
+    # P1-C (codex review) parity with build-deploy.yml: the baseline
+    # (pre_good) and recheck (remote_good) `ssh ... "cat '${DEPLOY_DIR}/...'"`
+    # calls interpolate DEPLOY_DIR raw inside single quotes. Unlike this
+    # lane's main deploy command (already `printf %q`-escaped end to end),
+    # these two recheck calls were added in a later round and missed it — a
+    # DEPLOY_DIR containing a single quote breaks the remote shell's quoting.
+    text = WORKFLOW.read_text()
+    assert "cat '${DEPLOY_DIR}/" not in text, (
+        "recheck cat calls must not interpolate DEPLOY_DIR raw inside single "
+        "quotes — %q-escape it first, matching the main deploy command's style"
+    )
+    assert text.count("cat ${_qdir}/.deploy-state/release/last_good_sha") == 2, (
+        "both the pre_good baseline and remote_good recheck cat calls must use "
+        "the %q-escaped DEPLOY_DIR"
+    )
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""

@@ -302,3 +302,25 @@ def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_cont
     assert idx_mv < idx_build_push, (
         "ci-templates must be relocated before the build step references its scripts"
     )
+
+
+def test_rc3_recheck_cat_escapes_deploy_dir():
+    # P1-C (codex review): the rc=3 recheck's two `ssh ... "cat '${DEPLOY_DIR}/...'"`
+    # calls (pre_good baseline + remote_good recheck) interpolate DEPLOY_DIR
+    # directly inside single quotes in a string built on the runner and handed
+    # to ssh as the remote command. A DEPLOY_DIR containing a single quote
+    # would break out of that quoting on the remote shell — truncating the
+    # path at best, command injection at worst. The release lane's main
+    # deploy command already builds its remote command with `printf %q`; the
+    # two recheck cat calls here must follow the same discipline instead of
+    # raw ${DEPLOY_DIR} interpolation.
+    text = WORKFLOW.read_text()
+    assert "cat '${DEPLOY_DIR}/" not in text, (
+        "recheck cat calls must not interpolate DEPLOY_DIR raw inside single "
+        "quotes — %q-escape it first"
+    )
+    assert text.count("%q") >= 1, "DEPLOY_DIR must be %q-escaped before use in the recheck cat calls"
+    assert text.count("cat ${_qdir}/.deploy-state/last_good_tag") == 2, (
+        "both the pre_good baseline and remote_good recheck cat calls must use "
+        "the %q-escaped DEPLOY_DIR"
+    )

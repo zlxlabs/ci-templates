@@ -776,6 +776,65 @@ exit 0
     assert run(env).returncode == 0
 
 
+def test_hup_during_new_compose_rolls_back_and_releases_lock(tmp_path):
+    # P1-D: OpenSSH delivers SIGHUP (not INT/TERM) to the remote command's
+    # process group when the SSH transport drops mid-run. Before this fix,
+    # only INT/TERM were trapped into the pending-signal -> rollback path, so
+    # a dropped SSH connection during the critical section (after compose up,
+    # before promote) would hit bash's default disposition for HUP
+    # (terminate immediately, no EXIT trap, no rollback) and leave the host on
+    # an unhealthy, unpromoted release. HUP must walk the exact same
+    # check_pending()/rollback path as TERM.
+    #
+    # This is a copy of test_term_during_new_compose_rolls_back_and_releases_lock
+    # with SIGHUP substituted for SIGTERM, plus an explicit exit-code check:
+    # a *trapped* signal drives the script through its normal `exit 130` in
+    # do_release() (a positive, WIFEXITED status), whereas an *untrapped*
+    # fatal signal has the kernel kill the process directly (Python reports
+    # that as a negative return code, -SIGHUP). That distinction holds
+    # regardless of exactly how far the race got before the signal landed,
+    # unlike the compose-line-count/marker checks below (kept for parity with
+    # the TERM test, but an orphaned child can still finish those on its own
+    # even when the parent was killed outright).
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    before = (state / "last_good_release").read_text()
+    log.write_text("")
+    marker = tmp_path / "compose.done"
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = compose ]; then sleep 0.25; touch "{marker}"; fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 3
+    while time.time() < deadline and "compose" not in log.read_text():
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGHUP)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert proc.returncode == 130, (
+        "HUP must drive the script through its normal pending-signal exit "
+        f"(rc=130), not an untrapped kill (negative rc): got {proc.returncode}; "
+        + stdout + stderr
+    )
+    lines = log.read_text().splitlines()
+    assert sum(line.startswith("compose ") for line in lines) >= 2
+    assert marker.exists(), "rollback compose must finish despite HUP"
+    assert (state / "last_good_release").read_text() == before
+    assert not list(state.glob(".release-*.release"))
+    # The lock is not leaked by the signal handler.
+    assert run(env).returncode == 0
+
+
 def test_term_during_pull_does_not_start_new_compose(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0

@@ -227,10 +227,16 @@ jobs:
           # $STATE_DIR/last_good_sha where STATE_DIR=${DEPLOY_DIR}/.deploy-state/release)
           # rather than the canonical last_good_release file, since promote() keeps
           # it in sync and a bare SHA is all this comparison needs.
+          # DEPLOY_DIR is interpolated into a remote shell command below; a
+          # value containing a single quote would break out of naive single-
+          # quote interpolation (truncation at best, injection at worst).
+          # %q-escape it once up front, matching this lane's main deploy
+          # command's existing %q discipline, and reuse the safe token.
+          printf -v _qdir '%q' "$DEPLOY_DIR"
           pre_good="__unknown__"
           if [ -n "$BUSY_LOCK_FILE" ]; then
             if _pg=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" \
-                 "cat '${DEPLOY_DIR}/.deploy-state/release/last_good_sha' 2>/dev/null || true"); then
+                 "cat ${_qdir}/.deploy-state/release/last_good_sha 2>/dev/null || true"); then
               pre_good="$_pg"
             fi
           fi
@@ -253,7 +259,7 @@ jobs:
                   # acquired right now" — recheck the host's last_good_sha before
                   # trusting the "deferred, old release kept" story.
                   remote_good=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" \
-                    "cat '${DEPLOY_DIR}/.deploy-state/release/last_good_sha' 2>/dev/null" || true)
+                    "cat ${_qdir}/.deploy-state/release/last_good_sha 2>/dev/null" || true)
                   # All three must hold: remote_good now equals this run's SHA;
                   # pre_good was different (proves the change happened during this
                   # run, not a historical same-value coincidence); and pre_good was

@@ -236,10 +236,15 @@ jobs:
           # 走 deferred)。远端文件不存在是合法的"此前无 last_good"状态,取到空字符串
           # 即可,不算 unknown——两种"空"语义不同,不能混。只服务于忙锁门禁场景,未开
           # 门禁的 caller 不会触发 rc=3,没必要多这次 ssh 调用。
+          # DEPLOY_DIR is interpolated into a remote shell command below; a
+          # value containing a single quote would break out of naive single-
+          # quote interpolation (truncation at best, injection at worst).
+          # %q-escape it once up front and reuse the safe token everywhere.
+          printf -v _qdir '%q' "$DEPLOY_DIR"
           pre_good="__unknown__"
           if [ -n "$BUSY_LOCK_FILE" ]; then
             if _pg=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                 "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null || true"); then
+                 "cat ${_qdir}/.deploy-state/last_good_tag 2>/dev/null || true"); then
               pre_good="$_pg"
             fi
           fi
@@ -262,7 +267,7 @@ jobs:
                 # STATE_DIR 默认是 ${DEPLOY_DIR}/.deploy-state(pull_and_deploy.sh 里的
                 # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
                 remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                  "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null" || true)
+                  "cat ${_qdir}/.deploy-state/last_good_tag 2>/dev/null" || true)
                 # 三条同时成立才提升为成功:
                 #   remote_good = GIT_SHA  —— 现在确实是这个 SHA
                 #   pre_good != GIT_SHA    —— 排除"重跑已部署过的同一个 SHA"这种历史

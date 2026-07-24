@@ -83,7 +83,7 @@ cleanup() {
   if [[ -n "${BUSY_LOCK_HELD:-}" ]]; then
     flock -u 8 2>/dev/null || true
   fi
-  trap - EXIT INT TERM
+  trap - EXIT INT TERM HUP
   exit "$rc"
 }
 on_signal() {
@@ -93,6 +93,13 @@ on_signal() {
 trap cleanup EXIT
 trap 'on_signal INT' INT
 trap 'on_signal TERM' TERM
+# OpenSSH sends SIGHUP (not INT/TERM) to the remote command's process group
+# when the SSH transport drops. Without this trap, bash's default HUP
+# disposition kills the script immediately mid-critical-section — no EXIT
+# trap, no rollback — leaving the host on an unhealthy, unpromoted release.
+# Route it through the exact same pending-signal -> rollback/cleanup path as
+# INT/TERM; no new mechanism, just another signal into check_pending().
+trap 'on_signal HUP' HUP
 
 check_pending() {
   (( ROLLBACK_MODE == 1 )) && return 0
@@ -374,7 +381,7 @@ do_release() {
     if probe_release && check_pending; then
       # Ignore a second signal for the short canonical commit: once promotion
       # starts, both SHA and manifest move as one protected release decision.
-      trap ':' INT TERM
+      trap ':' INT TERM HUP
       if promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST"; then
         log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
         return 0
@@ -392,7 +399,7 @@ do_release() {
     # Once rollback starts, a second signal must not interrupt the group
     # transition or leave the host on a half-staged release.
     ROLLBACK_MODE=1
-    trap ':' INT TERM
+    trap ':' INT TERM HUP
     deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
     if (( rollback_rc == 0 )); then
       if probe_release; then
