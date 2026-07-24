@@ -218,19 +218,36 @@ compose_release() {
     compose_args+=(--env-file "$DEPLOY_DIR/.env")
   fi
   compose_args+=(--env-file "$ENV_FILE")
-  local rendered_images config_rc=0 image_ref found line
+  local rendered_images config_rc=0 image_ref found_any line
   rendered_images="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
   if (( config_rc != 0 )); then
     log "compose config --images failed; compose up will not run" >&2
     return 1
   fi
+  # A declared image name can appear more than once in `compose config --images`
+  # when multiple services reference it. Requiring only ONE occurrence to match
+  # the expected <name>:<tag> is not enough: a second service left on `latest` or
+  # a stale SHA (e.g. a missed env-var interpolation) would slip through as long
+  # as some other service got the tag right — exactly the "half new, half old"
+  # image group this atomic-release gate exists to block. Every occurrence of a
+  # declared image name must match the expected ref; any stray occurrence fails
+  # the gate immediately. Non-declared images (e.g. nginx) are unconstrained.
   for image_name in "${IMAGE_NAMES[@]}"; do
     image_ref="${image_name}:${tag}"
-    found=0
+    found_any=0
     while IFS= read -r line; do
-      if [[ "$line" == "$image_ref" ]]; then found=1; break; fi
+      [[ -n "$line" ]] || continue
+      # Exact-prefix match on "<image_name>:" so e.g. declared name "frontend"
+      # never matches an unrelated "frontend-worker:xxx" line.
+      if [[ "$line" == "${image_name}:"* ]]; then
+        found_any=1
+        if [[ "$line" != "$image_ref" ]]; then
+          log "compose identity gate: ${image_name} has a stray reference (${line}), expected ${image_ref}; compose up will not run" >&2
+          return 1
+        fi
+      fi
     done <<< "$rendered_images"
-    if (( found == 0 )); then
+    if (( found_any == 0 )); then
       log "compose identity gate missing ${image_ref}; compose up will not run" >&2
       return 1
     fi
@@ -428,9 +445,20 @@ if [[ -n "$BUSY_LOCK_FILE" ]]; then
       continue
     fi
     check_pending || { flock -u 8 2>/dev/null || true; exit 130; }
-    if flock -n 9; then
+    # Only rc=1 means genuine lock contention (host lock held by another deploy) —
+    # the "release admission and retry" path below is only valid for that case.
+    # Any other non-zero rc means flock itself failed (bad args, syscall error,
+    # etc.) and is a real problem that must surface as an error, not be silently
+    # treated as ordinary host-busy contention.
+    _hrc=0; flock -n 9 || _hrc=$?
+    if [[ "$_hrc" -eq 0 ]]; then
       check_pending || { flock -u 9 2>/dev/null || true; flock -u 8 2>/dev/null || true; exit 130; }
       break
+    fi
+    if [[ "$_hrc" -ne 1 ]]; then
+      log "flock on host lock failed (rc=${_hrc} — not lock contention)" >&2
+      flock -u 8 2>/dev/null || true
+      exit 1
     fi
     # Never hold service admission while waiting for the host lock.
     flock -u 8 2>/dev/null || true

@@ -146,6 +146,59 @@ exit 0
     assert (Path(env["STATE_DIR"]) / "last_good_release").read_text() == before
 
 
+def test_compose_identity_gate_rejects_mixed_stale_tag_for_one_image(tmp_path):
+    # P1-4: docker compose config --images can emit the same image name more than
+    # once when multiple services reference it (e.g. one service's compose config
+    # got the new SHA, another still resolves to `latest` or a stale SHA due to a
+    # missed env-var interpolation). The old gate only required ONE occurrence of
+    # a declared image name to match the expected <name>:<tag> — as long as any
+    # single occurrence matched, the gate passed even though another occurrence of
+    # the SAME image name was stale. That is exactly the "half new, half old"
+    # image group this atomic-release gate exists to block: compose up must never
+    # run with a mixed group.
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nfrontend:latest\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "up -d" not in log.read_text(), "compose up must never run when one occurrence of a declared image is stale"
+    state = Path(env["STATE_DIR"])
+    assert not (state / "last_good_release").exists()
+    assert not (state / "last_good_sha").exists()
+    assert not (state / "last_good_manifest").exists()
+
+
+def test_compose_identity_gate_allows_repeated_occurrences_all_matching_expected_tag(tmp_path):
+    # Positive control for P1-4: every occurrence of every declared image name
+    # (including a repeated occurrence of the SAME image name from two services)
+    # matches the expected <name>:<tag>, and an undeclared image (nginx) is also
+    # present — the gate must still pass and compose up must run.
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nfrontend:%s\\nbackend:%s\\nnginx:1.27\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "up -d" in log.read_text()
+
+
 def test_compose_identity_gate_allows_extra_public_images(tmp_path):
     env, log = base(tmp_path)
     write_exec(
@@ -257,16 +310,22 @@ def test_canonical_commit_failure_rolls_back_runtime_and_preserves_old_state(tmp
 echo "$@" >> "{log}"
 if [ "$1" = pull ]; then exit 0; fi
 if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+env_file=""
+read_next=0
+for arg in "$@"; do
+  if [ "$read_next" = 1 ]; then env_file="$arg"; read_next=0; fi
+  if [ "$arg" = --env-file ]; then read_next=1; fi
+done
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
-  printf 'frontend:def567890123\\nbackend:def567890123\\nfrontend:abc123456789\\nbackend:abc123456789\\n'
+  # Reflect the tag actually written to --env-file for THIS invocation (new
+  # release vs. rollback each write their own tag before calling config --images)
+  # rather than a hardcoded mix of both tags — the stricter P1-4 gate now
+  # requires every occurrence of a declared image name to match the currently
+  # expected tag, so the mock must behave like the real docker compose would.
+  tag=$(grep '^D3_RELEASE_TAG=' "$env_file" | cut -d= -f2)
+  printf 'frontend:%s\\nbackend:%s\\n' "$tag" "$tag"
 fi
 if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
-  env_file=""
-  read_next=0
-  for arg in "$@"; do
-    if [ "$read_next" = 1 ]; then env_file="$arg"; read_next=0; fi
-    if [ "$arg" = --env-file ]; then read_next=1; fi
-  done
   printf 'compose-env=%s\\n' "$(cat "$env_file")" >> "{log}"
 fi
 exit 0
@@ -486,6 +545,46 @@ def test_busy_gate_host_contention_releases_admission_fd(tmp_path):
     assert result.returncode == 3
     probe = subprocess.run(["flock", "-n", str(busy), "-c", "true"])
     assert probe.returncode == 0, "busy admission lock leaked while host was contended"
+
+
+def test_host_lock_flock_non_contention_error_surfaces_as_real_failure(tmp_path):
+    # P1-3: `flock -n 9` returning rc=1 means genuine lock contention (the host
+    # lock is held by another deploy) and is the ONLY case that should feed the
+    # existing "release admission, sleep, retry" busy-host path. Any other
+    # non-zero rc means flock itself failed (bad args, syscall error, etc.) and
+    # must surface as a real error — not be silently swallowed and treated as
+    # ordinary host-busy contention.
+    #
+    # A fake `flock` binary ahead of PATH intercepts only the exact `flock -n 9`
+    # host-lock probe call (the sole call site in release_deploy.sh) and returns
+    # a non-1, non-zero code (7); every other flock invocation (the busy-lock fd 8
+    # wait/unlock calls) is delegated to the real flock binary so the rest of the
+    # busy-lock gate behaves exactly as it would in production.
+    env, log = base(tmp_path)
+    busy = tmp_path / "busy.lock"
+
+    bindir = tmp_path / "flockbin"
+    bindir.mkdir()
+    write_exec(
+        bindir / "flock",
+        '''#!/bin/bash
+if [ "$1" = "-n" ] && [ "$2" = "9" ]; then
+  exit 7
+fi
+exec /usr/bin/flock "$@"
+''',
+    )
+    env["PATH"] = f'{bindir}:{env["PATH"]}'
+    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="5")
+    result = run(env)
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "flock on host lock failed (rc=7" in result.stderr
+    assert not log.exists() or "compose" not in log.read_text()
+    state = Path(env["STATE_DIR"])
+    assert not (state / "last_good_release").exists()
+    # The busy admission lock must not leak on this error exit path either.
+    probe = subprocess.run(["flock", "-n", str(busy), "-c", "true"])
+    assert probe.returncode == 0, "busy admission lock leaked on the flock host-lock error path"
 
 
 def test_busy_shared_service_lock_defers_before_compose(tmp_path):
