@@ -835,6 +835,100 @@ exit 0
     assert run(env).returncode == 0
 
 
+def test_pending_signal_rechecked_before_compose_up(tmp_path):
+    # P1 (codex review round 3): a signal (INT/TERM/HUP) arriving while
+    # compose_release() is inside the identity-gate check -- right after
+    # `docker compose config --images` returns, before `up -d` is issued --
+    # was only recorded into PENDING_SIGNAL. The gate-check loop that follows
+    # is pure in-process bash with no further check_pending() call, so
+    # execution fell straight through into `docker compose up -d` regardless
+    # of the pending cancellation. On a FIRST deploy (no previous good
+    # release to roll back to) this is the worst case: the new, cancelled
+    # release's containers get switched in, are never promoted, and there is
+    # nothing to roll back to -- an unrecoverable half-cancelled deploy.
+    #
+    # Injection technique borrowed from the existing TERM/HUP compose tests:
+    # the mock's `config --images` branch sleeps briefly (holding up the
+    # command substitution bash is blocked on), the test polls the log for
+    # that call to have started and sends the signal while it is still
+    # "running", then lets it finish normally. bash defers dispatching the
+    # trap until it regains control; the identity-gate loop that follows
+    # makes no further docker calls, so PENDING_SIGNAL is guaranteed to
+    # already be set by the time compose_release() reaches its pre-`up -d`
+    # check -- this is deterministic, not a race, once the injected call has
+    # actually started (which the log-polling loop confirms before signaling).
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  sleep 0.25
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    deadline = time.time() + 3
+    while time.time() < deadline and not (log.exists() and "config --images" in log.read_text()):
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    assert proc.returncode == 130, (
+        "a signal caught during the identity-gate check must drive the script "
+        f"through the normal pending-signal exit (rc=130): got {proc.returncode}; "
+        + stdout + stderr
+    )
+    lines = log.read_text().splitlines()
+    assert not any(line.endswith(" up -d") for line in lines), (
+        "compose up must never run once a pending signal has been recorded, even "
+        "if the identity gate already passed:\n" + "\n".join(lines)
+    )
+    assert "no previous good release available" in (stdout + stderr), (
+        "first deploy (no previous good) must explicitly refuse pseudo-rollback, "
+        "not silently leave a cancelled-but-switched runtime with no rollback target"
+    )
+    state = Path(env["STATE_DIR"])
+    assert not (state / "last_good_release").exists()
+
+
+def test_pending_signal_rechecked_after_promotion_trap_before_promote():
+    # P2-1 (codex review round 3): between `probe_release && check_pending`
+    # returning true (probe passed, no cancellation seen yet) and the very
+    # next line actually installing `trap ':' INT TERM HUP`, on_signal() is
+    # still wired up as the live INT/TERM/HUP handler. A signal landing in
+    # that gap sets PENDING_SIGNAL but is then silently swallowed forever:
+    # every signal arriving AFTER the trap is installed is ignored (`:`), and
+    # nothing rechecks PENDING_SIGNAL before promote() runs. Without a
+    # recheck here, a release cancelled in that gap would still be committed
+    # as last_good_release instead of taking the existing
+    # rollback-without-promotion path.
+    #
+    # This window is a handful of in-process bash instructions with no
+    # external command execution in between it -- unlike the up -d race
+    # above (test_pending_signal_rechecked_before_compose_up), which is
+    # anchored to an external `docker compose config --images` call the test
+    # harness can make block long enough to land a signal deterministically,
+    # there is no reliable way to inject a signal inside this specific gap
+    # from outside the process. Per the review's own guidance for this case,
+    # falling back to a static, contract-style assertion: the source must
+    # recheck pending-signal state after the promotion trap is installed and
+    # before promote() is called.
+    text = SCRIPT.read_text()
+    idx_trap = text.index("trap ':' INT TERM HUP")
+    idx_promote = text.index('promote "$D3_RELEASE_TAG"')
+    assert idx_trap < idx_promote, "the promotion trap must be installed before promote() is called"
+    between = text[idx_trap:idx_promote]
+    assert "check_pending" in between or "PENDING_SIGNAL" in between, (
+        "a pending-signal recheck must appear between installing the promotion "
+        "trap and calling promote() -- otherwise a signal that lands in the gap "
+        "before the trap is installed gets recorded, then is silently ignored "
+        "by the trap that follows, and promote() commits a cancelled release"
+    )
+
+
 def test_term_during_pull_does_not_start_new_compose(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0

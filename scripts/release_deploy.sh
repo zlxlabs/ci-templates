@@ -268,6 +268,15 @@ compose_release() {
       return 1
     fi
   done
+  # A signal (INT/TERM/HUP) could have landed while we were blocked inside
+  # `config --images` or walking the identity-gate loop above — on_signal()
+  # only records PENDING_SIGNAL, it doesn't abort anything, and this whole
+  # gate check makes no docker calls to naturally surface it. Without this
+  # recheck, a cancellation recorded here would fall straight through into
+  # `compose up -d` regardless. On a first deploy (no previous good release)
+  # that is unrecoverable: the cancelled release's containers get switched
+  # in, are never promoted, and there is nothing to roll back to.
+  check_pending || return 130
   compose_args+=(up -d)
   local compose_rc=0
   (cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
@@ -382,12 +391,25 @@ do_release() {
       # Ignore a second signal for the short canonical commit: once promotion
       # starts, both SHA and manifest move as one protected release decision.
       trap ':' INT TERM HUP
-      if promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST"; then
-        log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
-        return 0
+      # Narrow race: a signal can land in the gap between the check_pending()
+      # above returning true and this trap actually being installed —
+      # on_signal() is still the live handler during that gap, so
+      # PENDING_SIGNAL may already be set even though every signal arriving
+      # AFTER this line is now ignored. Recheck once more, now that the
+      # window is closed, before committing to promote(): a cancellation
+      # caught here must still take the rollback-without-promotion path
+      # below, not be silently promoted.
+      if check_pending; then
+        if promote "$D3_RELEASE_TAG" "$RELEASE_MANIFEST"; then
+          log "release ${D3_RELEASE_TAG} healthy; promoted atomically"
+          return 0
+        fi
+        log "release ${D3_RELEASE_TAG} healthy but canonical promotion failed; rolling back" >&2
+        current_rc=1
+      else
+        log "release ${D3_RELEASE_TAG} healthy but a cancel signal landed just before the promotion trap; rolling back" >&2
+        current_rc=1
       fi
-      log "release ${D3_RELEASE_TAG} healthy but canonical promotion failed; rolling back" >&2
-      current_rc=1
     else
       log "release ${D3_RELEASE_TAG} probe gate failed"
       current_rc=1
