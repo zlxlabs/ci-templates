@@ -1,0 +1,64 @@
+# Drop this into a multi-image compose service repo at
+# .github/workflows/deploy.yml. This is the RELEASE lane
+# (build-deploy-release.yml) for services whose compose stack has more than
+# one image that must switch together atomically — e.g. a backend + frontend
+# pair sharing one docker-compose.yml. Single-image services should use
+# examples/caller-workflow.yml instead.
+#
+# Prototype: a web_transcibe_translate-style repo with backend/ and frontend/
+# each holding their own Dockerfile, and a root docker-compose.yml running
+# both images from the same immutable release tag.
+#
+# 首次接入建议先钉 @main 跑通一次真实发布(见 docs/RUNBOOK-go-live.md 阶段 4:
+# web_transcibe_translate 接 release lane),确认探针/回滚都正常之后再改回
+# @v1 —— 和单镜像 lane 一样的爆炸半径纪律,一个坏 commit 不该直接炸生产。
+name: deploy
+on:
+  push:
+    branches: [main]
+
+jobs:
+  ship:
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy-release.yml@v1
+    with:
+      # 严格 JSON 数组:每项 image_name/build_context/dockerfile 必填,可选
+      # build_alias(worker 别名复用同一次构建,这里两个镜像各自独立构建,不需要)。
+      # 实际构建命令是 `docker build -f "${build_context}/${dockerfile}" ...`,
+      # 所以 dockerfile 是相对 build_context 的路径,不是相对仓库根的路径。
+      images_json: |
+        [
+          {"image_name": "web-transcribe-translate-backend", "build_context": "backend", "dockerfile": "Dockerfile"},
+          {"image_name": "web-transcribe-translate-frontend", "build_context": "frontend", "dockerfile": "Dockerfile"}
+        ]
+      # 严格 JSON 数组,release 级探针 —— 生产发布至少配前端入口 + 后端 API 两条。
+      probes_json: |
+        [
+          {"url": "http://localhost:8080/", "expect_status": 200},
+          {"url": "http://localhost:8001/healthz", "expect_status": 200}
+        ]
+      host: 100.64.0.3                                # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-3)
+      ssh_user: deploy                                     # SSH user on the target host
+      deploy_dir: /srv/automation/web-transcribe-translate
+      ci_templates_ref: v1                              # fetch release scripts from @v1 too
+      # 可选·部署门禁:服务忙时本次延期不替换,不加则行为不变(见 docs/design/d3-busy-lock-gate.md)
+      # busy_lock_file: /srv/automation/web-transcribe-translate/.deploy-state/busy.lock
+    secrets:                                            # explicit — no `inherit`, same 6 as the single-image lane
+      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+      SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+      KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+      TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner joins tailnet to reach the internal host
+      CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # read-only PAT to checkout private ci-templates scripts
+
+# 前提:根目录 docker-compose.yml 里两个服务都必须用不可变发布变量
+# (Docker Compose v2,`docker compose config --images` 需可用才能过身份门禁),
+# 例如:
+#
+#   services:
+#     web-transcribe-translate-backend:
+#       image: web-transcribe-translate-backend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+#     web-transcribe-translate-frontend:
+#       image: web-transcribe-translate-frontend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+#
+# 两个镜像在同一个 D3_RELEASE_TAG 下一起切换、一起回滚,不会出现半新半旧的组合。
+# 细节见 README「多镜像原子发布(release lane)」一节。
