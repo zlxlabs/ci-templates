@@ -25,3 +25,19 @@
 **接受理由**：pre-existing 模式，输入源可信；本轮已对新增的复核 cat 调用补齐 %q。全量改造涉及整段 env 串重写与回归风险，收益有限。
 
 **重评触发**：caller 输入信任模型变化（如开放给非自控仓库），或该段代码因其他原因重写时顺带 %q 化。
+
+## 2026-07-24 · Codex review(release lane R4) · P2(降级自 P1) · 同 SHA 重建的 digest 漂移无回滚
+
+**现象**：忙锁延期或手动 re-run 同一 commit 时会在新 runner 上重建镜像；若 Dockerfile 基镜像/依赖未钉死，同名 `:sha` tag 可能被不同 digest 覆盖。此时探针失败的"回滚到自身"会被 same-SHA 守卫跳过，坏容器保留。
+
+**接受理由**：SHA-tag 状态模型的系统性局限，单镜像 lane 与 D3 之前的脚本完全相同，非 release lane 引入；彻底修复需 digest 级状态记录与部署（重架构）。缓解手段是保持构建可复现（钉基镜像、锁依赖）。
+
+**重评触发**：真实发生"同 SHA 重跑后探针失败且产物已漂移"事故，或舰队开始使用不可复现构建。届时评估 manifest 记录 digest 并按 digest 部署。
+
+## 2026-07-24 · Codex review(release lane R4) · P2(降级自 P1) · registry/namespace 迁移会破坏回滚引用
+
+**现象**：canonical manifest 只存裸镜像名，回滚用当前 run 的 acr_registry/acr_namespace 重建旧引用；若两次发布间迁移了 registry 且主机本地旧 tag 已被清理，回滚会从错误路径拉取失败。
+
+**接受理由**：需要 registry 迁移 + 本地 tag 被清 + 恰好回滚三重条件；registry 迁移完全是运维自控、低频的计划性动作。
+
+**重评触发**：计划迁移 acr_registry/acr_namespace 前，先改 manifest 存完整镜像引用（或 digest），再执行迁移。

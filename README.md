@@ -65,7 +65,9 @@ services:
 rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后尽力而为写入的兼容视图，
 供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
 `last_good_release` 为准。失败时按旧 manifest 整组回滚，首次发布没有旧版本则明确失败，
-不会伪造 last-good。
+不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死基镜像、锁定依赖，
+才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受支持——脚本会显式
+拒绝并保持容器现状，绝不做部分回滚，需要人工介入。
 
 ## 调用方（每服务 ~10 行）
 
