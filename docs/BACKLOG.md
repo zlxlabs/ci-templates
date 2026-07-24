@@ -49,3 +49,9 @@
 **现语义**：出过 255 的 run 收到 rc=3 一律延期 + 状态不确定告警；重跑幂等收敛，必要时人工在主机上确认。
 
 **重评触发**：若"断连后人工确认"实际频次成为负担，再考虑重建（届时需 run 级 nonce/digest 证明，而非可被历史同值污染的 last-good 比对）。
+
+## 2026-07-24 · 契约债 · CI_TEMPLATES_PAT 已无实际用途但仍在 6-secret 契约中
+
+**现象**：ci-templates 转 public 后 checkout 不再需要 PAT，两条 lane 已停用该 token；但 workflow_call 契约仍声明它为 required——立刻摘除会打破全舰队 caller 的显式 secrets 传递。
+
+**重评触发**：下一次需要动全舰队 caller 的大版本（v2）时，随版本一起从契约与所有 caller 中摘除；届时 test_workflow_contract 的 6-secret 断言同步改 5。
