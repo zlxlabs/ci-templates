@@ -8,7 +8,7 @@ on:
 
 jobs:
   ship:
-    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@v1
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
     with:
       image_name: web-api                       # == registry service id == ACR image
       host: 100.64.0.1                                # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)

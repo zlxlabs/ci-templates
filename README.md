@@ -76,7 +76,7 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 ```yaml
 jobs:
   ship:
-    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@v1
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
     with:
       image_name: web-api
       host: 100.64.0.1           # Tailscale 可达 IP/MagicDNS（runner 无 ~/.ssh/config，不能用别名 host-1）

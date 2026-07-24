@@ -86,7 +86,7 @@ jobs:
       - name: Checkout ci-templates (release scripts)
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
-          repository: zj1123581321/ci-templates
+          repository: zlxlabs/ci-templates
           ref: ${{ inputs.ci_templates_ref }}
           token: ${{ secrets.CI_TEMPLATES_PAT }}
           path: .ci-templates

@@ -52,3 +52,13 @@ def test_examples_pass_ssh_user():
     for name in ("caller-workflow.yml", "canary-workflow.yml"):
         with_, _ = _ship_with(EXAMPLES / name)
         assert with_.get("ssh_user"), f"{name}: 缺 ssh_user"
+
+
+def test_examples_use_org_repo_path_not_legacy_personal_path():
+    # 2026-07-24:本仓真实地址是 zlxlabs/ci-templates(git remote 可证)。旧个人
+    # 路径 zj1123581321/ci-templates 目前只靠 GitHub 仓库转移重定向才能工作——
+    # examples 是用户照抄的范例,写着旧路径就会把这个劫持面复制进每一个新服务仓。
+    for name in ("caller-workflow.yml", "canary-workflow.yml"):
+        text = (EXAMPLES / name).read_text()
+        assert "zj1123581321" not in text, f"{name}: legacy personal repo path must not reappear"
+        assert "zlxlabs/ci-templates" in text, f"{name}: uses: must reference the org repo path"

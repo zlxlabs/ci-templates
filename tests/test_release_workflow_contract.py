@@ -33,6 +33,18 @@ def test_release_workflow_pins_actions_and_has_atomic_build_gate():
     assert "push_to_acr.sh" in text
     assert "release_deploy.sh" in text
     assert "D3_RELEASE_TAG" in text
+
+
+def test_ci_templates_checkout_uses_org_repo_path_not_legacy_personal_path():
+    # 2026-07-24 parity with build-deploy.yml: the repo's real address is
+    # zlxlabs/ci-templates (per git remote); the legacy personal path
+    # zj1123581321/ci-templates only still works via GitHub's repo-transfer
+    # redirect. If that old username is ever re-registered by someone else,
+    # this checkout step would pull attacker-controlled code while the job
+    # already holds 6 deploy secrets. Pin to the org path, not the redirect.
+    text = WORKFLOW.read_text()
+    assert "zj1123581321" not in text, "legacy personal repo path must not reappear"
+    assert "repository: zlxlabs/ci-templates" in text
     assert "255" in text
     assert "ssh " in text
 
