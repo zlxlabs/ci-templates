@@ -329,6 +329,30 @@ jobs:
               # nothing else will ever remove this orphaned file once we give up
               # retrying. A failure of this cleanup itself must not mask the
               # real transport failure being reported above.
+              #
+              # P2-B-2 (codex review round 7): the release lane's equivalent
+              # cleanup was found to race the remote script's own rollback
+              # when it fired on ssh rc=255 (see build-deploy-release.yml's
+              # deploy_once()) and had to be removed from that branch. That
+              # race does not apply here, for two independent reasons:
+              # (1) REMOTE_SCRIPT here is only ever the deploy *script* file
+              # itself, never a state/manifest file that anything re-reads
+              # for a rollback decision -- pull_and_deploy.sh (this lane's
+              # remote script) has no HUP trap and no equivalent of the
+              # release lane's R4 image-set-comparison rollback guard, so
+              # there is nothing downstream that depends on this path still
+              # existing. (2) even setting that aside, on Linux, unlinking a
+              # file that a process already has open (which bash does once
+              # it starts executing `bash "$REMOTE_SCRIPT"`) is harmless to
+              # that process -- the inode and its data stay reachable through
+              # the already-open file descriptor until the process closes it
+              # or exits; only the directory entry goes away, so a
+              # still-running remote script is never disturbed by this rm -f.
+              # If a future change ever turns this path (or a sibling one)
+              # into something the remote script re-reads mid-run for a
+              # rollback/health decision, this safety argument no longer
+              # holds and this cleanup needs the same reconsideration the
+              # release lane's did.
               ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
               exit 1
             fi

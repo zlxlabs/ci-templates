@@ -213,18 +213,23 @@ jobs:
             local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
             local remote_script="/tmp/d3-release-${transport_nonce}.sh"
             # P2-B (codex review round 5): best-effort remote cleanup for the
-            # case where the remote script never gets a chance to run (so its
-            # own cleanup trap never installs) -- e.g. either scp fails, or
-            # the ssh call below fails at the transport layer (rc=255).
-            # remote_manifest/remote_script are local to this attempt (keyed
-            # by transport_nonce), so a later retry uses a fresh path and
-            # never reclaims this one; nothing else will ever remove it.
-            # rm -f on a path that was never created (e.g. the first scp
-            # failing before either file exists) is already a safe no-op, so
-            # this is applied uniformly rather than branching per failure
-            # point. %q-escaped, matching this function's own printf %q
-            # discipline for remote_cmd below. Cleanup failure itself must
-            # never mask/override the real transport failure being reported.
+            # case where the remote script never gets a chance to run at all
+            # (so its own cleanup trap never installs) -- i.e. either of the
+            # two scp calls below fails. remote_manifest/remote_script are
+            # local to this attempt (keyed by transport_nonce), so a later
+            # retry uses a fresh path and never reclaims this one; nothing
+            # else will ever remove it. rm -f on a path that was never
+            # created (e.g. the first scp failing before either file exists)
+            # is already a safe no-op, so this is applied uniformly to both
+            # scp failure points. %q-escaped, matching this function's own
+            # printf %q discipline for remote_cmd below. Cleanup failure
+            # itself must never mask/override the real transport failure
+            # being reported.
+            #
+            # P2-B-2 (codex review round 7, reverting part of round 5/e1688ba):
+            # this cleanup used to also fire from the ssh_rc==255 branch
+            # below. It no longer does -- see the comment at that branch for
+            # why running it there raced the remote script's own rollback.
             local cleanup_remote_cmd
             printf -v cleanup_remote_cmd 'rm -f -- %q %q' "$remote_manifest" "$remote_script"
             scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_deploy.sh" \
@@ -244,9 +249,51 @@ jobs:
               "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" "$remote_manifest" "$remote_script" "$remote_script"
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
             local ssh_rc=$?
-            if [[ "$ssh_rc" -eq 255 ]]; then
-              ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
-            fi
+            # P2-B-2 (codex review round 7, fixing a bug in round 5/e1688ba):
+            # deliberately NOT cleaning up remote_manifest/remote_script here,
+            # unlike the two scp failure points above. Both scp calls already
+            # succeeded by the time we reach this line, so release_deploy.sh
+            # has been shipped and its "ssh ... bash $remote_script" command
+            # was launched; ssh_rc==255 only means *this* SSH connection lost
+            # the transport before the remote script's real exit status made
+            # it back over the wire -- it does not mean the script never ran.
+            # If the transport drop happens while the remote script is still
+            # mid-flight (e.g. inside compose up / probing), OpenSSH delivers
+            # SIGHUP to the remote command's process group. release_deploy.sh
+            # traps HUP (its on_signal()/PENDING_SIGNAL machinery) instead of
+            # dying on it: it finishes the current step and then rolls back
+            # rather than promoting. That rollback path re-reads
+            # $RELEASE_MANIFEST (load_manifest "$RELEASE_MANIFEST" inside
+            # do_release(), guarding the R4 image-set-changed check) to
+            # compare the previous and current declared image sets before
+            # touching anything. If this workflow races ahead and rm -f's
+            # remote_manifest right here -- before the still-running remote
+            # script gets to that read -- load_manifest sees a missing file,
+            # the comparison is treated as an image-set change, and the
+            # remote script refuses to roll back at all ("rollback
+            # impossible ... manual intervention required, containers left
+            # as-is"), stranding the host on an unhealthy, unpromoted
+            # release. That is strictly worse than the orphaned-/tmp-file
+            # problem this cleanup was originally meant to solve, so it has
+            # been removed from this branch.
+            #
+            # release_deploy.sh's own EXIT trap (trap cleanup EXIT, which
+            # deletes REMOTE_SCRIPT_PATH/REMOTE_MANIFEST_PATH) is the only
+            # thing safe to rely on here once both scp calls above have
+            # confirmed the script was actually shipped: that trap runs
+            # before the script truly exits no matter how it gets there --
+            # normal completion, a probe-failure rollback, or a
+            # pending-signal rollback after HUP -- so it is the sole owner of
+            # cleaning up these two /tmp paths from this point on. Accepted
+            # cost: if scp fully succeeded but this ssh invocation never
+            # actually reached the point of the remote trap installing at all
+            # (connection died at the very start), these two /tmp files leak
+            # until the host's own /tmp reaper or a manual pass clears them --
+            # there is no reliable way for the CI side to tell that case apart
+            # from "script is mid-flight and will clean up after itself"
+            # without reintroducing the exact race this fix removes. A
+            # handful of leaked /tmp files is a strictly cheaper failure mode
+            # than a silently rejected rollback.
             return "$ssh_rc"
           }
           # Door-opening baseline for the rc=3 recheck below (only relevant when

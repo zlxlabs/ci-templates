@@ -272,16 +272,16 @@ def test_ssh_user_and_host_are_syntax_validated_before_use():
     )
 
 
-def test_orphaned_remote_files_cleaned_up_on_transport_failure():
+def test_orphaned_remote_files_cleaned_up_on_scp_failure():
     # P2-B (codex review round 5): remote_manifest/remote_script are local
     # variables inside deploy_once(), keyed by transport_attempt/
     # transport_nonce, so every retry uses a fresh nonce and never overwrites
-    # or reclaims a prior failed attempt's files. If either scp fails, or the
-    # ssh command itself fails at the transport layer (rc=255), the remote
-    # script never gets a chance to run its own cleanup trap -- nothing else
-    # will ever remove those /tmp paths. A best-effort ssh rm -f cleanup,
-    # covering both remote_manifest and remote_script, must be reachable from
-    # all three failure points inside deploy_once().
+    # or reclaims a prior failed attempt's files. If either scp fails, the
+    # remote script never gets a chance to run at all -- its own cleanup trap
+    # never installs -- so nothing else will ever remove those /tmp paths.
+    # A best-effort ssh rm -f cleanup, covering both remote_manifest and
+    # remote_script, must be reachable from both scp failure points inside
+    # deploy_once().
     text = WORKFLOW.read_text()
     assert "cleanup_remote_cmd" in text, (
         "deploy_once() must build a reusable best-effort remote cleanup command"
@@ -290,10 +290,49 @@ def test_orphaned_remote_files_cleaned_up_on_transport_failure():
         "the cleanup command must %q-escape both remote paths, matching this "
         "function's existing printf %q discipline"
     )
-    assert text.count('"$cleanup_remote_cmd"') == 3, (
-        "the cleanup command must be invoked at each of the three transport-"
-        "failure points inside deploy_once(): the first scp, the second scp, "
-        "and the ssh command itself"
+    assert text.count('"$cleanup_remote_cmd"') == 2, (
+        "the cleanup command must be invoked at exactly the two scp "
+        "transport-failure points inside deploy_once(): the first scp and "
+        "the second scp -- and nowhere else (see "
+        "test_ssh_255_does_not_race_remote_rollback_cleanup for why the "
+        "ssh_rc==255 branch must NOT also invoke it)"
+    )
+
+
+def test_ssh_255_does_not_race_remote_rollback_cleanup():
+    # Codex review round 7 (P2-B-2): round 5's fix (e1688ba) also invoked
+    # cleanup_remote_cmd from the ssh_rc==255 branch, reasoning that ssh
+    # transport failure meant the remote script "never got a chance to run".
+    # That premise is wrong for this branch specifically: both scp calls
+    # already succeeded by the time ssh_rc is checked, so release_deploy.sh
+    # was shipped and launched. rc=255 only means this SSH connection lost
+    # the transport before the remote exit status made it back -- if that
+    # happens while the remote script is mid-flight, OpenSSH sends it SIGHUP,
+    # which release_deploy.sh traps (on_signal()/PENDING_SIGNAL) instead of
+    # dying on, taking a rollback-without-promotion path that re-reads
+    # $RELEASE_MANIFEST to compare image sets (the R4 guard) before touching
+    # anything. Deleting remote_manifest from the workflow side right after
+    # ssh_rc==255 races that read: if the rm -f wins, load_manifest sees a
+    # missing file, the R4 guard reads that as an image-set change, and the
+    # remote script refuses to roll back at all -- worse than the orphaned
+    # /tmp file this cleanup was meant to prevent. So this branch must NOT
+    # invoke the cleanup; only release_deploy.sh's own EXIT trap may remove
+    # these two files once the script has actually been shipped.
+    text = WORKFLOW.read_text()
+    start = text.index('local ssh_rc=$?')
+    end = text.index('return "$ssh_rc"\n          }', start)
+    branch_text = text[start:end]
+    assert "cleanup_remote_cmd" not in branch_text, (
+        "the code path after `local ssh_rc=$?` (covering the ssh_rc==255 "
+        "case) must not invoke cleanup_remote_cmd -- doing so races the "
+        "remote script's own HUP-triggered rollback, which needs "
+        "$RELEASE_MANIFEST to still exist to compare image sets before it "
+        "will roll back"
+    )
+    assert 'if [[ "$ssh_rc" -eq 255 ]]; then' not in text, (
+        "the ssh_rc==255 special case must be removed entirely, not just "
+        "its cleanup call -- deploy_once() should fall through to a bare "
+        "`return \"$ssh_rc\"` for every ssh outcome"
     )
 
 
