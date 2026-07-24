@@ -85,6 +85,67 @@ def test_release_remote_paths_derive_from_repo_identity_not_just_run_id():
     assert 'remote_script="/tmp/d3-release-${transport_nonce}' in text
 
 
+def test_release_rc3_rechecks_last_good_sha_after_prior_transport_failure():
+    # P1-2: this mirrors the single-image lane's R5/R6-hardened recheck in
+    # build-deploy.yml (had_transport_failure / pre_good / __unknown__), adapted to
+    # the release lane's own last_good_sha path. release_deploy.sh's STATE_DIR is
+    # ${DEPLOY_DIR}/.deploy-state/release (not the single-image lane's bare
+    # .deploy-state), and the legacy simple-SHA view lives at last_good_sha (not
+    # last_good_tag) — GOOD_SHA_FILE="$STATE_DIR/last_good_sha" in release_deploy.sh.
+    #
+    # A 255 (SSH transport failure) can happen AFTER the remote release already
+    # promoted successfully but before the exit code made it back over the wire. A
+    # later rc=3 (busy-lock deferred) must not be trusted at face value in that
+    # case — recheck the host's last_good_sha before reporting "deferred".
+    text = WORKFLOW.read_text()
+
+    assert "pre_good" in text
+    assert "had_transport_failure" in text
+    assert "__unknown__" in text
+    assert ".deploy-state/release/last_good_sha" in text, (
+        "release lane's legacy last_good_sha view lives under .deploy-state/release, "
+        "distinct from the single-image lane's .deploy-state/last_good_tag"
+    )
+
+    idx_while = text.index("while true")
+    idx_pre_good_init = text.index("pre_good=")
+    assert idx_pre_good_init < idx_while, (
+        "pre_good's baseline capture must happen before the retry loop starts, not "
+        "inside it — otherwise it can't represent the pre-run state"
+    )
+
+    idx_init = text.index("had_transport_failure=0")
+    idx_rc3 = text.index('"$rc" -eq 3')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    idx_set = text.index("had_transport_failure=1")
+    assert idx_init < idx_rc3, "had_transport_failure must be initialised before the loop"
+    assert idx_rc_ne_255 < idx_set, "had_transport_failure=1 must be set on the confirmed-255 path"
+
+    # regression guard: deferred (busy_deferred) must still exist as the fallback.
+    assert "busy_deferred=true" in text, (
+        "rc=3 must still be able to fall through to deferred when the recheck "
+        "doesn't confirm success"
+    )
+
+    # the success-promotion if-condition must require all three: the current
+    # recheck value matches D3_RELEASE_TAG, pre_good was different beforehand (i.e.
+    # it actually changed during this run), and pre_good was obtainable at all.
+    idx_remote_good_if = text.index('"$remote_good"')
+    line_start = text.rindex("\n", 0, idx_remote_good_if) + 1
+    line_end = text.index("\n", idx_remote_good_if)
+    promotion_line = text[line_start:line_end]
+    assert "D3_RELEASE_TAG" in promotion_line
+    assert "pre_good" in promotion_line, (
+        "the success-promotion if-condition must also reference pre_good, not just "
+        "the current recheck value — otherwise a historical same-value coincidence "
+        "is indistinguishable from an in-run success"
+    )
+    assert "__unknown__" in promotion_line, (
+        "the success-promotion if-condition must refuse to promote to success when "
+        "the pre-loop baseline itself couldn't be fetched (ssh failure)"
+    )
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""
