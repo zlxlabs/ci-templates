@@ -85,26 +85,41 @@ def test_release_remote_paths_derive_from_repo_identity_not_just_run_id():
     assert 'remote_script="/tmp/d3-release-${transport_nonce}' in text
 
 
-def test_release_rc3_rechecks_last_good_sha_after_prior_transport_failure():
+def test_release_rc3_rechecks_canonical_last_good_release_after_prior_transport_failure():
     # P1-2: this mirrors the single-image lane's R5/R6-hardened recheck in
     # build-deploy.yml (had_transport_failure / pre_good / __unknown__), adapted to
-    # the release lane's own last_good_sha path. release_deploy.sh's STATE_DIR is
+    # the release lane's own state layout. release_deploy.sh's STATE_DIR is
     # ${DEPLOY_DIR}/.deploy-state/release (not the single-image lane's bare
-    # .deploy-state), and the legacy simple-SHA view lives at last_good_sha (not
-    # last_good_tag) — GOOD_SHA_FILE="$STATE_DIR/last_good_sha" in release_deploy.sh.
+    # .deploy-state).
+    #
+    # P2 (codex review): the recheck must read the CANONICAL commit point —
+    # last_good_release (GOOD_RELEASE_FILE in release_deploy.sh) — not the
+    # legacy last_good_sha view. promote()'s only atomic commit is the
+    # same-directory rename onto last_good_release; last_good_sha/
+    # last_good_manifest are best-effort legacy views written AFTER that
+    # commit and can lag behind or be missing on a partial legacy-refresh
+    # failure (see promote()'s WARN-and-continue fallback), so a recheck
+    # keyed on last_good_sha could stay wrongly "unconfirmed" even after a
+    # real canonical promotion. last_good_release's first line is the SHA
+    # (see the `head -n1` extraction), the rest is the manifest body.
     #
     # A 255 (SSH transport failure) can happen AFTER the remote release already
     # promoted successfully but before the exit code made it back over the wire. A
     # later rc=3 (busy-lock deferred) must not be trusted at face value in that
-    # case — recheck the host's last_good_sha before reporting "deferred".
+    # case — recheck the host's canonical last_good_release before reporting
+    # "deferred".
     text = WORKFLOW.read_text()
 
     assert "pre_good" in text
     assert "had_transport_failure" in text
     assert "__unknown__" in text
-    assert ".deploy-state/release/last_good_sha" in text, (
-        "release lane's legacy last_good_sha view lives under .deploy-state/release, "
-        "distinct from the single-image lane's .deploy-state/last_good_tag"
+    assert ".deploy-state/release/last_good_release" in text, (
+        "the rc=3 recheck must read the canonical last_good_release commit point, "
+        "not the best-effort legacy last_good_sha view"
+    )
+    assert "head -n1" in text, (
+        "last_good_release's first line is the SHA; the recheck must extract just "
+        "that line rather than comparing the whole file"
     )
 
     idx_while = text.index("while true")
@@ -188,19 +203,23 @@ def test_release_checkouts_do_not_persist_credentials_and_ci_templates_leaves_bu
 
 def test_rc3_recheck_cat_escapes_deploy_dir():
     # P1-C (codex review) parity with build-deploy.yml: the baseline
-    # (pre_good) and recheck (remote_good) `ssh ... "cat '${DEPLOY_DIR}/...'"`
-    # calls interpolate DEPLOY_DIR raw inside single quotes. Unlike this
-    # lane's main deploy command (already `printf %q`-escaped end to end),
-    # these two recheck calls were added in a later round and missed it — a
-    # DEPLOY_DIR containing a single quote breaks the remote shell's quoting.
+    # (pre_good) and recheck (remote_good) calls interpolate DEPLOY_DIR raw
+    # inside single quotes in a runner-built string handed to ssh. Unlike
+    # this lane's main deploy command (already `printf %q`-escaped end to
+    # end), these two recheck calls were added in a later round and missed
+    # it — a DEPLOY_DIR containing a single quote breaks the remote shell's
+    # quoting. (P2 later swapped the recheck's `cat ... last_good_sha` for
+    # `head -n1 ... last_good_release` to read the canonical commit point —
+    # see test_release_rc3_rechecks_canonical_last_good_release_after_prior_transport_failure
+    # — but the %q-escaping contract asserted here is unaffected by that.)
     text = WORKFLOW.read_text()
-    assert "cat '${DEPLOY_DIR}/" not in text, (
-        "recheck cat calls must not interpolate DEPLOY_DIR raw inside single "
+    assert "'${DEPLOY_DIR}/" not in text, (
+        "recheck calls must not interpolate DEPLOY_DIR raw inside single "
         "quotes — %q-escape it first, matching the main deploy command's style"
     )
-    assert text.count("cat ${_qdir}/.deploy-state/release/last_good_sha") == 2, (
-        "both the pre_good baseline and remote_good recheck cat calls must use "
-        "the %q-escaped DEPLOY_DIR"
+    assert text.count("head -n1 ${_qdir}/.deploy-state/release/last_good_release") == 2, (
+        "both the pre_good baseline and remote_good recheck calls must read the "
+        "canonical last_good_release through the %q-escaped DEPLOY_DIR"
     )
 
 

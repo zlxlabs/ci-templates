@@ -60,9 +60,12 @@ services:
 不可变 SHA 镜像并 retag 为 `<image_name>:<sha>`，完成本地 staging；随后才按忙锁 → host `flock`
 顺序进入临界区，在双锁内仅写入统一的 `D3_RELEASE_TAG` compose 环境文件，运行
 `config --images` 身份门禁、`docker compose up -d`、探针和 promote/rollback。这样等待服务忙锁时
-不会写 compose/env/state，也不会在拿到锁后重复拉取或 retag。全部探针通过后才原子提升
-`.deploy-state/release/last_good_{sha,manifest}`；失败时按旧 manifest 整组回滚，首次发布
-没有旧版本则明确失败，不会伪造 last-good。
+不会写 compose/env/state，也不会在拿到锁后重复拉取或 retag。全部探针通过后才原子提升唯一权威
+状态 `.deploy-state/release/last_good_release`（首行是 SHA，其余是完整 manifest 内容，同目录
+rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后尽力而为写入的兼容视图，
+供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
+`last_good_release` 为准。失败时按旧 manifest 整组回滚，首次发布没有旧版本则明确失败，
+不会伪造 last-good。
 
 ## 调用方（每服务 ~10 行）
 

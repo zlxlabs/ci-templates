@@ -17,3 +17,11 @@
 **接受理由**：按「第三个使用者出现前不抽公共库」的既定纪律暂不提取；两条 lane 的部署脚本本就各自独立 scp 到目标机执行，提取公共 shell 库会引入跨文件分发问题。
 
 **重评触发**：出现第三份拷贝，或两份实现开始语义漂移（修了一边忘了另一边）时，提取为共享 shell 片段并在 CI 里加一致性测试。
+
+## 2026-07-24 · Codex review(release lane R2) · P2 · 单镜像 lane 的 ssh env 插值未做 %q 硬化
+
+**现象**：`build-deploy.yml` 部署命令的 env 串（IMAGE_NAME=... DEPLOY_DIR=... 等）沿用单引号插值，未像 release lane 主命令那样全量 %q。输入来自 caller workflow 与 registry（经 schema 校验），信任级别为运维自控。
+
+**接受理由**：pre-existing 模式，输入源可信；本轮已对新增的复核 cat 调用补齐 %q。全量改造涉及整段 env 串重写与回归风险，收益有限。
+
+**重评触发**：caller 输入信任模型变化（如开放给非自控仓库），或该段代码因其他原因重写时顺带 %q 化。
