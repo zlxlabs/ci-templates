@@ -259,6 +259,24 @@ def test_remote_cleanup_deletes_only_exact_three_segment_paths(tmp_path):
     nonmatching.unlink()
 
 
+def test_cleanup_runs_even_when_earliest_deploy_dir_validation_fails(tmp_path):
+    env, _ = base(tmp_path)
+    nonce = f"{os.getpid()}-2-9"
+    remote_script = Path("/tmp") / f"d3-release-{nonce}.sh"
+    remote_manifest = Path("/tmp") / f"d3-release-{nonce}.manifest"
+    remote_script.write_text("temporary")
+    remote_manifest.write_text(Path(env["RELEASE_MANIFEST"]).read_text())
+    env.update(
+        RELEASE_MANIFEST=str(remote_manifest),
+        RELEASE_TEMP_SCRIPT=str(remote_script),
+        DEPLOY_DIR="",
+    )
+    result = run(env)
+    assert result.returncode != 0
+    assert not remote_script.exists()
+    assert not remote_manifest.exists()
+
+
 def test_probe_failure_rolls_back_entire_group_and_preserves_good(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0

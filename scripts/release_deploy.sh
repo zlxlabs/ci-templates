@@ -9,7 +9,80 @@
 # the complete previous group.
 set -u -o pipefail
 
+# REMOTE_SCRIPT_PATH must be assigned before ANY validation below that can
+# exit the script (the first is RELEASE_MANIFEST's `:?` a few lines down).
+# cleanup() (installed next, via the EXIT trap) references it unconditionally
+# and unguarded; under `set -u`, reading a variable that was never assigned
+# at all (not even to "") is a fatal "unbound variable" error, including
+# inside a trap handler. RELEASE_TEMP_SCRIPT is an optional input, so `:-`
+# here safely yields "" when unset — that empty value can never match
+# cleanup()'s /tmp/d3-release-*.sh pattern, so behavior is unchanged; it just
+# guarantees the variable is always bound by the time cleanup() can run.
+REMOTE_SCRIPT_PATH="${RELEASE_TEMP_SCRIPT:-}"
+
+log() { echo "[release] $*"; }
+die() { log "ERROR: $*" >&2; return 1; }
+
+cleanup() {
+  local rc=$?
+  # STAGING_PREFIX is derived from STATE_DIR/D3_RELEASE_TAG (assigned further
+  # below, after their own required-variable checks) and is NOT assigned yet
+  # at this point in the script. If D3_RELEASE_TAG or DEPLOY_DIR itself fails
+  # its `:?` check, cleanup() runs via the EXIT trap while STAGING_PREFIX has
+  # never been set — a bare reference would be a fatal unbound-variable error
+  # under `set -u`, aborting cleanup() before it reaches the REMOTE_SCRIPT_PATH
+  # / REMOTE_MANIFEST_PATH cleanup below. `${STAGING_PREFIX:-}` treats that
+  # case as an empty prefix: the rm targets below (".manifest", ".env", etc.
+  # with no prefix) never exist and were never going to, so this is a no-op,
+  # not a behavior change, for every run that gets far enough to stage
+  # anything real.
+  rm -f -- "${STAGING_PREFIX:-}.manifest" "${STAGING_PREFIX:-}.env" "${STAGING_PREFIX:-}.sha" "${STAGING_PREFIX:-}.release" "${STAGING_PREFIX:-}.previous" 2>/dev/null || true
+  # These are exact per-run paths supplied by the workflow; never glob /tmp.
+  # The nonce now carries a repo-identity slug ahead of the numeric run fields
+  # (P1-1: GITHUB_RUN_ID is only unique within a single repo, not across repos),
+  # so this can no longer assume digits-only segments. Still anchored to the
+  # exact fixed prefix/suffix and restricted to safe filename characters (no
+  # `/`, `.`, or shell metacharacters) — a malformed value still cannot escape
+  # /tmp or target an arbitrary file.
+  if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.sh$ ]]; then
+    rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true
+  fi
+  # REMOTE_MANIFEST_PATH is assigned immediately after RELEASE_MANIFEST's own
+  # `:?` check below, so it is unset only if THAT specific check is what
+  # fails. Guard with `:-` for the same reason as STAGING_PREFIX above: an
+  # unset reference here would abort cleanup() with an unbound-variable error
+  # instead of falling through to the lock-release and exit lines further
+  # down. An empty value can never match the /tmp/d3-release-*.manifest
+  # pattern, so this changes nothing once RELEASE_MANIFEST has passed.
+  if [[ "${REMOTE_MANIFEST_PATH:-}" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.manifest$ ]]; then
+    rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true
+  fi
+  if [[ -n "${LOCK_HELD:-}" ]]; then
+    flock -u 9 2>/dev/null || true
+  fi
+  if [[ -n "${BUSY_LOCK_HELD:-}" ]]; then
+    flock -u 8 2>/dev/null || true
+  fi
+  trap - EXIT INT TERM HUP
+  exit "$rc"
+}
+on_signal() {
+  PENDING_SIGNAL="$1"
+  log "received ${1}; will finish current command and rollback without promotion"
+}
+trap cleanup EXIT
+trap 'on_signal INT' INT
+trap 'on_signal TERM' TERM
+# OpenSSH sends SIGHUP (not INT/TERM) to the remote command's process group
+# when the SSH transport drops. Without this trap, bash's default HUP
+# disposition kills the script immediately mid-critical-section — no EXIT
+# trap, no rollback — leaving the host on an unhealthy, unpromoted release.
+# Route it through the exact same pending-signal -> rollback/cleanup path as
+# INT/TERM; no new mechanism, just another signal into check_pending().
+trap 'on_signal HUP' HUP
+
 : "${RELEASE_MANIFEST:?RELEASE_MANIFEST required}"
+REMOTE_MANIFEST_PATH="$RELEASE_MANIFEST"
 : "${D3_RELEASE_TAG:?D3_RELEASE_TAG required}"
 : "${DEPLOY_DIR:?DEPLOY_DIR required}"
 
@@ -28,8 +101,6 @@ HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
-REMOTE_SCRIPT_PATH="${RELEASE_TEMP_SCRIPT:-}"
-REMOTE_MANIFEST_PATH="$RELEASE_MANIFEST"
 
 GOOD_SHA_FILE="$STATE_DIR/last_good_sha"
 GOOD_MANIFEST_FILE="$STATE_DIR/last_good_manifest"
@@ -57,49 +128,6 @@ CURRENT_STAGED=0
   echo "[release] timing values must be non-negative/positive integers" >&2
   exit 2
 }
-
-log() { echo "[release] $*"; }
-die() { log "ERROR: $*" >&2; return 1; }
-
-cleanup() {
-  local rc=$?
-  rm -f -- "${STAGING_PREFIX}.manifest" "${STAGING_PREFIX}.env" "${STAGING_PREFIX}.sha" "${STAGING_PREFIX}.release" "${STAGING_PREFIX}.previous" 2>/dev/null || true
-  # These are exact per-run paths supplied by the workflow; never glob /tmp.
-  # The nonce now carries a repo-identity slug ahead of the numeric run fields
-  # (P1-1: GITHUB_RUN_ID is only unique within a single repo, not across repos),
-  # so this can no longer assume digits-only segments. Still anchored to the
-  # exact fixed prefix/suffix and restricted to safe filename characters (no
-  # `/`, `.`, or shell metacharacters) — a malformed value still cannot escape
-  # /tmp or target an arbitrary file.
-  if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.sh$ ]]; then
-    rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true
-  fi
-  if [[ "$REMOTE_MANIFEST_PATH" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.manifest$ ]]; then
-    rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true
-  fi
-  if [[ -n "${LOCK_HELD:-}" ]]; then
-    flock -u 9 2>/dev/null || true
-  fi
-  if [[ -n "${BUSY_LOCK_HELD:-}" ]]; then
-    flock -u 8 2>/dev/null || true
-  fi
-  trap - EXIT INT TERM HUP
-  exit "$rc"
-}
-on_signal() {
-  PENDING_SIGNAL="$1"
-  log "received ${1}; will finish current command and rollback without promotion"
-}
-trap cleanup EXIT
-trap 'on_signal INT' INT
-trap 'on_signal TERM' TERM
-# OpenSSH sends SIGHUP (not INT/TERM) to the remote command's process group
-# when the SSH transport drops. Without this trap, bash's default HUP
-# disposition kills the script immediately mid-critical-section — no EXIT
-# trap, no rollback — leaving the host on an unhealthy, unpromoted release.
-# Route it through the exact same pending-signal -> rollback/cleanup path as
-# INT/TERM; no new mechanism, just another signal into check_pending().
-trap 'on_signal HUP' HUP
 
 check_pending() {
   (( ROLLBACK_MODE == 1 )) && return 0
