@@ -171,8 +171,16 @@ jobs:
           set -euo pipefail
           SSH_OPTS=( -i "$HOME/.ssh/id_deploy" -o ServerAliveInterval=15 \
             -o ServerAliveCountMax=4 -o ConnectTimeout=20 )
-          release_base="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
-          [[ "$release_base" =~ ^[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
+          # GITHUB_RUN_ID is only guaranteed unique within a single repo, and this
+          # workflow's concurrency group (deploy-${{ inputs.host }}) is per-repo too.
+          # If the same host is deployed to by two different service repos at once,
+          # their run ids could collide, clobbering each other's remote manifest/
+          # script path. Anchor the remote path in repo identity as well, not just
+          # run id/attempt.
+          repo_slug="$(printf '%s' "${GITHUB_REPOSITORY//\//-}" | tr -cd 'A-Za-z0-9_-')"
+          [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
+          release_base="${repo_slug}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$release_base" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
           cleanup_local() {
             rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds"
           }
@@ -180,7 +188,7 @@ jobs:
           deploy_once() {
             local transport_attempt="$attempt"
             local transport_nonce="${release_base}-${transport_attempt}"
-            [[ "$transport_nonce" =~ ^[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
+            [[ "$transport_nonce" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
             local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
             local remote_script="/tmp/d3-release-${transport_nonce}.sh"
             scp "${SSH_OPTS[@]}" .ci-templates/scripts/release_deploy.sh \

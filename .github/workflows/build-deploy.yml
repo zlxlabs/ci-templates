@@ -193,7 +193,12 @@ jobs:
           # 互斥。同一台主机上如果两个不同服务仓并发部署(各自引用不同 tag,脚本内容
           # 可能不同),固定路径 /tmp/pull_and_deploy.sh 会被互相覆盖——新脚本可能被
           # 旧脚本覆盖后静默执行,门禁这类新增的安全逻辑可以被这样绕过而不自知。
-          REMOTE_SCRIPT="/tmp/pull_and_deploy.${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
+          # 仓库身份也要拼进去:GITHUB_RUN_ID 只保证仓库内唯一,不保证跨仓库唯一——
+          # 两个不同仓库各自的 run id 理论上仍可能撞上同一个数值(尤其配合 attempt/pid
+          # 这类局部唯一性拼接时),路径唯一性必须同时锚定"仓库"和"run"两个维度。
+          repo_slug="$(printf '%s' "${GITHUB_REPOSITORY//\//-}" | tr -cd 'A-Za-z0-9_-')"
+          [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
+          REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
 
           deploy_once() {
             scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \

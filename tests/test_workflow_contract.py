@@ -155,6 +155,22 @@ def test_remote_script_path_is_unique_per_run():
     # regression guard: the old fixed path must be gone entirely.
     assert ":/tmp/pull_and_deploy.sh" not in text, "fixed remote path must not reappear — it's the bug this test guards against"
 
+    # P1-1 parity: GITHUB_RUN_ID is only guaranteed unique within a single repo —
+    # two different service repos deploying to the same host concurrently could
+    # collide on run id (concurrency groups are per-repo too). The remote path
+    # must also be anchored in repo identity, not just run id/attempt.
+    assert "GITHUB_REPOSITORY" in text, (
+        "remote script path must also be derived from repo identity, since "
+        "GITHUB_RUN_ID alone is not unique across repositories"
+    )
+    assert "repo_slug" in text
+    idx_remote_script_def = text.index('REMOTE_SCRIPT="')
+    remote_script_line_end = text.index("\n", idx_remote_script_def)
+    remote_script_line = text[idx_remote_script_def:remote_script_line_end]
+    assert "repo_slug" in remote_script_line, (
+        "repo_slug must appear directly in the REMOTE_SCRIPT path assembly"
+    )
+
 
 def test_rc3_rechecks_remote_state_after_prior_transport_failure():
     # code review round 5 (P1): a 255 (SSH transport failure) can happen AFTER the

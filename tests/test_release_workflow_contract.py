@@ -51,6 +51,40 @@ def test_release_transfer_paths_are_run_unique_and_failure_notify_is_fail_open()
     assert "${transport_attempt}" in text
 
 
+def test_release_remote_paths_derive_from_repo_identity_not_just_run_id():
+    # P1-1: GITHUB_RUN_ID is only guaranteed unique within a single repo, and this
+    # workflow's concurrency group is per-repo too. If the same host is deployed to
+    # by two different service repos concurrently, colliding run ids could make one
+    # repo's remote manifest/script clobber the other's. The remote path must also
+    # be anchored in repo identity (GITHUB_REPOSITORY), not just run id/attempt.
+    text = WORKFLOW.read_text()
+    assert "GITHUB_REPOSITORY" in text
+    assert "repo_slug" in text
+
+    idx_repo_slug_def = text.index("repo_slug=")
+    idx_release_base_def = text.index("release_base=")
+    assert idx_repo_slug_def < idx_release_base_def, (
+        "repo_slug must be derived before release_base is assembled from it"
+    )
+
+    # release_base's own assignment line must fold in repo_slug so everything
+    # downstream (transport_nonce, remote_manifest, remote_script) inherits it
+    # without having to change more than the two validation regexes.
+    line_end = text.index("\n", idx_release_base_def)
+    release_base_line = text[idx_release_base_def:line_end]
+    assert "repo_slug" in release_base_line
+
+    # transport_nonce is built from release_base, and remote_manifest/remote_script
+    # are built from transport_nonce — confirm that chain is intact.
+    idx_nonce_def = text.index("transport_nonce=")
+    nonce_line_end = text.index("\n", idx_nonce_def)
+    nonce_line = text[idx_nonce_def:nonce_line_end]
+    assert "release_base" in nonce_line
+
+    assert 'remote_manifest="/tmp/d3-release-${transport_nonce}' in text
+    assert 'remote_script="/tmp/d3-release-${transport_nonce}' in text
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""
