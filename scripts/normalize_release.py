@@ -109,7 +109,10 @@ def _validate_probe(raw: object, index: int) -> tuple[str, str]:
     url = _text(raw.get("url"), f"probe {index}.url")
     if len(url) > 2048 or FORBIDDEN_URL_RE.search(url):
         raise ValidationError(f"probe {index}.url contains unsafe characters")
-    parsed = urlsplit(url)
+    try:
+        parsed = urlsplit(url)
+    except ValueError as exc:
+        raise ValidationError(f"probe {index}.url is not a valid URL: {exc}") from exc
     if parsed.scheme not in {"http", "https"} or not parsed.hostname:
         raise ValidationError(f"probe {index}.url must be an absolute http(s) URL")
     if parsed.username is not None or parsed.password is not None:

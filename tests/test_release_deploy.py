@@ -1019,3 +1019,82 @@ exit 0
     assert proc.returncode != 0, stdout + stderr
     assert marker.exists(), "TERM must not interrupt rollback compose"
     assert (Path(env["STATE_DIR"]) / "last_good_sha").read_text().strip() == "abc123456789"
+
+
+def test_rollback_refuses_when_image_set_changed(tmp_path):
+    # Codex review (release lane R4): rollback replays the OLD manifest's
+    # declared images via deploy_group -> compose_release, but `compose up -d`
+    # always acts on the FULL docker-compose.yml as it currently stands on the
+    # host. If the declared image-name set changed between the previous good
+    # release and this one (here: backend renamed to backend2 -- backend
+    # removed, backend2 added), replaying only the old manifest would roll
+    # frontend back while silently leaving backend2 untouched (still on the
+    # new image) -- a partial rollback the script must never perform silently.
+    # It must refuse outright: no docker call may reference the old SHA, the
+    # existing failure exit path is reused, and the log must explain why.
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0  # release 1: frontend+backend, promoted
+
+    new_manifest = tmp_path / "release2.manifest"
+    new_manifest.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\tfrontend\tfrontend\n"
+        "image\tbackend2\tbackend2\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(new_manifest)
+    env["D3_RELEASE_TAG"] = "def567890123"
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend2:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    mock_curl(Path(env["CURL_BIN"]), "500")  # force release 2's probe to fail -> rollback attempt
+
+    result = run(env)
+    assert result.returncode != 0
+    out = result.stdout + result.stderr
+    assert "image set changed" in out, out
+
+    lines = log.read_text().splitlines()
+    # No docker call may reference the previous release's SHA -- that would
+    # mean pull_and_retag/deploy_group ran for the old manifest despite the
+    # mismatched image set.
+    assert not any("abc123456789" in line for line in lines), lines
+    # Only release 2's own (failed-probe) compose up may have run; a second
+    # "up -d" would mean a rollback compose actually executed.
+    assert sum(line.endswith(" up -d") for line in lines) == 1
+
+    state = Path(env["STATE_DIR"])
+    assert (state / "last_good_sha").read_text().strip() == "abc123456789"
+    assert (state / "last_good_release").read_text().splitlines()[0] == "abc123456789"
+
+
+def test_rollback_proceeds_when_image_set_unchanged(tmp_path):
+    # Positive control for the image-set guard above: this scenario is
+    # already covered by test_probe_failure_rolls_back_entire_group_and_
+    # preserves_good (same RELEASE_MANIFEST file/images reused across both
+    # releases, probe forced to fail, rollback must still complete and
+    # restore last_good_sha to the previous release). Re-asserted here next
+    # to the new guard test so the "sets identical -> rollback unaffected"
+    # contract is visible in one place, without duplicating the scenario logic.
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")
+    log.write_text("")
+    result = run(env)
+    assert result.returncode != 0
+    out = result.stdout + result.stderr
+    assert "image set changed" not in out
+    lines = log.read_text().splitlines()
+    assert sum(line.endswith(" up -d") for line in lines) == 2
+    assert (Path(env["STATE_DIR"]) / "last_good_sha").read_text().strip() == "abc123456789"

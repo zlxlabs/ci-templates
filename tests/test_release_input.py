@@ -133,3 +133,25 @@ def test_image_name_follows_docker_path_component_syntax(tmp_path):
             tmp_path, [{"image_name": good_name, "build_context": ".", "dockerfile": "Dockerfile"}]
         )
         assert result.returncode == 0, f"{good_name!r} must be accepted: {result.stderr}"
+
+
+def test_probe_url_nfkc_urlsplit_valueerror_becomes_validation_error(tmp_path):
+    # A probe URL containing a fullwidth solidus (U+FF0F) survives the
+    # FORBIDDEN_URL_RE character check (it is not one of the forbidden ASCII
+    # shell metacharacters) but makes urlsplit() raise a bare ValueError
+    # during its internal NFKC-normalization safety check on the netloc. That
+    # ValueError is not a ValidationError, so main()'s
+    # `except (json.JSONDecodeError, ValidationError, OSError)` does not catch
+    # it: it must not propagate as an uncaught Python traceback (rc=1,
+    # unstructured output) -- it must be surfaced through this file's uniform
+    # "release input invalid: ..." ValidationError format (rc=2), exactly like
+    # every other rejected probe URL.
+    result, _, _ = run_normalizer(
+        tmp_path,
+        valid_images(),
+        [{"url": "http://example.com／foo", "expect_status": 200}],
+    )
+    assert result.returncode == 2, result.stdout + result.stderr
+    assert "release input invalid" in result.stderr
+    assert "Traceback" not in result.stderr
+    assert "probe 0.url" in result.stderr

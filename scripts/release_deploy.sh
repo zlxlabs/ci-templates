@@ -417,21 +417,53 @@ do_release() {
   fi
 
   if [[ -n "$previous_sha" && -n "$previous_manifest" && -f "$previous_manifest" && "$previous_sha" != "$D3_RELEASE_TAG" ]]; then
-    log "rolling back complete image group to ${previous_sha}"
-    # Once rollback starts, a second signal must not interrupt the group
-    # transition or leave the host on a half-staged release.
-    ROLLBACK_MODE=1
-    trap ':' INT TERM HUP
-    deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
-    if (( rollback_rc == 0 )); then
-      if probe_release; then
-        log "rollback to ${previous_sha} healthy"
-      else
-        log "rollback compose succeeded but probes still fail" >&2
-        rollback_rc=1
-      fi
+    # Rollback replays the PREVIOUS manifest's declared images via
+    # deploy_group -> compose_release, but `compose up -d` always acts on the
+    # full docker-compose.yml as it stands on the host right now. If the
+    # declared image-name set changed between the previous good release and
+    # this one (an image added, removed, or renamed), replaying only the old
+    # manifest would roll back the services that are still declared while
+    # silently leaving added/renamed services untouched (still on the new
+    # image, never validated against the old manifest's identity gate at
+    # all) -- a partial rollback that leaves the host in an inconsistent
+    # state without this script ever reporting it as an error. Rolling back
+    # across an image-set change is a documented, unsupported limitation
+    # (see README/BACKLOG): compare the two declared sets BEFORE touching
+    # anything and refuse outright on any mismatch, rather than let compose
+    # silently apply a half-old, half-new group.
+    local old_names=() cur_names=() name added=() removed=()
+    if load_manifest "$previous_manifest"; then
+      old_names=("${IMAGE_NAMES[@]}")
+    fi
+    if load_manifest "$RELEASE_MANIFEST"; then
+      cur_names=("${IMAGE_NAMES[@]}")
+    fi
+    if [[ "${#old_names[@]}" -gt 0 && "${#cur_names[@]}" -gt 0 ]]; then
+      declare -A _old_seen=() _cur_seen=()
+      for name in "${old_names[@]}"; do _old_seen["$name"]=1; done
+      for name in "${cur_names[@]}"; do _cur_seen["$name"]=1; done
+      for name in "${cur_names[@]}"; do [[ -n "${_old_seen[$name]+x}" ]] || added+=("$name"); done
+      for name in "${old_names[@]}"; do [[ -n "${_cur_seen[$name]+x}" ]] || removed+=("$name"); done
+    fi
+    if [[ "${#old_names[@]}" -eq 0 || "${#cur_names[@]}" -eq 0 || "${#added[@]}" -gt 0 || "${#removed[@]}" -gt 0 ]]; then
+      log "rollback impossible: image set changed since last good release (added: ${added[*]:-none} / removed: ${removed[*]:-none}); manual intervention required, containers left as-is" >&2
     else
-      log "rollback failed; last_good remains ${previous_sha}" >&2
+      log "rolling back complete image group to ${previous_sha}"
+      # Once rollback starts, a second signal must not interrupt the group
+      # transition or leave the host on a half-staged release.
+      ROLLBACK_MODE=1
+      trap ':' INT TERM HUP
+      deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
+      if (( rollback_rc == 0 )); then
+        if probe_release; then
+          log "rollback to ${previous_sha} healthy"
+        else
+          log "rollback compose succeeded but probes still fail" >&2
+          rollback_rc=1
+        fi
+      else
+        log "rollback failed; last_good remains ${previous_sha}" >&2
+      fi
     fi
   else
     log "no previous good release available; refusing pseudo-rollback" >&2
