@@ -44,6 +44,16 @@ def test_workflow_uses_least_privilege_and_immutable_action_references():
         assert f"uses: {action}@{sha}" in text, f"{action} must be pinned to its full commit SHA"
 
 
+def test_ci_templates_checkout_uses_org_repo_path_not_legacy_personal_path():
+    # 2026-07-24:本仓真实地址是 zlxlabs/ci-templates(git remote 可证)。旧个人路径
+    # zj1123581321/ci-templates 目前只靠 GitHub 仓库转移重定向才能工作——旧用户名
+    # 一旦被他人重新注册,这步 checkout 就会拉到攻击者控制的仓库,而此时 job 已经
+    # 握着 6 个部署 secret。统一到组织名下,不依赖重定向兜底。
+    text = WORKFLOW.read_text()
+    assert "zj1123581321" not in text, "legacy personal repo path must not reappear"
+    assert "repository: zlxlabs/ci-templates" in text
+
+
 def test_secrets_declared_explicitly_not_inherited():
     raw, trigger = _load()
     # strip comments — the contract is about real YAML, not prose

@@ -76,7 +76,7 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 ```yaml
 jobs:
   ship:
-    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@v1
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
     with:
       image_name: web-api
       host: 100.64.0.1           # Tailscale 可达 IP/MagicDNS（runner 无 ~/.ssh/config，不能用别名 host-1）
@@ -179,6 +179,18 @@ python scripts/validate_registry.py registry.yaml
 ```
 
 CI 在 PR 时自动跑 —— 漏字段 / 重复 slug / 重复端口 / DSN 明文 一律 **fail fast**。
+
+### 多镜像（release lane）服务怎么登记
+
+registry 仍然**一服务一条**，schema 不变。`id` 的语义是「服务标识」（对多镜像
+服务而言就是 compose 项目本身），**不是** ACR 镜像名——release lane 服务的镜像名
+不来自 registry，而来自 caller 自己声明的 `images_json`（见
+[`examples/release-caller-workflow.yml`](examples/release-caller-workflow.yml)），
+一个服务对应多个镜像，例如 `<id>-backend` / `<id>-frontend`。这是上表
+「`id` 即 ACR image 名」这条假设的**显式例外**：该假设只对单镜像（`build-deploy.yml`）
+服务成立；`healthcheck_url` 同理不适用（release lane 的探针配置在 caller 的
+`probes_json` 里，registry 不重复登记）。`deploy_dir` 仍指向该服务 compose 文件
+所在目录，两条 lane 共用同一套 host/deploy_dir 唯一性约束。
 
 ## 测试
 

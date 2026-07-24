@@ -7,7 +7,7 @@ on:
 
 jobs:
   ship:
-    uses: zj1123581321/ci-templates/.github/workflows/build-deploy.yml@main
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@main
     with:
       image_name: canary-svc
       host: 100.64.0.1          # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)
