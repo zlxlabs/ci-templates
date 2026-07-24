@@ -223,6 +223,45 @@ def test_rc3_recheck_cat_escapes_deploy_dir():
     )
 
 
+def test_run_steps_do_not_directly_expand_inputs():
+    # P1-A (codex review round 5) parity with build-deploy.yml: GitHub Actions
+    # substitutes ${{ }} expressions into `run:` text via plain textual
+    # replacement before the shell ever sees it -- not shell variable
+    # injection, a text splice. If the substituted value contains a newline,
+    # whatever follows the substitution point on that line (even inside a
+    # shell comment) becomes a new, literally-executed shell command, and by
+    # this point in the job the runner already holds ACR/SSH credentials.
+    # `inputs.*` values must be routed through the step's `env:` mapping and
+    # referenced as "$VAR" instead of being spliced directly into run: text.
+    raw, _ = load()
+    for job_name, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not run:
+                continue
+            assert "${{ inputs." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ inputs.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+
+
+def test_ssh_user_and_host_are_syntax_validated_before_use():
+    # P1-B (codex review round 5) parity with build-deploy.yml: an ssh_user
+    # starting with '-' makes the assembled "${SSH_USER}@${DEPLOY_HOST}:path"
+    # argument itself start with '-', which scp/ssh parse as a command-line
+    # option rather than a user@host target -- double-quoting does not stop
+    # this, since the problem is scp/ssh's own option parsing. Both values
+    # must be regex-validated before their first use in deploy_once().
+    text = WORKFLOW.read_text()
+    assert 'SSH_USER" =~' in text, (
+        "ssh_user must be regex-validated against a safe charset before use"
+    )
+    assert 'DEPLOY_HOST" =~' in text, (
+        "host must be regex-validated against a safe charset before use"
+    )
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""

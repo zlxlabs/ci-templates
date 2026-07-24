@@ -324,3 +324,44 @@ def test_rc3_recheck_cat_escapes_deploy_dir():
         "both the pre_good baseline and remote_good recheck cat calls must use "
         "the %q-escaped DEPLOY_DIR"
     )
+
+
+def test_run_steps_do_not_directly_expand_inputs():
+    # P1-A (codex review round 5): GitHub Actions substitutes ${{ }} expressions
+    # into `run:` text via plain textual replacement BEFORE the shell ever sees
+    # it -- it is not shell variable injection, it is a text splice. If the
+    # substituted value contains a newline, whatever text follows the
+    # substitution point on that line (even inside a shell comment) becomes a
+    # new, literally-executed shell command. At this point in the job the
+    # runner already holds ACR/SSH credentials, so this is a high-value
+    # injection surface. `inputs.*` values must be routed through the step's
+    # `env:` mapping and referenced as "$VAR" in the script body instead of
+    # being spliced directly into `run:` text.
+    raw, _ = _load()
+    for job_name, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not run:
+                continue
+            assert "${{ inputs." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ inputs.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+
+
+def test_ssh_user_and_host_are_syntax_validated_before_use():
+    # P1-B (codex review round 5): if ssh_user starts with '-', the assembled
+    # "${SSH_USER}@${DEPLOY_HOST}:path" argument itself starts with '-' and
+    # scp/ssh parse it as a command-line option (e.g. a crafted
+    # -oProxyCommand=... value), not as a user@host target -- double-quoting
+    # does not stop this, because the problem is scp/ssh's own option parsing,
+    # not shell word-splitting. Both values must be validated against a safe
+    # character class before their first use in deploy_once()/SSH_OPTS.
+    text = WORKFLOW.read_text()
+    assert 'SSH_USER" =~' in text, (
+        "ssh_user must be regex-validated against a safe charset before use"
+    )
+    assert 'DEPLOY_HOST" =~' in text, (
+        "host must be regex-validated against a safe charset before use"
+    )
