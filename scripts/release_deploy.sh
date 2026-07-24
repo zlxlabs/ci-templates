@@ -219,7 +219,16 @@ compose_release() {
   fi
   compose_args+=(--env-file "$ENV_FILE")
   local rendered_images config_rc=0 image_ref found_any line
-  rendered_images="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
+  # Docker Compose resolves ${VAR} interpolation from the shell environment
+  # BEFORE --env-file. D3_RELEASE_TAG is exported into this whole script's
+  # process environment by the SSH invocation and is never reassigned, so a
+  # bare `docker compose ...` call here would keep resolving whichever tag the
+  # script started with — wrong during rollback, when this function is asked
+  # to deploy a DIFFERENT (older) tag than the one still sitting in the
+  # process environment. Pin D3_RELEASE_TAG="$tag" explicitly on every compose
+  # invocation so it always reflects what THIS call is actually deploying,
+  # regardless of what leaked in from the process environment.
+  rendered_images="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
   if (( config_rc != 0 )); then
     log "compose config --images failed; compose up will not run" >&2
     return 1
@@ -254,7 +263,7 @@ compose_release() {
   done
   compose_args+=(up -d)
   local compose_rc=0
-  (cd "$DEPLOY_DIR" && "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
+  (cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
   check_pending || return 130
   return "$compose_rc"
 }

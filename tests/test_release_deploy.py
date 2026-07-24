@@ -346,6 +346,82 @@ exit 0
     assert (state / "last_good_manifest").read_bytes() == before_manifest
 
 
+def test_rollback_env_leak_does_not_poison_identity_gate(tmp_path):
+    # P1-A: D3_RELEASE_TAG is exported into this script's process environment by
+    # the SSH invocation (`D3_RELEASE_TAG=... bash release_deploy.sh`) and is
+    # NEVER reassigned for the life of the process — it still holds the NEW
+    # release's tag even while do_release() is rolling the compose group back
+    # to the OLD tag it just wrote into ENV_FILE. Real `docker compose`
+    # resolves ${D3_RELEASE_TAG} interpolation from the shell environment
+    # BEFORE --env-file, so unless every compose invocation explicitly pins
+    # D3_RELEASE_TAG to the tag it is actually deploying, the rollback's own
+    # `config --images` gate check (and `up -d`) resolve the NEW tag instead
+    # of the OLD one it was just told to deploy — the identity gate then
+    # rejects its own rollback attempt as a "stray reference" and the host is
+    # stuck on the failed release.
+    #
+    # The mock below deliberately reproduces real compose's env-over-file
+    # precedence (rather than a "just cat the --env-file" shortcut, which
+    # would silently hide this bug) so this test fails against the unfixed
+    # script and passes once compose_release() pins D3_RELEASE_TAG=<tag> on
+    # each docker invocation.
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    state = Path(env["STATE_DIR"])
+    before_sha = (state / "last_good_sha").read_text().strip()
+    assert before_sha == "abc123456789"
+
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = pull ]; then exit 0; fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = tag ]; then exit 0; fi
+env_file=""
+read_next=0
+for arg in "$@"; do
+  if [ "$read_next" = 1 ]; then env_file="$arg"; read_next=0; fi
+  if [ "$arg" = --env-file ]; then read_next=1; fi
+done
+# Reproduce real docker compose precedence: a shell-environment
+# D3_RELEASE_TAG (if the invoking process still has one set) wins over
+# --env-file. This is what a bare, unpinned `docker compose ...` call would
+# actually resolve on the SSH host.
+if [ -n "${{D3_RELEASE_TAG:-}}" ]; then
+  tag="$D3_RELEASE_TAG"
+else
+  tag=$(grep '^D3_RELEASE_TAG=' "$env_file" | cut -d= -f2)
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$tag" "$tag"
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  printf 'up-d-tag=%s\\n' "$tag" >> "{log}"
+  exit 0
+fi
+exit 0
+''',
+    )
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")  # force the new release's probe to fail -> rollback
+    result = run(env)
+    assert result.returncode != 0
+    out = result.stdout + result.stderr
+    assert "compose identity gate" not in out, (
+        "rollback must not be rejected by a D3_RELEASE_TAG leaked from the NEW "
+        "release's process environment: " + out
+    )
+    lines = log.read_text().splitlines()
+    assert f"up-d-tag={before_sha}" in lines, (
+        "rollback's compose up must actually run, pinned to the OLD tag, "
+        "despite the leaked process env"
+    )
+    assert (state / "last_good_sha").read_text().strip() == before_sha
+
+
 def test_legacy_refresh_failure_after_canonical_commit_is_fail_open(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
