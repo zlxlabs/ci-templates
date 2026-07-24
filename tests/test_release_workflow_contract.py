@@ -262,6 +262,31 @@ def test_ssh_user_and_host_are_syntax_validated_before_use():
     )
 
 
+def test_orphaned_remote_files_cleaned_up_on_transport_failure():
+    # P2-B (codex review round 5): remote_manifest/remote_script are local
+    # variables inside deploy_once(), keyed by transport_attempt/
+    # transport_nonce, so every retry uses a fresh nonce and never overwrites
+    # or reclaims a prior failed attempt's files. If either scp fails, or the
+    # ssh command itself fails at the transport layer (rc=255), the remote
+    # script never gets a chance to run its own cleanup trap -- nothing else
+    # will ever remove those /tmp paths. A best-effort ssh rm -f cleanup,
+    # covering both remote_manifest and remote_script, must be reachable from
+    # all three failure points inside deploy_once().
+    text = WORKFLOW.read_text()
+    assert "cleanup_remote_cmd" in text, (
+        "deploy_once() must build a reusable best-effort remote cleanup command"
+    )
+    assert "rm -f -- %q %q" in text, (
+        "the cleanup command must %q-escape both remote paths, matching this "
+        "function's existing printf %q discipline"
+    )
+    assert text.count('"$cleanup_remote_cmd"') == 3, (
+        "the cleanup command must be invoked at each of the three transport-"
+        "failure points inside deploy_once(): the first scp, the second scp, "
+        "and the ssh command itself"
+    )
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""

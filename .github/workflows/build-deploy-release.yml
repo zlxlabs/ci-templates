@@ -212,16 +212,42 @@ jobs:
             [[ "$transport_nonce" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
             local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
             local remote_script="/tmp/d3-release-${transport_nonce}.sh"
+            # P2-B (codex review round 5): best-effort remote cleanup for the
+            # case where the remote script never gets a chance to run (so its
+            # own cleanup trap never installs) -- e.g. either scp fails, or
+            # the ssh call below fails at the transport layer (rc=255).
+            # remote_manifest/remote_script are local to this attempt (keyed
+            # by transport_nonce), so a later retry uses a fresh path and
+            # never reclaims this one; nothing else will ever remove it.
+            # rm -f on a path that was never created (e.g. the first scp
+            # failing before either file exists) is already a safe no-op, so
+            # this is applied uniformly rather than branching per failure
+            # point. %q-escaped, matching this function's own printf %q
+            # discipline for remote_cmd below. Cleanup failure itself must
+            # never mask/override the real transport failure being reported.
+            local cleanup_remote_cmd
+            printf -v cleanup_remote_cmd 'rm -f -- %q %q' "$remote_manifest" "$remote_script"
             scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_deploy.sh" \
-              "${SSH_USER}@${DEPLOY_HOST}:${remote_script}" || return 255
+              "${SSH_USER}@${DEPLOY_HOST}:${remote_script}" || {
+                ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                return 255
+              }
             scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.manifest" \
-              "${SSH_USER}@${DEPLOY_HOST}:${remote_manifest}" || return 255
+              "${SSH_USER}@${DEPLOY_HOST}:${remote_manifest}" || {
+                ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                return 255
+              }
             # printf %q makes every input one shell word; no JSON or raw input
             # is ever concatenated into the remote command.
             printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
               "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
               "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" "$remote_manifest" "$remote_script" "$remote_script"
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
+            local ssh_rc=$?
+            if [[ "$ssh_rc" -eq 255 ]]; then
+              ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+            fi
+            return "$ssh_rc"
           }
           # Door-opening baseline for the rc=3 recheck below (only relevant when
           # the busy-lock gate is opt-in): rc=3 later on only proves "can't get the

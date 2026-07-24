@@ -37,6 +37,17 @@ from urllib.parse import urlsplit
 # to `docker build`/`docker tag`. build_alias reuses the same regex.
 IMAGE_RE = re.compile(r"^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$")
 ALIAS_RE = IMAGE_RE
+# P2-A (codex review round 5): the remote load_manifest() in release_deploy.sh
+# validates image names against `^[a-z0-9][a-z0-9._-]{0,127}$` -- a first
+# char plus up to 127 more, 128 characters total. This must match that limit
+# exactly so a too-long name is rejected here, at the fail-fast build-side
+# validator, instead of building and pushing an image the deploy-side script
+# will then refuse -- burning a full CI cycle before the mismatch surfaces.
+# build_alias does not need this cap: it is a purely local grouping key
+# written only to d3-release.builds (which stays on the runner) and never
+# appears in the manifest scp'd to the remote host, so it is never subject to
+# load_manifest()'s grammar.
+IMAGE_NAME_MAX_LEN = 128
 STATUS_RE = re.compile(r"^[1-5][0-9][0-9]$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 FORBIDDEN_URL_RE = re.compile(r"[\s;|&$`(){}<>\[\]\\\"']")
@@ -86,6 +97,11 @@ def _validate_image(raw: object, index: int) -> dict[str, str]:
     image_name = _text(raw.get("image_name"), f"image {index}.image_name")
     if not IMAGE_RE.fullmatch(image_name):
         raise ValidationError(f"image {index}.image_name is unsafe: {image_name!r}")
+    if len(image_name) > IMAGE_NAME_MAX_LEN:
+        raise ValidationError(
+            f"image {index}.image_name exceeds {IMAGE_NAME_MAX_LEN} characters: "
+            f"{len(image_name)} chars"
+        )
     build_context = _relative_path(raw.get("build_context"), f"image {index}.build_context")
     dockerfile = _relative_path(raw.get("dockerfile"), f"image {index}.dockerfile")
     build_alias = raw.get("build_alias", image_name)

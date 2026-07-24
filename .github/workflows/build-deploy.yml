@@ -309,6 +309,14 @@ jobs:
             had_transport_failure=1
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "::error::SSH transport failed after ${max_attempts} attempts (rc=255)"
+              # P2-B (codex review round 5): best-effort cleanup. REMOTE_SCRIPT's
+              # path is fixed for this whole job (not per-attempt), so if every
+              # retry failed at the transport layer, the remote script never got
+              # a chance to run — its own cleanup trap never installed — and
+              # nothing else will ever remove this orphaned file once we give up
+              # retrying. A failure of this cleanup itself must not mask the
+              # real transport failure being reported above.
+              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
               exit 1
             fi
             echo "::warning::SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"

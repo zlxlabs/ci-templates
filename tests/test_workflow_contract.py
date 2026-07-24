@@ -365,3 +365,25 @@ def test_ssh_user_and_host_are_syntax_validated_before_use():
     assert 'DEPLOY_HOST" =~' in text, (
         "host must be regex-validated against a safe charset before use"
     )
+
+
+def test_orphaned_remote_script_cleaned_up_when_retries_exhausted():
+    # P2-B (codex review round 5): REMOTE_SCRIPT's path is fixed for the whole
+    # job (constructed once before the retry loop, not per-attempt), so if
+    # scp/ssh keep failing at the transport layer (rc=255) across every
+    # retry, the remote script never gets a chance to run its own cleanup
+    # trap, and nothing else ever removes the orphaned /tmp file once retries
+    # are exhausted. A best-effort ssh rm -f cleanup must run right before the
+    # final give-up `exit 1` in the "attempt >= max_attempts" branch.
+    text = WORKFLOW.read_text()
+    assert "rm -f -- '${REMOTE_SCRIPT}'" in text, (
+        "must best-effort clean up the orphaned REMOTE_SCRIPT path on the host "
+        "when transport retries are exhausted"
+    )
+    idx_giveup = text.index("SSH transport failed after ${max_attempts} attempts (rc=255)")
+    idx_cleanup = text.index("rm -f -- '${REMOTE_SCRIPT}'")
+    idx_exit1 = text.index("exit 1", idx_giveup)
+    assert idx_giveup < idx_cleanup < idx_exit1, (
+        "cleanup must happen inside the exhausted-retries branch, before its "
+        "final exit 1"
+    )

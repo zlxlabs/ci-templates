@@ -135,6 +135,34 @@ def test_image_name_follows_docker_path_component_syntax(tmp_path):
         assert result.returncode == 0, f"{good_name!r} must be accepted: {result.stderr}"
 
 
+def test_image_name_length_matches_remote_128_char_limit(tmp_path):
+    # P2-A (codex review round 5): the remote load_manifest() in
+    # release_deploy.sh validates image names against
+    # `^[a-z0-9][a-z0-9._-]{0,127}$` -- a first char plus up to 127 more, 128
+    # characters total. normalize_release.py's IMAGE_RE had no length limit at
+    # all, so the build lane would accept, build, and push an image name over
+    # 128 chars, only for the remote deploy script to reject it once the
+    # deploy step ran -- burning a full CI cycle before the build/deploy
+    # length mismatch surfaced. build_alias is not subject to this remote
+    # grammar (it never appears in the manifest scp'd to the host -- it is a
+    # purely local grouping key in d3-release.builds, which stays on the
+    # runner), so it deliberately gets no length cap here.
+    for good_len in (127, 128):
+        name = "a" * good_len
+        result, _, _ = run_normalizer(
+            tmp_path, [{"image_name": name, "build_context": ".", "dockerfile": "Dockerfile"}]
+        )
+        assert result.returncode == 0, f"{good_len}-char name must be accepted: {result.stderr}"
+
+    for bad_len in (129, 200):
+        name = "a" * bad_len
+        result, _, _ = run_normalizer(
+            tmp_path, [{"image_name": name, "build_context": ".", "dockerfile": "Dockerfile"}]
+        )
+        assert result.returncode != 0, f"{bad_len}-char name must be rejected"
+        assert "image_name" in result.stderr, result.stderr
+
+
 def test_probe_url_nfkc_urlsplit_valueerror_becomes_validation_error(tmp_path):
     # A probe URL containing a fullwidth solidus (U+FF0F) survives the
     # FORBIDDEN_URL_RE character check (it is not one of the forbidden ASCII
