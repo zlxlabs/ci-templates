@@ -85,50 +85,37 @@ def test_release_remote_paths_derive_from_repo_identity_not_just_run_id():
     assert 'remote_script="/tmp/d3-release-${transport_nonce}' in text
 
 
-def test_release_rc3_rechecks_canonical_last_good_release_after_prior_transport_failure():
-    # P1-2: this mirrors the single-image lane's R5/R6-hardened recheck in
-    # build-deploy.yml (had_transport_failure / pre_good / __unknown__), adapted to
-    # the release lane's own state layout. release_deploy.sh's STATE_DIR is
-    # ${DEPLOY_DIR}/.deploy-state/release (not the single-image lane's bare
-    # .deploy-state).
-    #
-    # P2 (codex review): the recheck must read the CANONICAL commit point —
-    # last_good_release (GOOD_RELEASE_FILE in release_deploy.sh) — not the
-    # legacy last_good_sha view. promote()'s only atomic commit is the
-    # same-directory rename onto last_good_release; last_good_sha/
-    # last_good_manifest are best-effort legacy views written AFTER that
-    # commit and can lag behind or be missing on a partial legacy-refresh
-    # failure (see promote()'s WARN-and-continue fallback), so a recheck
-    # keyed on last_good_sha could stay wrongly "unconfirmed" even after a
-    # real canonical promotion. last_good_release's first line is the SHA
-    # (see the `head -n1` extraction), the rest is the manifest body.
-    #
-    # A 255 (SSH transport failure) can happen AFTER the remote release already
-    # promoted successfully but before the exit code made it back over the wire. A
-    # later rc=3 (busy-lock deferred) must not be trusted at face value in that
-    # case — recheck the host's canonical last_good_release before reporting
-    # "deferred".
+def test_release_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
+    # 2026-07-24 subtractive refactor (mirrors build-deploy.yml): dropped the
+    # post-255 auto-promotion machine -- pre_good baseline capture, remote_good
+    # recheck of the canonical last_good_release, the __unknown__ sentinel, and
+    # the three-way promotion condition (hardened across R5/R6/P2 review
+    # rounds). The proof conditions themselves (historical same-value false
+    # positives, unobtainable-baseline semantics, a rollback-manifest race) kept
+    # getting punched full of holes across review -- upkeep outweighed the
+    # value. The honest semantics now: once this run has seen a 255, remote
+    # state is inherently uncertain, so rc=3 always defers; the only thing that
+    # changes is an extra "state uncertain" warning, never a promotion to
+    # success.
     text = WORKFLOW.read_text()
 
-    assert "pre_good" in text
-    assert "had_transport_failure" in text
-    assert "__unknown__" in text
-    assert ".deploy-state/release/last_good_release" in text, (
-        "the rc=3 recheck must read the canonical last_good_release commit point, "
-        "not the best-effort legacy last_good_sha view"
+    # the auto-promotion machine must be gone entirely -- no baseline/recheck
+    # variables, no unknown-sentinel, no read of the canonical commit point.
+    assert "pre_good" not in text, "post-255 baseline capture must be gone"
+    assert "remote_good" not in text, "post-255 remote recheck must be gone"
+    assert "__unknown__" not in text, "the baseline-unknown sentinel must be gone"
+    assert ".deploy-state/release/last_good_release" not in text, (
+        "the rc=3 recheck reading the canonical last_good_release must be gone"
     )
-    assert "head -n1" in text, (
-        "last_good_release's first line is the SHA; the recheck must extract just "
-        "that line rather than comparing the whole file"
-    )
-
-    idx_while = text.index("while true")
-    idx_pre_good_init = text.index("pre_good=")
-    assert idx_pre_good_init < idx_while, (
-        "pre_good's baseline capture must happen before the retry loop starts, not "
-        "inside it — otherwise it can't represent the pre-run state"
+    assert "_qdir" not in text, (
+        "the %q-escaped DEPLOY_DIR token that only served the deleted recheck "
+        "must be gone too (deploy_once()'s own %q-escaped remote_cmd/"
+        "cleanup_remote_cmd variables are unrelated and must remain untouched)"
     )
 
+    # had_transport_failure tracking is preserved: initialised before the loop,
+    # set only once rc==255 is confirmed. This is the signal the honest warning
+    # still depends on -- it is not part of what got torn out.
     idx_init = text.index("had_transport_failure=0")
     idx_rc3 = text.index('"$rc" -eq 3')
     idx_rc_ne_255 = text.index('"$rc" -ne 255')
@@ -136,29 +123,16 @@ def test_release_rc3_rechecks_canonical_last_good_release_after_prior_transport_
     assert idx_init < idx_rc3, "had_transport_failure must be initialised before the loop"
     assert idx_rc_ne_255 < idx_set, "had_transport_failure=1 must be set on the confirmed-255 path"
 
-    # regression guard: deferred (busy_deferred) must still exist as the fallback.
-    assert "busy_deferred=true" in text, (
-        "rc=3 must still be able to fall through to deferred when the recheck "
-        "doesn't confirm success"
-    )
+    # the honest warning is the core of the new semantics: say "uncertain"
+    # instead of quietly promoting to success.
+    assert (
+        "::warning::transport was interrupted earlier in this run; remote state "
+        "may have advanced beyond what 'deferred' implies" in text
+    ), "the honest uncertainty warning must remain after dropping auto-promotion"
 
-    # the success-promotion if-condition must require all three: the current
-    # recheck value matches D3_RELEASE_TAG, pre_good was different beforehand (i.e.
-    # it actually changed during this run), and pre_good was obtainable at all.
-    idx_remote_good_if = text.index('"$remote_good"')
-    line_start = text.rindex("\n", 0, idx_remote_good_if) + 1
-    line_end = text.index("\n", idx_remote_good_if)
-    promotion_line = text[line_start:line_end]
-    assert "D3_RELEASE_TAG" in promotion_line
-    assert "pre_good" in promotion_line, (
-        "the success-promotion if-condition must also reference pre_good, not just "
-        "the current recheck value — otherwise a historical same-value coincidence "
-        "is indistinguishable from an in-run success"
-    )
-    assert "__unknown__" in promotion_line, (
-        "the success-promotion if-condition must refuse to promote to success when "
-        "the pre-loop baseline itself couldn't be fetched (ssh failure)"
-    )
+    # regression guard: deferred (busy_deferred) must still exist as the (only)
+    # outcome.
+    assert "busy_deferred=true" in text, "rc=3 must still fall through to deferred"
 
 
 def test_release_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
@@ -198,28 +172,6 @@ def test_release_checkouts_do_not_persist_credentials_and_ci_templates_leaves_bu
     idx_normalize = text.index("normalize_release.py")
     assert idx_mv < idx_normalize, (
         "ci-templates must be relocated before the first step that uses its scripts"
-    )
-
-
-def test_rc3_recheck_cat_escapes_deploy_dir():
-    # P1-C (codex review) parity with build-deploy.yml: the baseline
-    # (pre_good) and recheck (remote_good) calls interpolate DEPLOY_DIR raw
-    # inside single quotes in a runner-built string handed to ssh. Unlike
-    # this lane's main deploy command (already `printf %q`-escaped end to
-    # end), these two recheck calls were added in a later round and missed
-    # it — a DEPLOY_DIR containing a single quote breaks the remote shell's
-    # quoting. (P2 later swapped the recheck's `cat ... last_good_sha` for
-    # `head -n1 ... last_good_release` to read the canonical commit point —
-    # see test_release_rc3_rechecks_canonical_last_good_release_after_prior_transport_failure
-    # — but the %q-escaping contract asserted here is unaffected by that.)
-    text = WORKFLOW.read_text()
-    assert "'${DEPLOY_DIR}/" not in text, (
-        "recheck calls must not interpolate DEPLOY_DIR raw inside single "
-        "quotes — %q-escape it first, matching the main deploy command's style"
-    )
-    assert text.count("head -n1 ${_qdir}/.deploy-state/release/last_good_release") == 2, (
-        "both the pre_good baseline and remote_good recheck calls must read the "
-        "canonical last_good_release through the %q-escaped DEPLOY_DIR"
     )
 
 

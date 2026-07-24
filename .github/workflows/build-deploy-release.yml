@@ -296,38 +296,6 @@ jobs:
             # than a silently rejected rollback.
             return "$ssh_rc"
           }
-          # Door-opening baseline for the rc=3 recheck below (only relevant when
-          # the busy-lock gate is opt-in): rc=3 later on only proves "can't get the
-          # busy lock right now", not "the old release is still running" — a prior
-          # 255 in this run could have happened AFTER the remote release already
-          # promoted, before its exit code made it back over the wire. Comparing
-          # against a pre-loop baseline is what lets the recheck tell "changed
-          # during this run" apart from "already this value before this run
-          # started" (e.g. a manual re-run of an already-deployed SHA). A baseline
-          # we can't fetch (ssh failure) is marked __unknown__ so the recheck never
-          # promotes without a real basis for comparison. This reads the release
-          # lane's CANONICAL commit point (GOOD_RELEASE_FILE in release_deploy.sh,
-          # $STATE_DIR/last_good_release where STATE_DIR=${DEPLOY_DIR}/.deploy-state/release)
-          # rather than the legacy last_good_sha view: promote()'s only atomic
-          # commit is the same-directory rename onto last_good_release; last_good_sha
-          # is a best-effort legacy view written AFTER that commit and can lag
-          # behind (or be missing) if that later, non-atomic legacy refresh step
-          # fails, which would make a last_good_sha-based recheck wrongly stay
-          # "unconfirmed" even after a real canonical promotion. last_good_release's
-          # first line is the SHA (see promote()); `head -n1` extracts just that.
-          # DEPLOY_DIR is interpolated into a remote shell command below; a
-          # value containing a single quote would break out of naive single-
-          # quote interpolation (truncation at best, injection at worst).
-          # %q-escape it once up front, matching this lane's main deploy
-          # command's existing %q discipline, and reuse the safe token.
-          printf -v _qdir '%q' "$DEPLOY_DIR"
-          pre_good="__unknown__"
-          if [ -n "$BUSY_LOCK_FILE" ]; then
-            if _pg=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" \
-                 "head -n1 ${_qdir}/.deploy-state/release/last_good_release 2>/dev/null || true"); then
-              pre_good="$_pg"
-            fi
-          fi
           attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
@@ -341,22 +309,16 @@ jobs:
             if [[ "$rc" -ne 255 ]]; then
               if [[ "$rc" -eq 3 ]]; then
                 if [[ "$had_transport_failure" -eq 1 ]]; then
-                  # A 255 happened earlier in this run: that attempt's remote side
-                  # may have already completed (promote() ran) even though the exit
-                  # code never made it back. rc=3 here only means "busy lock not
-                  # acquired right now" — recheck the host's canonical
-                  # last_good_release before trusting the "deferred, old release
-                  # kept" story.
-                  remote_good=$(ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" \
-                    "head -n1 ${_qdir}/.deploy-state/release/last_good_release 2>/dev/null" || true)
-                  # All three must hold: remote_good now equals this run's SHA;
-                  # pre_good was different (proves the change happened during this
-                  # run, not a historical same-value coincidence); and pre_good was
-                  # obtainable at all (no baseline -> no proof -> stay deferred).
-                  if [[ "$remote_good" == "$D3_RELEASE_TAG" && "$pre_good" != "$D3_RELEASE_TAG" && "$pre_good" != "__unknown__" ]]; then
-                    echo "::notice::atomic release deploy ok — an earlier attempt completed on the host despite the SSH transport failure (canonical last_good_release changed to ${D3_RELEASE_TAG} during this run)"
-                    break
-                  fi
+                  # Design decision (2026-07-24 subtractive refactor: dropped the
+                  # post-255 auto-promotion machine). Once this run has seen a 255,
+                  # remote state is inherently uncertain. We used to recheck the
+                  # canonical last_good_release and auto-promote to success on a
+                  # three-way match, but the proof conditions (historical
+                  # same-value false positives, an unobtainable baseline, races)
+                  # kept getting punched full of holes across two review rounds --
+                  # upkeep outweighed the value. Reruns are idempotent and
+                  # converge; a human confirming on the host when in doubt is
+                  # cheaper than maintaining that machine.
                   echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
                 fi
                 echo "busy_deferred=true" >> "$GITHUB_OUTPUT"

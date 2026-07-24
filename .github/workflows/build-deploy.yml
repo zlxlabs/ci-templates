@@ -258,26 +258,6 @@ jobs:
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
-          # 门禁开启时先取 last_good 基线:后面 255→rc=3 的复核要证明的是"last_good 在
-          # 本次 run 期间才变成 GIT_SHA",光比对现值会把重跑已部署 SHA(手动 re-run,或
-          # 两次 push 恰好产生同一个 GIT_SHA)时的历史遗留同值误当成功证据。基线取不到
-          # (ssh 传输失败)就标记 __unknown__,复核时不做成功提升(没有对照基准,宁可保守
-          # 走 deferred)。远端文件不存在是合法的"此前无 last_good"状态,取到空字符串
-          # 即可,不算 unknown——两种"空"语义不同,不能混。只服务于忙锁门禁场景,未开
-          # 门禁的 caller 不会触发 rc=3,没必要多这次 ssh 调用。
-          # DEPLOY_DIR is interpolated into a remote shell command below; a
-          # value containing a single quote would break out of naive single-
-          # quote interpolation (truncation at best, injection at worst).
-          # %q-escape it once up front and reuse the safe token everywhere.
-          printf -v _qdir '%q' "$DEPLOY_DIR"
-          pre_good="__unknown__"
-          if [ -n "$BUSY_LOCK_FILE" ]; then
-            if _pg=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                 "cat ${_qdir}/.deploy-state/last_good_tag 2>/dev/null || true"); then
-              pre_good="$_pg"
-            fi
-          fi
-
           attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
@@ -290,24 +270,12 @@ jobs:
               # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
               # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
               if [ "$had_transport_failure" = "1" ]; then
-                # 之前出过 255:那一次远端可能已完成部署,只是退出码没传回来。rc=3 只
-                # 说明"现在拿不到锁",不能证明"旧容器还在"。用远端 last_good_tag(部署
-                # 脚本探针通过后才写入的既有状态,不新增任何机制)复核真实状态再分类。
-                # STATE_DIR 默认是 ${DEPLOY_DIR}/.deploy-state(pull_and_deploy.sh 里的
-                # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
-                remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                  "cat ${_qdir}/.deploy-state/last_good_tag 2>/dev/null" || true)
-                # 三条同时成立才提升为成功:
-                #   remote_good = GIT_SHA  —— 现在确实是这个 SHA
-                #   pre_good != GIT_SHA    —— 排除"重跑已部署过的同一个 SHA"这种历史
-                #                              遗留同值的假阳性,必须是本次 run 期间才
-                #                              变成这个值,才能证明这次 attempt 真的成功
-                #   pre_good != __unknown__ —— 基线本身没拿到就没有对照基准,不能做
-                #                              成功提升判断,宁可保守走 deferred
-                if [ "$remote_good" = "$GIT_SHA" ] && [ "$pre_good" != "$GIT_SHA" ] && [ "$pre_good" != "__unknown__" ]; then
-                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (last_good_tag changed to ${GIT_SHA} during this run)"
-                  break
-                fi
+                # 设计决策(2026-07-24 减法重构,拆除"255 后自动判成功"证明机器):
+                # 本 run 出过 255 之后,远端状态本质不确定——曾经实现过一套读取远端
+                # 部署成功标记、按新旧值三条件比对自动判成功的复核机制,但证明条件
+                # (历史同值假阳性、基线不可得语义、竞态窗口)在两轮 review 中先后
+                # 被打洞,维护面大于价值,已整体拆除。重跑幂等收敛,必要时人工上机
+                # 确认一次,成本低于维护这套证明机器。
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
               fi
               echo "deferred=true" >> "$GITHUB_OUTPUT"
