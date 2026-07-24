@@ -146,6 +146,46 @@ def test_release_rc3_rechecks_last_good_sha_after_prior_transport_failure():
     )
 
 
+def test_release_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
+    # P1-B (codex review) parity with build-deploy.yml: actions/checkout
+    # defaults to persist-credentials: true (writes the CI_TEMPLATES_PAT into
+    # .git/config), and .ci-templates sits inside this job's build context —
+    # a caller Dockerfile's `COPY . .` would bake the PAT and the private
+    # ci-templates source into the image pushed to ACR. Both checkouts must
+    # disable credential persistence, and ci-templates must move out of the
+    # build context before any build step runs, with all later references
+    # (normalize_release.py, push_to_acr.sh, push_alias_to_acr.sh,
+    # release_deploy.sh) following it to $RUNNER_TEMP.
+    text = WORKFLOW.read_text()
+    assert text.count("persist-credentials: false") >= 2, (
+        "both the caller-repo and ci-templates checkout steps must set "
+        "persist-credentials: false"
+    )
+    assert 'mv .ci-templates "$RUNNER_TEMP/ci-templates"' in text, (
+        "ci-templates must be moved out of the build_context (.) after checkout"
+    )
+    assert ".ci-templates/scripts/" not in text, (
+        "no step may reference ci-templates scripts at their original "
+        "in-build-context path once the relocation step exists — every "
+        "reference must go through $RUNNER_TEMP/ci-templates/scripts/"
+    )
+    for script in (
+        "normalize_release.py",
+        "push_to_acr.sh",
+        "push_alias_to_acr.sh",
+        "release_deploy.sh",
+    ):
+        assert f"$RUNNER_TEMP/ci-templates/scripts/{script}" in text, (
+            f"{script} must be invoked from $RUNNER_TEMP/ci-templates/scripts/"
+        )
+
+    idx_mv = text.index("mv .ci-templates")
+    idx_normalize = text.index("normalize_release.py")
+    assert idx_mv < idx_normalize, (
+        "ci-templates must be relocated before the first step that uses its scripts"
+    )
+
+
 def test_release_busy_lock_and_compose_identity_contract():
     raw, trigger = load()
     assert trigger["workflow_call"]["inputs"]["busy_lock_file"]["default"] == ""

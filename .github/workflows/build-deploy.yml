@@ -112,6 +112,8 @@ jobs:
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Checkout ci-templates (deploy scripts)
         # ci-templates 是 private 仓,默认 GITHUB_TOKEN 读不了 → 用只读 PAT
@@ -121,6 +123,16 @@ jobs:
           ref: ${{ inputs.ci_templates_ref }}
           token: ${{ secrets.CI_TEMPLATES_PAT }}
           path: .ci-templates
+          persist-credentials: false
+
+      # .ci-templates sits inside this job's build_context ("."). A caller
+      # Dockerfile doing `COPY . .` would otherwise bake the PAT-backed
+      # checkout metadata and the private ci-templates source straight into
+      # the image layer pushed to ACR. Move it out of the build context
+      # before any build step touches it; every later reference below follows
+      # it to $RUNNER_TEMP.
+      - name: Move ci-templates out of the build context
+        run: mv .ci-templates "$RUNNER_TEMP/ci-templates"
 
       - name: Resolve git SHA (immutable tag)
         id: sha
@@ -140,7 +152,7 @@ jobs:
           GIT_SHA: ${{ steps.sha.outputs.git_sha }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: bash .ci-templates/scripts/push_to_acr.sh
+        run: bash "$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh"
 
       - name: Connect to Tailscale
         # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机
@@ -201,7 +213,7 @@ jobs:
           REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
 
           deploy_once() {
-            scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \
+            scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh" \
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \

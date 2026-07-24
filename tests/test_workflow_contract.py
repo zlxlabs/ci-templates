@@ -266,3 +266,39 @@ def test_yellow_card_step_exists_for_deferred_without_at_all():
     # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
     red_section = text[red_idx:idx]
     assert "<at id=all>" in red_section
+
+
+def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
+    # P1-B (codex review): actions/checkout defaults to persist-credentials:
+    # true, which writes the (in the ci-templates checkout's case, PAT-backed)
+    # token into .git/config. Nothing after checkout needs git credentials —
+    # deploy is pure SSH/scp/docker. Worse, .ci-templates lives inside this
+    # job's `build_context: "."` — a caller Dockerfile with `COPY . .` would
+    # bake the CI_TEMPLATES_PAT-backed .git/config *and* the private
+    # ci-templates source straight into the image layer pushed to ACR. Both
+    # checkouts must disable credential persistence, and ci-templates must be
+    # relocated out of the build context (into $RUNNER_TEMP) before the build
+    # step runs, with every later reference following it there.
+    text = WORKFLOW.read_text()
+    assert text.count("persist-credentials: false") >= 2, (
+        "both the caller-repo and ci-templates checkout steps must set "
+        "persist-credentials: false"
+    )
+    assert 'mv .ci-templates "$RUNNER_TEMP/ci-templates"' in text or \
+        "mv .ci-templates \"$RUNNER_TEMP/ci-templates\"" in text, (
+        "ci-templates must be moved out of the build_context (.) after checkout"
+    )
+    assert ".ci-templates/scripts/" not in text, (
+        "no step may reference ci-templates scripts at their original "
+        "in-build-context path once the relocation step exists — every "
+        "reference must go through $RUNNER_TEMP/ci-templates/scripts/"
+    )
+    assert '$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh' in text
+    assert '$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh' in text
+
+    # the relocation must happen before the build step consumes push_to_acr.sh
+    idx_mv = text.index('mv .ci-templates')
+    idx_build_push = text.index('push_to_acr.sh')
+    assert idx_mv < idx_build_push, (
+        "ci-templates must be relocated before the build step references its scripts"
+    )
