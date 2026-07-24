@@ -26,7 +26,16 @@ import sys
 from pathlib import Path
 from urllib.parse import urlsplit
 
-IMAGE_RE = re.compile(r"^[a-z0-9][a-z0-9._-]{0,127}$")
+# Docker distribution reference path-component grammar:
+#   path-component := alpha-numeric [separator alpha-numeric]*
+#   alpha-numeric   := [a-z0-9]+
+#   separator       := [._] | __ | -+
+# The previous `^[a-z0-9][a-z0-9._-]{0,127}$` allowed any separator character
+# anywhere after the first, including repeated/leading/trailing separators
+# (e.g. "frontend-", "foo..bar") that docker itself rejects as an invalid
+# reference -- pushing the failure from this fail-fast validator all the way
+# to `docker build`/`docker tag`. build_alias reuses the same regex.
+IMAGE_RE = re.compile(r"^[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*$")
 ALIAS_RE = IMAGE_RE
 STATUS_RE = re.compile(r"^[1-5][0-9][0-9]$")
 CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")

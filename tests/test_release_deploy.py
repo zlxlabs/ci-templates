@@ -610,6 +610,36 @@ def test_busy_lock_invalid_timeout_is_configuration_failure(tmp_path):
     assert not log.exists() or "pull " not in log.read_text()
 
 
+def test_busy_lock_timeout_rejects_leading_zero(tmp_path):
+    # P2-2 (codex review round 3): the review flagged that a leading-zero
+    # BUSY_LOCK_TIMEOUT (e.g. "0600") could slip past validation and then hit
+    # bash arithmetic's octal interpretation ($((SECONDS + BUSY_LOCK_TIMEOUT))
+    # reads "0600" as octal 384, and "08"/"09" is an outright arithmetic
+    # error) instead of being rejected as a configuration error up front.
+    #
+    # Regression-tested here, but no source change was needed: is_positive_
+    # integer() in release_deploy.sh has always been `^[1-9][0-9]*$` (added in
+    # the very first commit that introduced busy-lock support, 3e24106),
+    # which already requires the first digit to be 1-9 and so already rejects
+    # every leading-zero form. Confirmed empirically before writing this test
+    # (both via a direct manual run and via the pytest harness) that
+    # BUSY_LOCK_TIMEOUT="0600" already exits 1 with a readable
+    # "must be a positive integer" message, not exit 3 / an octal-arithmetic
+    # surprise. This test exists purely as a regression guard against that
+    # regex ever being loosened back to `^[0-9]+$`.
+    env, log = base(tmp_path)
+    env.update(BUSY_LOCK_FILE=str(tmp_path / "busy.lock"), BUSY_LOCK_TIMEOUT="0600")
+    result = run(env)
+    assert result.returncode == 1, (
+        f"leading-zero BUSY_LOCK_TIMEOUT must be a configuration failure (rc=1), "
+        f"not deferred (rc=3): got {result.returncode}; {result.stdout}{result.stderr}"
+    )
+    assert "positive integer" in (result.stdout + result.stderr), (
+        "the rejection message must be readable, not a raw bash arithmetic error"
+    )
+    assert not log.exists() or "pull " not in log.read_text()
+
+
 def test_busy_gate_host_contention_releases_admission_fd(tmp_path):
     env, _ = base(tmp_path)
     busy = tmp_path / "busy.lock"

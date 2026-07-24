@@ -107,3 +107,29 @@ def test_release_requires_at_least_one_probe(tmp_path):
         tmp_path, valid_images(), [{"url": "http://localhost/health", "expect_status": 999}]
     )
     assert result.returncode != 0
+
+
+def test_image_name_follows_docker_path_component_syntax(tmp_path):
+    # P2-3 (codex review round 3): the old regex `^[a-z0-9][a-z0-9._-]{0,127}$`
+    # allows any character from the class anywhere after the first, which lets
+    # separators repeat or land at the very end -- names docker itself will
+    # never accept as a repository path component (a trailing/leading
+    # separator or a doubled `.` is not a valid path-component per Docker's
+    # distribution reference grammar). Those invalid names slipped through
+    # normalize_release.py's supposedly fail-fast validation and only blew up
+    # much later, as an opaque "invalid reference format" from `docker build`/
+    # `docker tag`. image_name (and build_alias, which reuses the same regex)
+    # must be validated against the real path-component grammar:
+    # alpha-numeric [separator alpha-numeric]*, separator = . | _ | __ | -+.
+    for bad_name in ("frontend-", "-frontend", "frontend.", ".frontend", "foo..bar", "Frontend"):
+        result, _, _ = run_normalizer(
+            tmp_path, [{"image_name": bad_name, "build_context": ".", "dockerfile": "Dockerfile"}]
+        )
+        assert result.returncode != 0, f"{bad_name!r} must be rejected: {result.stderr}"
+        assert "image_name" in result.stderr, result.stderr
+
+    for good_name in ("front-end", "foo.bar", "foo_bar", "frontend", "a", "foo__bar"):
+        result, _, _ = run_normalizer(
+            tmp_path, [{"image_name": good_name, "build_context": ".", "dockerfile": "Dockerfile"}]
+        )
+        assert result.returncode == 0, f"{good_name!r} must be accepted: {result.stderr}"
