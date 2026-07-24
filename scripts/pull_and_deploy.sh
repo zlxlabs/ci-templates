@@ -183,8 +183,17 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
       log "flock on busy lock failed with rc=${_frc} (not a lock timeout — config or host problem)"
       exit 1
     fi
-    if flock -n 9; then
+    # 只有 rc=1 才是真正的锁冲突(host lock 被别的部署占着,应该走既有的放忙锁重试
+    # 路径);其余非零值是 flock 命令本身出了问题(参数错误、系统调用异常等),不能
+    # 被悄悄吞掉当成"服务忙"处理,必须报出真实错误——与上面忙锁的 flock rc 分流
+    # 保持同一原则。
+    _hrc=0; flock -n 9 || _hrc=$?
+    if [ "$_hrc" -eq 0 ]; then
       break            # 两把锁同时在手 → 替换窗口开始
+    fi
+    if [ "$_hrc" -ne 1 ]; then
+      log "flock on host lock failed (rc=${_hrc} — not lock contention)"
+      exit 1
     fi
     flock -u 8         # 整机锁被别的部署占着:立即放掉忙锁,admission 重新打开
     # 重试前的休眠要 clamp 到"剩余预算"和 5s 两者中较小值:固定 sleep 5 在剩余预算

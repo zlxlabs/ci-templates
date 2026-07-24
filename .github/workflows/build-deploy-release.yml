@@ -1,0 +1,367 @@
+# Reusable D3 release lane for services that publish a group of compose images.
+# This is intentionally separate from build-deploy.yml: single-image callers
+# keep their existing inputs, secrets and behavior unchanged.
+name: build-deploy-release
+
+on:
+  workflow_call:
+    inputs:
+      images_json:
+        description: "Strict JSON array: image_name, build_context, dockerfile, optional build_alias"
+        required: true
+        type: string
+      probes_json:
+        description: "Strict JSON array of release-level {url, expect_status} probes"
+        required: true
+        type: string
+      host:
+        description: "Tailscale-reachable IP or MagicDNS name; also the concurrency key"
+        required: true
+        type: string
+      ssh_user:
+        description: "SSH user on the deploy target host"
+        required: false
+        default: "zlx"
+        type: string
+      deploy_dir:
+        description: "Absolute path on the host holding the compose file"
+        required: true
+        type: string
+      acr_registry:
+        description: "ACR registry host"
+        required: false
+        default: "crpi-0vsre5argteykh9m.cn-guangzhou.personal.cr.aliyuncs.com"
+        type: string
+      acr_namespace:
+        description: "ACR namespace"
+        required: false
+        default: "zlx-personal"
+        type: string
+      busy_lock_file:
+        description: "Optional service admission flock path; empty preserves release behavior"
+        required: false
+        default: ""
+        type: string
+      busy_lock_timeout:
+        description: "Busy-lock total wait budget in seconds"
+        required: false
+        default: "600"
+        type: string
+      ci_templates_ref:
+        description: "Ref of ci-templates to fetch the release scripts from"
+        required: false
+        default: "v1"
+        type: string
+    # Deliberately the same six explicit secrets as build-deploy.yml.
+    secrets:
+      ACR_USERNAME:
+        required: true
+      ACR_PASSWORD:
+        required: true
+      SSH_DEPLOY_KEY:
+        required: true
+      KNOWN_HOSTS:
+        required: true
+      TS_AUTHKEY:
+        required: true
+      CI_TEMPLATES_PAT:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-${{ inputs.host }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout caller repo
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Checkout ci-templates (release scripts)
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          repository: zj1123581321/ci-templates
+          ref: ${{ inputs.ci_templates_ref }}
+          token: ${{ secrets.CI_TEMPLATES_PAT }}
+          path: .ci-templates
+          persist-credentials: false
+
+      # .ci-templates sits inside this job's build context. A caller
+      # Dockerfile doing `COPY . .` would otherwise bake the PAT-backed
+      # checkout metadata and the private ci-templates source straight into
+      # an image layer pushed to ACR. Move it out before any build step runs;
+      # every later reference below follows it to $RUNNER_TEMP.
+      - name: Move ci-templates out of the build context
+        run: mv .ci-templates "$RUNNER_TEMP/ci-templates"
+
+      - name: Resolve immutable release SHA
+        id: sha
+        run: echo "git_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate and normalize release declaration
+        env:
+          IMAGES_JSON: ${{ inputs.images_json }}
+          PROBES_JSON: ${{ inputs.probes_json }}
+        run: |
+          set -euo pipefail
+          python3 "$RUNNER_TEMP/ci-templates/scripts/normalize_release.py" \
+            --images-json "$IMAGES_JSON" \
+            --probes-json "$PROBES_JSON" \
+            --manifest-out "$RUNNER_TEMP/d3-release.manifest" \
+            --builds-out "$RUNNER_TEMP/d3-release.builds"
+
+      - name: Log in to ACR
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' "$ACR_PASSWORD" | docker login \
+            "$ACR_REGISTRY" -u "$ACR_USERNAME" --password-stdin
+
+      - name: Build and push each unique image artifact
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          GIT_SHA: ${{ steps.sha.outputs.git_sha }}
+          DOCKER_BIN: docker
+        run: |
+          set -euo pipefail
+          while IFS=$'\t' read -r kind build_alias build_context dockerfile canonical publish_names; do
+            [[ "$kind" == "build" ]] || continue
+            IMAGE_NAME="$canonical" BUILD_CONTEXT="$build_context" DOCKERFILE="$dockerfile" \
+              bash "$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh"
+            IFS=',' read -ra names <<< "$publish_names"
+            for image_name in "${names[@]:1}"; do
+              [[ -n "$image_name" ]] || continue
+              source="${ACR_REGISTRY}/${ACR_NAMESPACE}/${canonical}:${GIT_SHA}"
+              target="${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${GIT_SHA}"
+              docker tag "$source" "$target"
+              SOURCE_IMAGE="$source" TARGET_IMAGE="$target" \
+                DOCKER_BIN=docker bash "$RUNNER_TEMP/ci-templates/scripts/push_alias_to_acr.sh"
+            done
+          done < "$RUNNER_TEMP/d3-release.builds"
+
+      - name: Connect to Tailscale
+        uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
+        with:
+          authkey: ${{ secrets.TS_AUTHKEY }}
+
+      - name: Set up SSH
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
+        run: |
+          set -euo pipefail
+          mkdir -p ~/.ssh
+          printf '%s\n' "$SSH_DEPLOY_KEY" > ~/.ssh/id_deploy
+          chmod 600 ~/.ssh/id_deploy
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Deploy release atomically over SSH
+        id: deploy
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          D3_RELEASE_TAG: ${{ steps.sha.outputs.git_sha }}
+          DEPLOY_HOST: ${{ inputs.host }}
+          SSH_USER: ${{ inputs.ssh_user }}
+          DEPLOY_DIR: ${{ inputs.deploy_dir }}
+          HOST_LOCK: /var/lock/fleet-deploy.lock
+          BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
+          BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
+        run: |
+          set -euo pipefail
+          # P1-B (codex review round 5): ssh_user starting with '-' makes the
+          # assembled "${SSH_USER}@${DEPLOY_HOST}:path" argument itself start
+          # with '-', which scp/ssh parse as a command-line option (e.g. a
+          # crafted -oProxyCommand=... value) instead of a user@host target --
+          # double-quoting does not stop this, it's scp/ssh's own option
+          # parsing, not shell word-splitting. Validate before first use.
+          [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid ssh_user"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid host"; exit 1; }
+
+          SSH_OPTS=( -i "$HOME/.ssh/id_deploy" -o ServerAliveInterval=15 \
+            -o ServerAliveCountMax=4 -o ConnectTimeout=20 )
+          # GITHUB_RUN_ID is only guaranteed unique within a single repo, and this
+          # workflow's concurrency group is keyed on the host input too, so it is
+          # also only a per-repo guarantee. If the same host is deployed to by
+          # two different service repos at once,
+          # their run ids could collide, clobbering each other's remote manifest/
+          # script path. Anchor the remote path in repo identity as well, not just
+          # run id/attempt.
+          repo_slug="$(printf '%s' "${GITHUB_REPOSITORY//\//-}" | tr -cd 'A-Za-z0-9_-')"
+          [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
+          release_base="${repo_slug}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          [[ "$release_base" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
+          cleanup_local() {
+            rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds"
+          }
+          trap cleanup_local EXIT
+          deploy_once() {
+            local transport_attempt="$attempt"
+            local transport_nonce="${release_base}-${transport_attempt}"
+            [[ "$transport_nonce" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
+            local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
+            local remote_script="/tmp/d3-release-${transport_nonce}.sh"
+            # P2-B (codex review round 5): best-effort remote cleanup for the
+            # case where the remote script never gets a chance to run at all
+            # (so its own cleanup trap never installs) -- i.e. either of the
+            # two scp calls below fails. remote_manifest/remote_script are
+            # local to this attempt (keyed by transport_nonce), so a later
+            # retry uses a fresh path and never reclaims this one; nothing
+            # else will ever remove it. rm -f on a path that was never
+            # created (e.g. the first scp failing before either file exists)
+            # is already a safe no-op, so this is applied uniformly to both
+            # scp failure points. %q-escaped, matching this function's own
+            # printf %q discipline for remote_cmd below. Cleanup failure
+            # itself must never mask/override the real transport failure
+            # being reported.
+            #
+            # P2-B-2 (codex review round 7, reverting part of round 5/e1688ba):
+            # this cleanup used to also fire from the ssh_rc==255 branch
+            # below. It no longer does -- see the comment at that branch for
+            # why running it there raced the remote script's own rollback.
+            local cleanup_remote_cmd
+            printf -v cleanup_remote_cmd 'rm -f -- %q %q' "$remote_manifest" "$remote_script"
+            scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_deploy.sh" \
+              "${SSH_USER}@${DEPLOY_HOST}:${remote_script}" || {
+                ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                return 255
+              }
+            scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.manifest" \
+              "${SSH_USER}@${DEPLOY_HOST}:${remote_manifest}" || {
+                ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                return 255
+              }
+            # printf %q makes every input one shell word; no JSON or raw input
+            # is ever concatenated into the remote command.
+            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
+              "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
+              "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" "$remote_manifest" "$remote_script" "$remote_script"
+            ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
+            local ssh_rc=$?
+            # P2-B-2 (codex review round 7, fixing a bug in round 5/e1688ba):
+            # deliberately NOT cleaning up remote_manifest/remote_script here,
+            # unlike the two scp failure points above. Both scp calls already
+            # succeeded by the time we reach this line, so release_deploy.sh
+            # has been shipped and its "ssh ... bash $remote_script" command
+            # was launched; ssh_rc==255 only means *this* SSH connection lost
+            # the transport before the remote script's real exit status made
+            # it back over the wire -- it does not mean the script never ran.
+            # If the transport drop happens while the remote script is still
+            # mid-flight (e.g. inside compose up / probing), OpenSSH delivers
+            # SIGHUP to the remote command's process group. release_deploy.sh
+            # traps HUP (its on_signal()/PENDING_SIGNAL machinery) instead of
+            # dying on it: it finishes the current step and then rolls back
+            # rather than promoting. That rollback path re-reads
+            # $RELEASE_MANIFEST (load_manifest "$RELEASE_MANIFEST" inside
+            # do_release(), guarding the R4 image-set-changed check) to
+            # compare the previous and current declared image sets before
+            # touching anything. If this workflow races ahead and rm -f's
+            # remote_manifest right here -- before the still-running remote
+            # script gets to that read -- load_manifest sees a missing file,
+            # the comparison is treated as an image-set change, and the
+            # remote script refuses to roll back at all ("rollback
+            # impossible ... manual intervention required, containers left
+            # as-is"), stranding the host on an unhealthy, unpromoted
+            # release. That is strictly worse than the orphaned-/tmp-file
+            # problem this cleanup was originally meant to solve, so it has
+            # been removed from this branch.
+            #
+            # release_deploy.sh's own EXIT trap (trap cleanup EXIT, which
+            # deletes REMOTE_SCRIPT_PATH/REMOTE_MANIFEST_PATH) is the only
+            # thing safe to rely on here once both scp calls above have
+            # confirmed the script was actually shipped: that trap runs
+            # before the script truly exits no matter how it gets there --
+            # normal completion, a probe-failure rollback, or a
+            # pending-signal rollback after HUP -- so it is the sole owner of
+            # cleaning up these two /tmp paths from this point on. Accepted
+            # cost: if scp fully succeeded but this ssh invocation never
+            # actually reached the point of the remote trap installing at all
+            # (connection died at the very start), these two /tmp files leak
+            # until the host's own /tmp reaper or a manual pass clears them --
+            # there is no reliable way for the CI side to tell that case apart
+            # from "script is mid-flight and will clean up after itself"
+            # without reintroducing the exact race this fix removes. A
+            # handful of leaked /tmp files is a strictly cheaper failure mode
+            # than a silently rejected rollback.
+            return "$ssh_rc"
+          }
+          attempt=1; max_attempts=3; had_transport_failure=0
+          while true; do
+            rc=0; deploy_once || rc=$?
+            if [[ "$rc" -eq 0 ]]; then
+              echo "::notice::atomic release deploy ok (attempt ${attempt}/${max_attempts})"
+              break
+            fi
+            # Only SSH/scp transport rc=255 is transient.  A release or probe
+            # failure has already rolled back (or reported first-deploy failure)
+            # and must not be replayed.
+            if [[ "$rc" -ne 255 ]]; then
+              if [[ "$rc" -eq 3 ]]; then
+                if [[ "$had_transport_failure" -eq 1 ]]; then
+                  # Design decision (2026-07-24 subtractive refactor: dropped the
+                  # post-255 auto-promotion machine). Once this run has seen a 255,
+                  # remote state is inherently uncertain. We used to recheck the
+                  # canonical last_good_release and auto-promote to success on a
+                  # three-way match, but the proof conditions (historical
+                  # same-value false positives, an unobtainable baseline, races)
+                  # kept getting punched full of holes across two review rounds --
+                  # upkeep outweighed the value. Reruns are idempotent and
+                  # converge; a human confirming on the host when in doubt is
+                  # cheaper than maintaining that machine.
+                  echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
+                fi
+                echo "busy_deferred=true" >> "$GITHUB_OUTPUT"
+              fi
+              echo "::error::release deploy failed (rc=${rc}); no transport retry"
+              exit "$rc"
+            fi
+            had_transport_failure=1
+            if [[ "$attempt" -ge "$max_attempts" ]]; then
+              echo "::error::SSH transport failed after ${max_attempts} attempts"
+              exit 1
+            fi
+            echo "::warning::SSH transport hiccup (rc=255), retrying in 10s"
+            attempt=$((attempt + 1))
+            sleep 10
+          done
+
+      - name: Feishu release busy defer card (yellow, fail-open)
+        if: failure() && steps.deploy.outputs.busy_deferred == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+        run: |
+          set -u
+          webhook="${FEISHU_CI_WEBHOOK:-}"
+          [[ -n "$webhook" ]] || exit 0
+          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          import json, sys
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release deferred: service busy"}}))
+          PY
+
+      - name: Feishu release failure card (P0, fail-open)
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true'
+        continue-on-error: true
+        env:
+          FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+        run: |
+          set -u
+          webhook="${FEISHU_CI_WEBHOOK:-}"
+          [[ -n "$webhook" ]] || exit 0
+          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          import json, sys
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release failed"}}))
+          PY

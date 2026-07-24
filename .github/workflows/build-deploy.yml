@@ -112,6 +112,8 @@ jobs:
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
 
       - name: Checkout ci-templates (deploy scripts)
         # ci-templates 是 private 仓,默认 GITHUB_TOKEN 读不了 → 用只读 PAT
@@ -121,16 +123,39 @@ jobs:
           ref: ${{ inputs.ci_templates_ref }}
           token: ${{ secrets.CI_TEMPLATES_PAT }}
           path: .ci-templates
+          persist-credentials: false
+
+      # .ci-templates sits inside this job's build_context ("."). A caller
+      # Dockerfile doing `COPY . .` would otherwise bake the PAT-backed
+      # checkout metadata and the private ci-templates source straight into
+      # the image layer pushed to ACR. Move it out of the build context
+      # before any build step touches it; every later reference below follows
+      # it to $RUNNER_TEMP.
+      - name: Move ci-templates out of the build context
+        run: mv .ci-templates "$RUNNER_TEMP/ci-templates"
 
       - name: Resolve git SHA (immutable tag)
         id: sha
         run: echo "git_sha=${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"
 
       - name: Log in to ACR
+        # P1-A (codex review round 5, closed out on coordinator direction):
+        # ${{ inputs.* }} / ${{ secrets.* }} are spliced into run: text as
+        # plain text BEFORE the shell ever runs it -- a value containing a
+        # newline would make everything after it on that line execute as a new
+        # shell command, at a point where this job already holds ACR
+        # credentials. inputs.acr_registry and both ACR secrets must go
+        # through env: and be read as "$VAR". printf '%s' (not echo) avoids
+        # appending a trailing newline to the password piped into
+        # `docker login --password-stdin`.
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+          ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
         run: |
-          echo "${{ secrets.ACR_PASSWORD }}" | docker login \
-            "${{ inputs.acr_registry }}" \
-            -u "${{ secrets.ACR_USERNAME }}" --password-stdin
+          printf '%s' "$ACR_PASSWORD" | docker login \
+            "$ACR_REGISTRY" \
+            -u "$ACR_USERNAME" --password-stdin
 
       - name: Build & push immutable image
         env:
@@ -140,7 +165,7 @@ jobs:
           GIT_SHA: ${{ steps.sha.outputs.git_sha }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
-        run: bash .ci-templates/scripts/push_to_acr.sh
+        run: bash "$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh"
 
       - name: Connect to Tailscale
         # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机
@@ -149,11 +174,18 @@ jobs:
           authkey: ${{ secrets.TS_AUTHKEY }}
 
       - name: Set up SSH
+        # P1-A (codex review round 5, closed out on coordinator direction):
+        # same run:-text-splice hazard as "Log in to ACR" above. Matches the
+        # release lane's "Set up SSH" step (build-deploy-release.yml) exactly.
+        env:
+          SSH_DEPLOY_KEY: ${{ secrets.SSH_DEPLOY_KEY }}
+          KNOWN_HOSTS: ${{ secrets.KNOWN_HOSTS }}
         run: |
+          set -euo pipefail
           mkdir -p ~/.ssh
-          echo "${{ secrets.SSH_DEPLOY_KEY }}" > ~/.ssh/id_deploy
+          printf '%s\n' "$SSH_DEPLOY_KEY" > ~/.ssh/id_deploy
           chmod 600 ~/.ssh/id_deploy
-          echo "${{ secrets.KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          printf '%s\n' "$KNOWN_HOSTS" > ~/.ssh/known_hosts
           chmod 644 ~/.ssh/known_hosts
 
       - name: Deploy over SSH (flock + health probe + auto-rollback)
@@ -174,6 +206,15 @@ jobs:
           BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
           BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
         run: |
+          # P1-B (codex review round 5): ssh_user starting with '-' makes the
+          # assembled "${SSH_USER}@${DEPLOY_HOST}:path" argument itself start
+          # with '-', which scp/ssh parse as a command-line option (e.g. a
+          # crafted -oProxyCommand=... value) instead of a user@host target --
+          # double-quoting does not stop this, it's scp/ssh's own option
+          # parsing, not shell word-splitting. Validate before first use.
+          [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid ssh_user"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid host"; exit 1; }
+
           ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
           # keepalive 防 tailnet 上偶发的 `Connection reset ...:22`(canary 遇过,50 服务规模会常遇):
           # 15s 探一次,连丢 4 次(~60s)才判死;连接阶段也给 ConnectTimeout 兜底。
@@ -193,10 +234,15 @@ jobs:
           # 互斥。同一台主机上如果两个不同服务仓并发部署(各自引用不同 tag,脚本内容
           # 可能不同),固定路径 /tmp/pull_and_deploy.sh 会被互相覆盖——新脚本可能被
           # 旧脚本覆盖后静默执行,门禁这类新增的安全逻辑可以被这样绕过而不自知。
-          REMOTE_SCRIPT="/tmp/pull_and_deploy.${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
+          # 仓库身份也要拼进去:GITHUB_RUN_ID 只保证仓库内唯一,不保证跨仓库唯一——
+          # 两个不同仓库各自的 run id 理论上仍可能撞上同一个数值(尤其配合 attempt/pid
+          # 这类局部唯一性拼接时),路径唯一性必须同时锚定"仓库"和"run"两个维度。
+          repo_slug="$(printf '%s' "${GITHUB_REPOSITORY//\//-}" | tr -cd 'A-Za-z0-9_-')"
+          [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
+          REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
 
           deploy_once() {
-            scp $SSH_OPTS .ci-templates/scripts/pull_and_deploy.sh \
+            scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh" \
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
@@ -212,21 +258,6 @@ jobs:
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
-          # 门禁开启时先取 last_good 基线:后面 255→rc=3 的复核要证明的是"last_good 在
-          # 本次 run 期间才变成 GIT_SHA",光比对现值会把重跑已部署 SHA(手动 re-run,或
-          # 两次 push 恰好产生同一个 GIT_SHA)时的历史遗留同值误当成功证据。基线取不到
-          # (ssh 传输失败)就标记 __unknown__,复核时不做成功提升(没有对照基准,宁可保守
-          # 走 deferred)。远端文件不存在是合法的"此前无 last_good"状态,取到空字符串
-          # 即可,不算 unknown——两种"空"语义不同,不能混。只服务于忙锁门禁场景,未开
-          # 门禁的 caller 不会触发 rc=3,没必要多这次 ssh 调用。
-          pre_good="__unknown__"
-          if [ -n "$BUSY_LOCK_FILE" ]; then
-            if _pg=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                 "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null || true"); then
-              pre_good="$_pg"
-            fi
-          fi
-
           attempt=1; max_attempts=3; had_transport_failure=0
           while true; do
             rc=0; deploy_once || rc=$?
@@ -239,24 +270,12 @@ jobs:
               # 顺序很重要:必须先于下面 "!= 255" 的判断拦截,否则会被误判为
               # "已按探针门自动回滚" 报错退出,语义就错了(那是给探针失败用的)。
               if [ "$had_transport_failure" = "1" ]; then
-                # 之前出过 255:那一次远端可能已完成部署,只是退出码没传回来。rc=3 只
-                # 说明"现在拿不到锁",不能证明"旧容器还在"。用远端 last_good_tag(部署
-                # 脚本探针通过后才写入的既有状态,不新增任何机制)复核真实状态再分类。
-                # STATE_DIR 默认是 ${DEPLOY_DIR}/.deploy-state(pull_and_deploy.sh 里的
-                # 既有约定,这里直接拼接路径,与脚本端的默认值耦合,不是新增契约)。
-                remote_good=$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
-                  "cat '${DEPLOY_DIR}/.deploy-state/last_good_tag' 2>/dev/null" || true)
-                # 三条同时成立才提升为成功:
-                #   remote_good = GIT_SHA  —— 现在确实是这个 SHA
-                #   pre_good != GIT_SHA    —— 排除"重跑已部署过的同一个 SHA"这种历史
-                #                              遗留同值的假阳性,必须是本次 run 期间才
-                #                              变成这个值,才能证明这次 attempt 真的成功
-                #   pre_good != __unknown__ —— 基线本身没拿到就没有对照基准,不能做
-                #                              成功提升判断,宁可保守走 deferred
-                if [ "$remote_good" = "$GIT_SHA" ] && [ "$pre_good" != "$GIT_SHA" ] && [ "$pre_good" != "__unknown__" ]; then
-                  echo "::notice::deploy ok — an earlier attempt completed on the host despite the SSH transport failure (last_good_tag changed to ${GIT_SHA} during this run)"
-                  break
-                fi
+                # 设计决策(2026-07-24 减法重构,拆除"255 后自动判成功"证明机器):
+                # 本 run 出过 255 之后,远端状态本质不确定——曾经实现过一套读取远端
+                # 部署成功标记、按新旧值三条件比对自动判成功的复核机制,但证明条件
+                # (历史同值假阳性、基线不可得语义、竞态窗口)在两轮 review 中先后
+                # 被打洞,维护面大于价值,已整体拆除。重跑幂等收敛,必要时人工上机
+                # 确认一次,成本低于维护这套证明机器。
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
               fi
               echo "deferred=true" >> "$GITHUB_OUTPUT"
@@ -271,6 +290,38 @@ jobs:
             had_transport_failure=1
             if [ "$attempt" -ge "$max_attempts" ]; then
               echo "::error::SSH transport failed after ${max_attempts} attempts (rc=255)"
+              # P2-B (codex review round 5): best-effort cleanup. REMOTE_SCRIPT's
+              # path is fixed for this whole job (not per-attempt), so if every
+              # retry failed at the transport layer, the remote script never got
+              # a chance to run — its own cleanup trap never installed — and
+              # nothing else will ever remove this orphaned file once we give up
+              # retrying. A failure of this cleanup itself must not mask the
+              # real transport failure being reported above.
+              #
+              # P2-B-2 (codex review round 7): the release lane's equivalent
+              # cleanup was found to race the remote script's own rollback
+              # when it fired on ssh rc=255 (see build-deploy-release.yml's
+              # deploy_once()) and had to be removed from that branch. That
+              # race does not apply here, for two independent reasons:
+              # (1) REMOTE_SCRIPT here is only ever the deploy *script* file
+              # itself, never a state/manifest file that anything re-reads
+              # for a rollback decision -- pull_and_deploy.sh (this lane's
+              # remote script) has no HUP trap and no equivalent of the
+              # release lane's R4 image-set-comparison rollback guard, so
+              # there is nothing downstream that depends on this path still
+              # existing. (2) even setting that aside, on Linux, unlinking a
+              # file that a process already has open (which bash does once
+              # it starts executing `bash "$REMOTE_SCRIPT"`) is harmless to
+              # that process -- the inode and its data stay reachable through
+              # the already-open file descriptor until the process closes it
+              # or exits; only the directory entry goes away, so a
+              # still-running remote script is never disturbed by this rm -f.
+              # If a future change ever turns this path (or a sibling one)
+              # into something the remote script re-reads mid-run for a
+              # rollback/health decision, this safety argument no longer
+              # holds and this cleanup needs the same reconsideration the
+              # release lane's did.
+              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
               exit 1
             fi
             echo "::warning::SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"

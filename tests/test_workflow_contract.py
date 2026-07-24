@@ -155,29 +155,46 @@ def test_remote_script_path_is_unique_per_run():
     # regression guard: the old fixed path must be gone entirely.
     assert ":/tmp/pull_and_deploy.sh" not in text, "fixed remote path must not reappear — it's the bug this test guards against"
 
+    # P1-1 parity: GITHUB_RUN_ID is only guaranteed unique within a single repo —
+    # two different service repos deploying to the same host concurrently could
+    # collide on run id (concurrency groups are per-repo too). The remote path
+    # must also be anchored in repo identity, not just run id/attempt.
+    assert "GITHUB_REPOSITORY" in text, (
+        "remote script path must also be derived from repo identity, since "
+        "GITHUB_RUN_ID alone is not unique across repositories"
+    )
+    assert "repo_slug" in text
+    idx_remote_script_def = text.index('REMOTE_SCRIPT="')
+    remote_script_line_end = text.index("\n", idx_remote_script_def)
+    remote_script_line = text[idx_remote_script_def:remote_script_line_end]
+    assert "repo_slug" in remote_script_line, (
+        "repo_slug must appear directly in the REMOTE_SCRIPT path assembly"
+    )
 
-def test_rc3_rechecks_remote_state_after_prior_transport_failure():
-    # code review round 5 (P1): a 255 (SSH transport failure) can happen AFTER the
-    # remote deploy already finished (compose up + probe passed + last_good_tag
-    # written) but before the exit code made it back over the wire. A retry then
-    # sees rc=3 (busy lock held by the just-started new container) and — without
-    # this recheck — would misreport "deferred: old container kept", which is the
-    # opposite of what actually happened. The workflow must track whether a 255
-    # occurred earlier in this run, and if so, verify via the host's
-    # last_good_tag before trusting rc=3's "deferred" story.
+
+def test_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
+    # 2026-07-24 减法重构:拆除"255 后自动判成功"证明机器(pre_good 基线捕获 +
+    # remote_good 复核 + __unknown__ 哨兵 + 三条件提升,曾经历 R5/R6 两轮加固)。
+    # 证明条件本身(历史同值假阳性、基线不可得语义、竞态窗口)在两轮 code review
+    # 中先后被打洞,维护面大于价值,已整体拆除。回归诚实语义:本 run 出过 255 之后
+    # 远端状态本质不确定,rc=3 一律按 deferred 处理,只是额外打一条"状态不确定"
+    # 的告警,不再尝试反查远端状态来判定"其实已经成功"。
     text = WORKFLOW.read_text()
 
-    assert "had_transport_failure" in text, (
-        "must track whether an earlier attempt in this run hit rc=255, so a later "
-        "rc=3 can be recognised as potentially stale rather than trusted at face value"
+    # 证明机器必须已被整体拆除 —— 不应再出现基线/复核相关的变量名或哨兵值。
+    assert "pre_good" not in text, "post-255 baseline capture must be gone"
+    assert "remote_good" not in text, "post-255 remote recheck must be gone"
+    assert "last_good_tag" not in text, (
+        "the rc=3 recheck reading the host's last_good_tag must be gone"
     )
-    assert "last_good_tag" in text, (
-        "rc=3 recheck must consult the host's last_good_tag to see whether an "
-        "earlier (transport-failed) attempt actually already deployed GIT_SHA"
+    assert "__unknown__" not in text, "the baseline-unknown sentinel must be gone"
+    assert "_qdir" not in text, (
+        "the %q-escaped DEPLOY_DIR token that only served the deleted recheck "
+        "must be gone too"
     )
 
-    # had_transport_failure must be initialised before the loop, set on the 255
-    # branch, and consulted inside the rc=3 branch — not just present anywhere.
+    # had_transport_failure 的追踪逻辑保留:循环前初始化、确认 255 后才置位 ——
+    # 这是诚实告警仍然依赖的信号,不是本次拆除的对象。
     idx_init = text.index("had_transport_failure=0")
     idx_rc3 = text.index('"$rc" -eq 3')
     idx_rc_ne_255 = text.index('"$rc" -ne 255')
@@ -186,48 +203,14 @@ def test_rc3_rechecks_remote_state_after_prior_transport_failure():
     # the flag is set once rc is known to be 255, i.e. after the "!= 255" guard
     assert idx_rc_ne_255 < idx_set, "had_transport_failure=1 must be set on the confirmed-255 path"
 
-    # regression guard: deferred=true must still exist as the fallback outcome.
-    assert "deferred=true" in text, "rc=3 must still be able to fall through to deferred when the recheck doesn't confirm success"
+    # 诚实告警保留:这是整套新语义的核心 —— 断过线就说"不确定",而不是悄悄判成功。
+    assert (
+        "::warning::transport was interrupted earlier in this run; remote state "
+        "may have advanced beyond what 'deferred' implies" in text
+    ), "the honest uncertainty warning must remain after dropping auto-promotion"
 
-    # code review round 6 (P1): remote_good == GIT_SHA alone doesn't prove the
-    # *current run* wrote that value — re-running an already-deployed SHA (e.g.
-    # a manual re-run, or two pushes that happen to produce the same GIT_SHA)
-    # can leave last_good_tag pre-equal to GIT_SHA before this run's loop even
-    # starts. In that case a real attempt-1 probe failure (whose rollback branch
-    # is itself skipped when prev_good == GIT_SHA) followed by a transport hiccup
-    # would wrongly be "verified" as success by the R5 check alone. The recheck
-    # must also prove last_good_tag *changed to* GIT_SHA during this run, by
-    # comparing against a pre-loop baseline (pre_good).
-    assert "pre_good" in text, (
-        "the recheck must capture a pre-loop baseline of last_good_tag (pre_good) "
-        "so it can distinguish 'changed during this run' from 'already this value "
-        "before this run started'"
-    )
-
-    idx_while = text.index("while true")
-    idx_pre_good_init = text.index("pre_good=")
-    assert idx_pre_good_init < idx_while, (
-        "pre_good's baseline capture must happen before the retry loop starts, "
-        "not inside it — otherwise it can't represent the pre-run state"
-    )
-
-    # the success-promotion if-condition must require all three: remote_good
-    # matches GIT_SHA now, pre_good was different before this run (i.e. it
-    # actually changed during this run), and pre_good was obtainable at all
-    # (not "__unknown__" — no baseline means no proof, so don't promote).
-    idx_remote_good_if = text.index('"$remote_good" = "$GIT_SHA"')
-    line_start = text.rindex("\n", 0, idx_remote_good_if) + 1
-    line_end = text.index("\n", idx_remote_good_if)
-    promotion_line = text[line_start:line_end]
-    assert "pre_good" in promotion_line, (
-        "the success-promotion if-condition must also reference pre_good, not "
-        "just remote_good — otherwise a historical same-value coincidence is "
-        "indistinguishable from an in-run success"
-    )
-    assert "__unknown__" in promotion_line, (
-        "the success-promotion if-condition must refuse to promote to success "
-        "when the pre-loop baseline itself couldn't be fetched (ssh failure)"
-    )
+    # regression guard: deferred=true must still exist as the (only) outcome.
+    assert "deferred=true" in text, "rc=3 must still fall through to deferred"
 
 
 def test_red_card_step_skips_when_deferred():
@@ -250,3 +233,114 @@ def test_yellow_card_step_exists_for_deferred_without_at_all():
     # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
     red_section = text[red_idx:idx]
     assert "<at id=all>" in red_section
+
+
+def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
+    # P1-B (codex review): actions/checkout defaults to persist-credentials:
+    # true, which writes the (in the ci-templates checkout's case, PAT-backed)
+    # token into .git/config. Nothing after checkout needs git credentials —
+    # deploy is pure SSH/scp/docker. Worse, .ci-templates lives inside this
+    # job's `build_context: "."` — a caller Dockerfile with `COPY . .` would
+    # bake the CI_TEMPLATES_PAT-backed .git/config *and* the private
+    # ci-templates source straight into the image layer pushed to ACR. Both
+    # checkouts must disable credential persistence, and ci-templates must be
+    # relocated out of the build context (into $RUNNER_TEMP) before the build
+    # step runs, with every later reference following it there.
+    text = WORKFLOW.read_text()
+    assert text.count("persist-credentials: false") >= 2, (
+        "both the caller-repo and ci-templates checkout steps must set "
+        "persist-credentials: false"
+    )
+    assert 'mv .ci-templates "$RUNNER_TEMP/ci-templates"' in text or \
+        "mv .ci-templates \"$RUNNER_TEMP/ci-templates\"" in text, (
+        "ci-templates must be moved out of the build_context (.) after checkout"
+    )
+    assert ".ci-templates/scripts/" not in text, (
+        "no step may reference ci-templates scripts at their original "
+        "in-build-context path once the relocation step exists — every "
+        "reference must go through $RUNNER_TEMP/ci-templates/scripts/"
+    )
+    assert '$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh' in text
+    assert '$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh' in text
+
+    # the relocation must happen before the build step consumes push_to_acr.sh
+    idx_mv = text.index('mv .ci-templates')
+    idx_build_push = text.index('push_to_acr.sh')
+    assert idx_mv < idx_build_push, (
+        "ci-templates must be relocated before the build step references its scripts"
+    )
+
+
+def test_run_steps_do_not_directly_expand_inputs():
+    # P1-A (codex review round 5): GitHub Actions substitutes ${{ }} expressions
+    # into `run:` text via plain textual replacement BEFORE the shell ever sees
+    # it -- it is not shell variable injection, it is a text splice. If the
+    # substituted value contains a newline, whatever text follows the
+    # substitution point on that line (even inside a shell comment) becomes a
+    # new, literally-executed shell command. At this point in the job the
+    # runner already holds ACR/SSH credentials, so this is a high-value
+    # injection surface. `inputs.*` values must be routed through the step's
+    # `env:` mapping and referenced as "$VAR" in the script body instead of
+    # being spliced directly into `run:` text.
+    #
+    # P1-A follow-up (round 5 leftover, closed out on coordinator direction):
+    # the same text-splice hazard applies to `${{ secrets.* }}` -- the round 5
+    # fix only routed `inputs.*` out of run: text and explicitly left the 3
+    # `secrets.*` splices (ACR login, SSH key setup) in place as an accepted-
+    # risk item. This test now also guards against `${{ secrets.` regressing
+    # back into run: text.
+    raw, _ = _load()
+    for job_name, job in raw["jobs"].items():
+        for step in job.get("steps", []):
+            run = step.get("run")
+            if not run:
+                continue
+            assert "${{ inputs." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ inputs.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+            assert "${{ secrets." not in run, (
+                f"step {step.get('name')!r} in job {job_name!r} must not expand "
+                "${{ secrets.* }} directly in its run: text -- route it through "
+                "env: instead"
+            )
+
+
+def test_ssh_user_and_host_are_syntax_validated_before_use():
+    # P1-B (codex review round 5): if ssh_user starts with '-', the assembled
+    # "${SSH_USER}@${DEPLOY_HOST}:path" argument itself starts with '-' and
+    # scp/ssh parse it as a command-line option (e.g. a crafted
+    # -oProxyCommand=... value), not as a user@host target -- double-quoting
+    # does not stop this, because the problem is scp/ssh's own option parsing,
+    # not shell word-splitting. Both values must be validated against a safe
+    # character class before their first use in deploy_once()/SSH_OPTS.
+    text = WORKFLOW.read_text()
+    assert 'SSH_USER" =~' in text, (
+        "ssh_user must be regex-validated against a safe charset before use"
+    )
+    assert 'DEPLOY_HOST" =~' in text, (
+        "host must be regex-validated against a safe charset before use"
+    )
+
+
+def test_orphaned_remote_script_cleaned_up_when_retries_exhausted():
+    # P2-B (codex review round 5): REMOTE_SCRIPT's path is fixed for the whole
+    # job (constructed once before the retry loop, not per-attempt), so if
+    # scp/ssh keep failing at the transport layer (rc=255) across every
+    # retry, the remote script never gets a chance to run its own cleanup
+    # trap, and nothing else ever removes the orphaned /tmp file once retries
+    # are exhausted. A best-effort ssh rm -f cleanup must run right before the
+    # final give-up `exit 1` in the "attempt >= max_attempts" branch.
+    text = WORKFLOW.read_text()
+    assert "rm -f -- '${REMOTE_SCRIPT}'" in text, (
+        "must best-effort clean up the orphaned REMOTE_SCRIPT path on the host "
+        "when transport retries are exhausted"
+    )
+    idx_giveup = text.index("SSH transport failed after ${max_attempts} attempts (rc=255)")
+    idx_cleanup = text.index("rm -f -- '${REMOTE_SCRIPT}'")
+    idx_exit1 = text.index("exit 1", idx_giveup)
+    assert idx_giveup < idx_cleanup < idx_exit1, (
+        "cleanup must happen inside the exhausted-retries branch, before its "
+        "final exit 1"
+    )

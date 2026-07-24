@@ -13,6 +13,7 @@
 ```
 .github/workflows/
   build-deploy.yml      # 复用流水线 (workflow_call)，每服务 ~10 行调它
+  build-deploy-release.yml # 多镜像原子发布（独立接口，不改变单镜像 lane）
   ci.yml                # 本仓自测：registry 校验 + pytest
 scripts/
   push_to_acr.sh        # build + 打 git-SHA 不可变 tag + push ACR
@@ -25,6 +26,48 @@ examples/
   canary-workflow.yml   # canary 服务模板（钉 @main）
 tests/                  # pytest（schema + 部署逻辑 + workflow 契约）
 ```
+
+## 多镜像原子发布（release lane）
+
+需要让 frontend、backend 等镜像一起切换的服务调用
+`build-deploy-release.yml`。`images_json` 是严格 JSON 数组，每项至少包含
+`image_name`、`build_context`、`dockerfile`；可选 `build_alias` 让 worker 别名共享一次
+构建（同一 alias 的 context 和 Dockerfile 必须一致）。未知字段、重复 image 名、控制字符、
+绝对路径和 `..` 路径都会在构建前拒绝。`probes_json` 是必填的严格 JSON 数组；生产发布
+至少配置 frontend 入口和 backend API 两个探针，例如：
+
+```json
+[{"url":"http://localhost:8080/","expect_status":200},
+ {"url":"http://localhost:8000/healthz","expect_status":200}]
+```
+
+Compose 必须使用不可变发布变量（Docker Compose v2，`config --images` 需可用）；公共的
+nginx 等额外镜像可以继续存在：
+
+```yaml
+services:
+  transcribe-backend:
+    image: transcribe-backend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+  transcribe-frontend:
+    image: transcribe-frontend:${D3_RELEASE_TAG:?D3_RELEASE_TAG is required}
+```
+
+`busy_lock_file` / `busy_lock_timeout` 是可选服务 admission 门（默认空路径关闭，兼容旧行为）。
+启用后远端按服务忙锁再主机锁的顺序进入整组切换；忙时返回 rc=3，caller 只发黄色延后卡，
+不会 SSH 重试或提升 last-good。
+
+构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本分两个阶段运行：先在锁外拉取并校验这次发布的
+不可变 SHA 镜像并 retag 为 `<image_name>:<sha>`，完成本地 staging；随后才按忙锁 → host `flock`
+顺序进入临界区，在双锁内仅写入统一的 `D3_RELEASE_TAG` compose 环境文件，运行
+`config --images` 身份门禁、`docker compose up -d`、探针和 promote/rollback。这样等待服务忙锁时
+不会写 compose/env/state，也不会在拿到锁后重复拉取或 retag。全部探针通过后才原子提升唯一权威
+状态 `.deploy-state/release/last_good_release`（首行是 SHA，其余是完整 manifest 内容，同目录
+rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后尽力而为写入的兼容视图，
+供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
+`last_good_release` 为准。失败时按旧 manifest 整组回滚，首次发布没有旧版本则明确失败，
+不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死基镜像、锁定依赖，
+才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受支持——脚本会显式
+拒绝并保持容器现状，绝不做部分回滚，需要人工介入。
 
 ## 调用方（每服务 ~10 行）
 
