@@ -85,12 +85,13 @@ on:
         # `runner` input (this workflow's runs-on ternary below mirrors that file's
         # mapping pattern verbatim, just without the PR/fork-guard clause a deploy
         # job doesn't need). self = self-hosted (VM201 fleet, labels
-        # self-hosted,linux,x64,codex); hosted = GitHub-hosted ubuntu-latest (free
-        # minutes, today's only value in production — every @v1 caller is
-        # unaffected by this input's existence until a caller sets it explicitly).
-        description: "Deploy job runner pool: self (self-hosted VM201 fleet) | hosted (GitHub-hosted ubuntu-latest, free minutes). Default hosted preserves today's behavior for every existing caller."
+        # self-hosted,linux,x64,codex); hosted = GitHub-hosted ubuntu-latest.
+        # Default self since D3 migration P1 (2026-07-27): every @v1 caller deploys
+        # on the self-hosted fleet; a caller sets `runner: hosted` explicitly to
+        # opt out (emergency fallback lane, paid/free GitHub minutes).
+        description: "Deploy job runner pool: self (self-hosted VM201 fleet, default since D3 migration P1) | hosted (GitHub-hosted ubuntu-latest, explicit opt-out / emergency fallback)."
         required: false
-        default: "hosted"
+        default: "self"
         type: string
     # EXPLICIT secrets only — least privilege. Do NOT add `inherit`.
     secrets:
