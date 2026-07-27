@@ -80,6 +80,18 @@ on:
         required: false
         default: "v1"
         type: string
+      runner:
+        # self | hosted — same two values and meaning as zlxlabs/gate's gate-v2.yml
+        # `runner` input (this workflow's runs-on ternary below mirrors that file's
+        # mapping pattern verbatim, just without the PR/fork-guard clause a deploy
+        # job doesn't need). self = self-hosted (VM201 fleet, labels
+        # self-hosted,linux,x64,codex); hosted = GitHub-hosted ubuntu-latest (free
+        # minutes, today's only value in production — every @v1 caller is
+        # unaffected by this input's existence until a caller sets it explicitly).
+        description: "Deploy job runner pool: self (self-hosted VM201 fleet) | hosted (GitHub-hosted ubuntu-latest, free minutes). Default hosted preserves today's behavior for every existing caller."
+        required: false
+        default: "hosted"
+        type: string
     # EXPLICIT secrets only — least privilege. Do NOT add `inherit`.
     secrets:
       ACR_USERNAME:
@@ -108,7 +120,11 @@ concurrency:
 
 jobs:
   build-deploy:
-    runs-on: ubuntu-latest
+    # Same runs-on ternary shape as zlxlabs/gate's gate-v2.yml `gate` job's
+    # control_runner mapping (control_runner == 'self-hosted-control' →
+    # self-hosted labels, else ubuntu-latest) — hosted (default) is unchanged
+    # behavior for every existing @v1 caller; self routes to the VM201 fleet.
+    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","codex"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -171,7 +187,11 @@ jobs:
         run: bash "$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh"
 
       - name: Connect to Tailscale
-        # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机
+        # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机。
+        # self 模式整段跳过:VM201 self-hosted runner 容器(默认 bridge 网络,出流量经宿主
+        # NAT)已可直连部署目标机——宿主机本身就在 tailnet 内,不需要每次 job 再为 runner
+        # 临时建一个 ephemeral tailscale 节点(2026-07-27 实测确认,d3mig T2)。
+        if: inputs.runner == 'hosted'
         uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}
