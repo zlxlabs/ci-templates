@@ -192,6 +192,14 @@ if [ "$1" = push ]; then echo "push $2" >> "{calls}"; exit 0; fi
         str(tmp_path),
     ]
     assert all(call[:2] != ["buildx", "create"] for call in recorded)
+    # --load 有专属守卫,而不只是上面那张大 argv 表里的一个元素:docker-container
+    # driver 的产物默认**不进**本地 daemon,少了它下面的 tag/push 会推一个陈旧或
+    # 不存在的镜像——静默出错,是本增量最危险的失败模式。断言独立一条,回归时的
+    # 报错才说得清是哪个不变式挂了,而不是一屏 argv 的 diff。
+    assert "--load" in recorded[1], (
+        "buildx build must --load into the local daemon, otherwise the tag/push below "
+        "would operate on a stale or missing image"
+    )
     assert recorded[2:] == [
         [
             "tag",
@@ -331,6 +339,12 @@ if [ "$1" = build ]; then exit 17; fi
 
     assert result.returncode == 17
     recorded = _recorded_argv(tmp_path)
+    # 恰好三次调用:inspect → buildx build(失败) → classic build(失败)。锁死调用
+    # 次数而不只是最后一条,否则「降级路径里多跑了一次 buildx build 才放弃」这类
+    # 回归不会被发现——降级必须只发生一次。
+    assert len(recorded) == 3, f"fallback must happen exactly once, got: {recorded}"
+    assert recorded[0] == ["buildx", "inspect", "ci-templates-registry-cache"]
+    assert recorded[1][:2] == ["buildx", "build"]
     assert recorded[-1] == [
         "build",
         "--build-arg",
