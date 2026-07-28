@@ -19,6 +19,10 @@ PUSH_TIMEOUT_KILL_AFTER_SECONDS="${PUSH_TIMEOUT_KILL_AFTER_SECONDS:-15}"
 PUSH_MAX_ATTEMPTS="${PUSH_MAX_ATTEMPTS:-3}"
 PUSH_RETRY_DELAY_SECONDS="${PUSH_RETRY_DELAY_SECONDS:-10}"
 
+# opt-in 本地网络 registry 镜像(host:port,如 tailnet MagicDNS 名):部署关键路径。
+# 留空(默认)= 禁用,下面的双推逻辑整体退化成改动前的纯 ACR 单推,行为逐字节不变。
+LOCAL_REGISTRY="${LOCAL_REGISTRY:-}"
+
 is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
@@ -100,6 +104,48 @@ echo "[push] building ${ACR_IMAGE}:${GIT_SHA}"
   -t "${ACR_IMAGE}:${GIT_SHA}" \
   "${BUILD_CONTEXT}"
 
-push_with_retry "${ACR_IMAGE}:${GIT_SHA}" "$PUSH_MAX_ATTEMPTS"
+# 双推:本地 registry(部署关键路径,opt-in) + ACR(异地存档 + 拉取回退,pull_and_deploy.sh
+# 的 pull_from_local_registry() 失败时会退回它)。LOCAL_REGISTRY 为空(默认)时
+# local_enabled 恒为 0,下面的致命判断退化为"ACR 失败就报错退出"—— 与改动前逐字节一致。
+local_enabled=0
+local_ok=0
+if [ -n "$LOCAL_REGISTRY" ]; then
+  local_enabled=1
+  LOCAL_IMAGE="${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
+  if "$DOCKER_BIN" tag "${ACR_IMAGE}:${GIT_SHA}" "${LOCAL_IMAGE}:${GIT_SHA}"; then
+    if push_with_retry "${LOCAL_IMAGE}:${GIT_SHA}" "$PUSH_MAX_ATTEMPTS"; then
+      local_ok=1
+    else
+      echo "::warning::local registry push failed for ${LOCAL_IMAGE}:${GIT_SHA} — this deploy will fall back to ACR-only for this SHA"
+    fi
+  else
+    echo "::warning::local retag to ${LOCAL_IMAGE}:${GIT_SHA} failed — skipping local registry push, falling back to ACR-only for this SHA"
+  fi
+fi
 
-echo "[push] done: ${ACR_IMAGE}:${GIT_SHA}"
+acr_ok=0
+if push_with_retry "${ACR_IMAGE}:${GIT_SHA}" "$PUSH_MAX_ATTEMPTS"; then
+  acr_ok=1
+elif [ "$local_enabled" -eq 1 ]; then
+  echo "::warning::ACR push failed for ${ACR_IMAGE}:${GIT_SHA} — offsite archive/fallback unavailable for this SHA"
+fi
+
+# 致命条件:ACR 失败,且(本地未启用 或 本地也失败)——覆盖默认路径(本地关闭时
+# ACR 失败必须致命,逐字节复刻改动前行为)和 opt-in 路径(两处都失败才致命;
+# 单边失败允许降级继续,只是丢掉对应那份保障,已在上面打过 warning)。
+fatal=0
+if [ "$acr_ok" -ne 1 ]; then
+  if [ "$local_enabled" -eq 0 ] || [ "$local_ok" -ne 1 ]; then
+    fatal=1
+  fi
+fi
+if [ "$fatal" -eq 1 ]; then
+  echo "::error::push failed for ${GIT_SHA} to every configured registry — image not available anywhere"
+  exit 1
+fi
+
+if [ "$local_enabled" -eq 1 ]; then
+  echo "[push] done: ${ACR_IMAGE}:${GIT_SHA} (local registry $([ "$local_ok" -eq 1 ] && echo ok || echo failed), ACR $([ "$acr_ok" -eq 1 ] && echo ok || echo failed))"
+else
+  echo "[push] done: ${ACR_IMAGE}:${GIT_SHA}"
+fi

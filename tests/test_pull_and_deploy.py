@@ -489,6 +489,134 @@ def test_host_lock_held_past_budget_defers(tmp_path):
     assert "compose up" not in log
 
 
+# --- local registry pull fast path (opt-in; LOCAL_IMAGE empty = ACR-only, unchanged) ---
+# 本地 registry 是部署关键路径(同网段实测端到端 0.458s),ACR 是拉取回退。LOCAL_IMAGE
+# 未设置时(上面所有既有测试都不设置它)pull_image() 必须逐字节复刻改动前的纯 ACR
+# 单路径 —— 这正是那些既有测试(如 test_deploys_immutable_git_sha_tag 对 pull 次数
+# 的精确断言)已经在锁的边界,这里再显式补一条便于按名字检索这条不变式。
+
+def _mock_docker_local_then_acr(log_path: Path, local_ref: str, local_fail_pulls: int, acr_ref: str) -> str:
+    """docker mock: pulls of `local_ref` fail `local_fail_pulls` times then succeed;
+    pulls of `acr_ref` always succeed immediately; tag/compose always succeed."""
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  ref="$2"
+  if [ "$ref" = "{local_ref}" ]; then
+    count_file="{log_path}.localcount"
+    n=$(cat "$count_file" 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > "$count_file"
+    [ "$n" -le {local_fail_pulls} ] && exit 1
+    exit 0
+  fi
+  if [ "$ref" = "{acr_ref}" ]; then
+    exit 0
+  fi
+  exit 1
+fi
+exit 0
+"""
+
+
+def _local_registry_env(tmp_path: Path, *, local_fail_pulls: int) -> dict:
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    local_ref = "local.example:5001/ns/demo:abc1234"
+    acr_ref = "registry.example.com/ns/demo:abc1234"  # matches ACR_IMAGE/GIT_SHA from _base_env
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_local_then_acr(Path(env["DOCKER_LOG"]), local_ref, local_fail_pulls, acr_ref),
+    )
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRY_DELAY"] = "0"
+    return env
+
+
+def test_local_registry_optout_leaves_behavior_unchanged(tmp_path):
+    """不传 LOCAL_IMAGE(或为空)→ pull_image() 完全走原 ACR 单路径,不产生任何
+    本地 registry 相关的 pull/tag 调用,不多一次 docker 调用。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 1, log
+    assert "local" not in log.lower(), log
+
+
+def test_local_registry_pull_succeeds_skips_acr_entirely(tmp_path):
+    """本地 registry 一次拉到 → 直接 retag 成 ACR_IMAGE:tag 规范名,完全不碰 ACR。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 1, log
+    assert "pull registry.example.com/ns/demo:abc1234" not in log, log
+    assert "tag local.example:5001/ns/demo:abc1234 registry.example.com/ns/demo:abc1234" in log, log
+    assert "compose up -d" in log
+
+
+def test_local_registry_pull_retries_default_is_two_then_falls_back_to_acr(tmp_path):
+    """本地 registry 全程不可达(2026-07-28 决策:同网段链路给它套 ACR 的 150s 预算
+    是浪费,默认只给 2 次快速失败)→ 精确耗尽 2 次本地尝试后切到 ACR,ACR 照常成功。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=99)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 2, log
+    assert log.count("pull registry.example.com/ns/demo:abc1234") == 1, log
+    assert "falling back to ACR" in res.stdout
+    assert "compose up -d" in log
+
+
+def test_local_registry_retry_budget_is_configurable(tmp_path):
+    """LOCAL_PULL_RETRIES 可覆盖(不是硬编码),锁定"精确耗尽配置值才切 ACR"这条边界。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=99)
+    env["LOCAL_PULL_RETRIES"] = "4"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 4, log
+    assert log.count("pull registry.example.com/ns/demo:abc1234") == 1, log
+
+
+def test_local_registry_retag_failure_falls_back_to_acr(tmp_path):
+    """本地拉取成功但 retag 到 ACR_IMAGE:tag 规范名失败(极端情况)→ 不重试本地,
+    直接落到 ACR 路径,部署仍应成功(last_good_tag/回滚只认规范名,与来源 registry 无关)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    local_ref = "local.example:5001/ns/demo:abc1234"
+    acr_ref = "registry.example.com/ns/demo:abc1234"
+    docker_log = Path(env["DOCKER_LOG"])
+    _write_exec(
+        mock_dir / "docker",
+        f"""#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = "pull" ]; then
+  [ "$2" = "{local_ref}" ] && exit 0
+  [ "$2" = "{acr_ref}" ] && exit 0
+  exit 1
+fi
+if [ "$1" = "tag" ]; then
+  [ "$2" = "{local_ref}" ] && exit 1
+  exit 0
+fi
+exit 0
+""",
+    )
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = docker_log.read_text()
+    assert log.count(f"pull {local_ref}") == 1, log
+    assert log.count(f"pull {acr_ref}") == 1, log
+    assert "retag" in res.stdout and "failed" in res.stdout
+    assert "compose up -d" in log
+
+
 def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
     """BUSY_LOCK_TIMEOUT 不是正整数 → 必须是显式的配置错误(rc=1),不能被 bash 算术
     悄悄当 0 处理后伪装成"服务忙"的 deferred(rc=3)——两者运维含义完全不同。"""
