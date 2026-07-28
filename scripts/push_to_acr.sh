@@ -60,6 +60,20 @@ if ! is_non_negative_integer "$PUSH_RETRY_DELAY_SECONDS"; then
   exit 2
 fi
 
+# 校验 LOCAL_REGISTRY 的形状:只接受 host[:port],拒绝协议前缀(http://)、凭据
+# (user:pass@host)、多余路径(host:port/extra)——这些一旦混进下面的
+# ${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME} 镜像引用,凭据会连同 docker
+# tag/push 命令行和 warning 文本一起被打进构建日志,发生泄漏。错误信息里绝不
+# 回显原值,只说期望格式,否则校验本身就成了泄漏点。
+is_valid_registry_host() {
+  [[ "$1" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+}
+
+if [ -n "$LOCAL_REGISTRY" ] && ! is_valid_registry_host "$LOCAL_REGISTRY"; then
+  echo "::error::local_registry has an invalid shape — expected host[:port] only (no scheme prefix like http://, no credentials, no path)" >&2
+  exit 2
+fi
+
 # An immutable SHA push is safe to retry: it always points to the same image
 # bytes. Bound every attempt so a stalled blob upload cannot keep a deployment
 # job silent for tens of minutes. Do not publish a mutable registry `latest`:
@@ -106,7 +120,10 @@ echo "[push] building ${ACR_IMAGE}:${GIT_SHA}"
 
 # 双推:本地 registry(部署关键路径,opt-in) + ACR(异地存档 + 拉取回退,pull_and_deploy.sh
 # 的 pull_from_local_registry() 失败时会退回它)。LOCAL_REGISTRY 为空(默认)时
-# local_enabled 恒为 0,下面的致命判断退化为"ACR 失败就报错退出"—— 与改动前逐字节一致。
+# local_enabled 恒为 0,下面的致命判断退化为"ACR 失败就报错退出"—— 退出码与失败/
+# 成功结论与改动前一致(见下面 fatal 判断处的说明,那里有一处刻意的 stdout 差异)。
+# 整条 opt-out 等价性只系于下面这一个 `[ -n "$LOCAL_REGISTRY" ]` guard:删掉或
+# 重构掉它,本地未开启时的行为保证就没有代码在守着了。
 local_enabled=0
 local_ok=0
 if [ -n "$LOCAL_REGISTRY" ]; then
@@ -131,8 +148,18 @@ elif [ "$local_enabled" -eq 1 ]; then
 fi
 
 # 致命条件:ACR 失败,且(本地未启用 或 本地也失败)——覆盖默认路径(本地关闭时
-# ACR 失败必须致命,逐字节复刻改动前行为)和 opt-in 路径(两处都失败才致命;
-# 单边失败允许降级继续,只是丢掉对应那份保障,已在上面打过 warning)。
+# ACR 失败必须致命)和 opt-in 路径(两处都失败才致命;单边失败允许降级继续,只是
+# 丢掉对应那份保障,已在上面打过 warning)。
+#
+# 退出码与"失败/成功"这个结论,在默认路径(LOCAL_REGISTRY 为空)下与改动前完全
+# 一致:ACR 失败 → exit 1(与改动前 `set -e` 下 push_with_retry 直接返回 1 让脚本
+# 终止时的退出码相同);ACR 成功 → exit 0。**但 stdout 不是逐字节一致**:改动前
+# ACR 失败时脚本在 push_with_retry 打完自己的 `::error::` 后立即因 `set -e` 终止,
+# 永远不会走到任何"汇总"消息;这里为了让 opt-in 路径也能说清"两处都失败"这个
+# 汇总结论,把判断显式收进了 `if`(因此不再触发 set -e),失败时统一多打一行
+# `::error::push failed ... image not available anywhere`——包括默认路径。这一行
+# stdout 差异是刻意接受的(信息量 > 逐字节形式),不追求恢复原始的隐式 set -e
+# 终止方式。
 fatal=0
 if [ "$acr_ok" -ne 1 ]; then
   if [ "$local_enabled" -eq 0 ] || [ "$local_ok" -ne 1 ]; then

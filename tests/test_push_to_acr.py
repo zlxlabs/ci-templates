@@ -219,6 +219,77 @@ if [ "$1" = push ]; then exit 1; fi
     assert "image not available anywhere" in result.stdout
 
 
+def test_local_registry_rejects_credentials_in_host(tmp_path):
+    """user:pass@host 形式必须被拒绝——否则凭据会随镜像引用流进 tag/push 命令行和日志
+    (OCR round-1 finding #5/#13,P1 不变式:凭据不得泄漏)。"""
+    docker = _write_fake_docker(tmp_path, "exit 0\n")
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="user:secretpw@local.example:5001"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "invalid shape" in result.stderr
+    # 校验本身绝不能回显原值,否则错误信息自己就是一条泄漏点。
+    assert "secretpw" not in result.stdout
+    assert "secretpw" not in result.stderr
+
+
+def test_local_registry_rejects_scheme_prefix(tmp_path):
+    docker = _write_fake_docker(tmp_path, "exit 0\n")
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="https://local.example:5001"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "invalid shape" in result.stderr
+
+
+def test_local_registry_rejects_embedded_path(tmp_path):
+    docker = _write_fake_docker(tmp_path, "exit 0\n")
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001/extra"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "invalid shape" in result.stderr
+
+
+def test_local_registry_accepts_plain_host_port(tmp_path):
+    """回归护栏:合法的 host:port(含端口)不应该被新校验误伤。"""
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ] || [ "$1" = tag ]; then exit 0; fi
+if [ "$1" = push ]; then exit 0; fi
+''',
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_default_path_stdout_never_mentions_local_registry(tmp_path):
+    """LOCAL_REGISTRY 未设置(默认)→ 输出里不出现 "local" 字样,防止后来者加一行
+    诊断 log 就悄悄破坏了默认路径与下游 grep 的假设(OCR round-1 finding #8/#9)。"""
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ]; then exit 0; fi
+if [ "$1" = push ]; then exit 0; fi
+''',
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker), text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "local" not in result.stdout.lower()
+    assert "local" not in result.stderr.lower()
+
+
 def test_local_retag_failure_skips_local_push_and_falls_back_to_acr(tmp_path):
     """build 后的本地 retag 本身失败(极端情况,如磁盘满)→ 不尝试本地 push,直接走 ACR。"""
     calls = tmp_path / "calls"

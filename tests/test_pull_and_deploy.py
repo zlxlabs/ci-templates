@@ -533,6 +533,163 @@ def _local_registry_env(tmp_path: Path, *, local_fail_pulls: int) -> dict:
     return env
 
 
+def test_local_image_rejects_credentials_in_host(tmp_path):
+    """user:pass@host 形式必须被拒绝——否则凭据会随镜像引用流进 pull/tag 命令行和
+    log(OCR round-1 finding #5/#13,P1 不变式:凭据不得泄漏)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "user:secretpw@local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+    # 校验本身绝不能回显原值,否则错误信息自己就是一条泄漏点。
+    assert "secretpw" not in res.stdout
+    assert "secretpw" not in res.stderr
+
+
+def test_local_image_rejects_scheme_prefix(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "https://local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+
+
+def test_local_pull_retries_zero_is_rejected(tmp_path):
+    """LOCAL_PULL_RETRIES=0 会让本地路径的循环一次都不执行,表现和"本地不可达"完全
+    一样——每次都静默回退 ACR,而没有任何信号说明新链路根本没生效。必须是显式
+    配置错误,不能被 bash 算术悄悄当 0 处理(OCR round-1 finding #12,防静默降级)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRIES"] = "0"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRIES must be a positive integer" in res.stdout
+
+
+def test_local_pull_retry_delay_negative_is_rejected(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRY_DELAY"] = "-1"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRY_DELAY must be a non-negative integer" in res.stdout
+
+
+def test_local_pull_retry_delay_zero_is_allowed(tmp_path):
+    """与 RETRIES 不同,DELAY=0(退避间隔为零、立即重试)是合法配置,不该被拒绝——
+    与 push_to_acr.sh 的 PUSH_RETRY_DELAY_SECONDS 使用同一条 is_non_negative_integer
+    规则保持一致。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    env["LOCAL_PULL_RETRY_DELAY"] = "0"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_local_registry_last_good_tag_is_bare_sha_without_registry_prefix(tmp_path):
+    """P1 不变式:last_good_tag 只能记裸 SHA,不含 registry 前缀/冒号。本地 registry
+    拉到的字节已经 retag 成 ACR_IMAGE:tag 规范名,写入 last_good_tag 的必须还是那个
+    裸 tag,与字节来自哪个 registry 无关——一个把 LOCAL_IMAGE 前缀悄悄带进
+    last_good_tag 的回归,不会被"部署成功"的既有断言拦住,只有精确内容比对能拦
+    (OCR round-1 finding #10,P1:回滚拉错镜像 = 静默出错 + 故障放大)。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    content = good.read_text().strip()
+    assert content == "abc1234", content
+    assert "/" not in content and ":" not in content, (
+        f"last_good_tag must be a bare SHA with no registry prefix, got {content!r}"
+    )
+
+
+def test_local_registry_rollback_keeps_last_good_tag_bare_sha(tmp_path):
+    """回滚路径同理:探针失败触发回滚后,last_good_tag 必须还是原先那条裸 SHA——
+    两次部署(健康 + 回滚)都走本地 registry 拉取,retag 环节不能让任何一次把
+    registry 前缀带进 last_good_tag。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    local_prefix = "local.example:5001/ns/demo:"
+
+    _write_exec(
+        mock_dir / "docker",
+        f"""#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = "pull" ]; then
+  case "$2" in
+    {local_prefix}*) exit 0 ;;
+    *) exit 1 ;;
+  esac
+fi
+exit 0
+""",
+    )
+    curl_status_file = tmp_path / "curl_status"
+    curl = mock_dir / "curl"
+    _write_exec(
+        curl,
+        f"""#!/bin/bash
+printf '%s' "$(cat "{curl_status_file}")"
+exit 0
+""",
+    )
+
+    deploy_dir = tmp_path / "app"
+    deploy_dir.mkdir()
+    (deploy_dir / "docker-compose.yml").write_text("services: {}\n")
+
+    base_env = dict(os.environ)
+    base_env.update(
+        IMAGE_NAME="demo",
+        ACR_IMAGE="registry.example.com/ns/demo",
+        DEPLOY_DIR=str(deploy_dir),
+        STATE_DIR=str(tmp_path / "state"),
+        HOST_LOCK=str(tmp_path / "host.lock"),
+        HEALTHCHECK_URL="http://localhost/health",
+        HEALTHCHECK_EXPECT_STATUS="200",
+        HEALTHCHECK_RETRIES="1",
+        HEALTHCHECK_INTERVAL="0",
+        HEALTHCHECK_WARMUP="0",
+        HEALTHCHECK_TIMEOUT="1",
+        DOCKER_BIN=str(mock_dir / "docker"),
+        CURL_BIN=str(curl),
+        LOCAL_IMAGE="local.example:5001/ns/demo",
+    )
+
+    good = Path(base_env["STATE_DIR"]) / "last_good_tag"
+
+    # 1st deploy: healthy via the local registry -> records bare "abc1234"
+    curl_status_file.write_text("200")
+    env_ok = dict(base_env, GIT_SHA="abc1234")
+    res_ok = subprocess.run(["bash", str(SCRIPT)], env=env_ok, capture_output=True, text=True)
+    assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+    assert good.read_text().strip() == "abc1234"
+
+    # 2nd deploy: a new SHA, also pulled via the local registry, but unhealthy
+    # -> must roll back to abc1234 (re-pulled via the local registry too)
+    curl_status_file.write_text("500")
+    env_bad = dict(base_env, GIT_SHA="def5678")
+    docker_log.write_text("")
+    res_bad = subprocess.run(["bash", str(SCRIPT)], env=env_bad, capture_output=True, text=True)
+    assert res_bad.returncode != 0
+
+    content = good.read_text().strip()
+    assert content == "abc1234", content
+    assert "/" not in content and ":" not in content
+
+    log = docker_log.read_text()
+    assert f"pull {local_prefix}def5678" in log, log
+    assert f"pull {local_prefix}abc1234" in log, log
+
+
 def test_local_registry_optout_leaves_behavior_unchanged(tmp_path):
     """不传 LOCAL_IMAGE(或为空)→ pull_image() 完全走原 ACR 单路径,不产生任何
     本地 registry 相关的 pull/tag 调用,不多一次 docker 调用。"""
@@ -544,6 +701,12 @@ def test_local_registry_optout_leaves_behavior_unchanged(tmp_path):
     log = Path(env["DOCKER_LOG"]).read_text()
     assert log.count("pull ") == 1, log
     assert "local" not in log.lower(), log
+    # 不只断言 mock 调用序列,也断言脚本自身的 stdout/stderr——防止后来者加一行
+    # 诊断 log 就悄悄破坏了默认路径与下游 grep 的假设(OCR round-1 finding #8/#9)。
+    # 用 "local registry" 而不是裸 "local":HEALTHCHECK_URL 里的 "localhost" 本身
+    # 就含 "local" 子串,裸子串断言会被这个既有、无关的巧合坑到误判。
+    assert "local registry" not in res.stdout.lower()
+    assert "local registry" not in res.stderr.lower()
 
 
 def test_local_registry_pull_succeeds_skips_acr_entirely(tmp_path):

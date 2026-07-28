@@ -62,6 +62,39 @@ is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_non_negative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# --- local registry input validation (opt-in; only runs when LOCAL_IMAGE is set) ---
+# 校验 LOCAL_IMAGE 的 host[:port] 前缀部分(第一个 "/" 之前),拒绝协议前缀
+# (http://)、凭据(user:pass@host)、多余路径——这些一旦混进镜像引用,会连同下面
+# 的 docker pull/tag 命令行和 log 一起被打进部署日志,凭据因此发生泄漏。
+# 错误信息里绝不回显原值,只说期望格式,否则校验本身就成了泄漏点。
+is_valid_registry_host() {
+  [[ "$1" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+}
+
+if [ -n "$LOCAL_IMAGE" ]; then
+  local_registry_host="${LOCAL_IMAGE%%/*}"
+  if ! is_valid_registry_host "$local_registry_host"; then
+    log "LOCAL_IMAGE has an invalid registry host — expected host[:port] with no scheme prefix, credentials, or path"
+    exit 1
+  fi
+  # LOCAL_PULL_RETRIES=0 会让本地路径的 while 循环一次都不执行 —— 表现和"本地
+  # registry 不可达"完全一样:每次都静默回退 ACR,而没有任何信号说明新链路根本
+  # 没生效。这正是要防的静默降级,必须是显式配置错误,不能被 bash 算术悄悄当 0
+  # 处理后伪装成"永远走 ACR 兜底"。
+  if ! is_positive_integer "$LOCAL_PULL_RETRIES"; then
+    log "LOCAL_PULL_RETRIES must be a positive integer, got: ${LOCAL_PULL_RETRIES}"
+    exit 1
+  fi
+  if ! is_non_negative_integer "$LOCAL_PULL_RETRY_DELAY"; then
+    log "LOCAL_PULL_RETRY_DELAY must be a non-negative integer, got: ${LOCAL_PULL_RETRY_DELAY}"
+    exit 1
+  fi
+fi
+
 # --- pull with retry + local fallback ----------------------------------------
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
 # 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
