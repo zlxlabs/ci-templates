@@ -95,8 +95,22 @@ if [ -n "$LOCAL_IMAGE" ]; then
     log "LOCAL_PULL_RETRIES must be a positive integer, got: ${LOCAL_PULL_RETRIES}"
     exit 1
   fi
+  # 上限同样是防静默降级的另一半(OCR round-3 finding #3):这条快速路径存在的
+  # 唯一理由就是"本地是同网段直连,预算必须远小于 ACR 的 150s"——不设上限的话,
+  # 一次误配置(比如抄错成三位数)就会让"本地优先"在实际效果上退化成"本地几乎
+  # 总是先拖住部署很久才轮到 ACR",违背这条快速路径本身的设计意图。上限选取
+  # 与 push_to_acr.sh 的 PUSH_MAX_ATTEMPTS(<=3)同精神:给个足够宽松、但确实
+  # 挡住"整数量级"误配置的硬顶。
+  if [ "$LOCAL_PULL_RETRIES" -gt 5 ]; then
+    log "LOCAL_PULL_RETRIES must not exceed 5, got: ${LOCAL_PULL_RETRIES}"
+    exit 1
+  fi
   if ! is_non_negative_integer "$LOCAL_PULL_RETRY_DELAY"; then
     log "LOCAL_PULL_RETRY_DELAY must be a non-negative integer, got: ${LOCAL_PULL_RETRY_DELAY}"
+    exit 1
+  fi
+  if [ "$LOCAL_PULL_RETRY_DELAY" -gt 5 ]; then
+    log "LOCAL_PULL_RETRY_DELAY must not exceed 5, got: ${LOCAL_PULL_RETRY_DELAY}"
     exit 1
   fi
 fi

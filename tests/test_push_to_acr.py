@@ -287,6 +287,26 @@ if [ "$1" = push ]; then exit 0; fi
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+def test_default_path_success_stdout_is_exact_no_extra_lines(tmp_path):
+    """默认路径(LOCAL_REGISTRY 未设置)成功时,stdout 的收尾行必须还是改动前那句
+    `[push] done: ...`,不能多出任何汇总行——把"stdout 差异只发生在失败路径,成功
+    路径逐字节不变"这个结论从注释口头保证升级成测试断言(OCR round-3 finding #4/#9)。"""
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ]; then exit 0; fi
+if [ "$1" = push ]; then exit 0; fi
+''',
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker), text=True, capture_output=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip().endswith(
+        "[push] done: registry.example/namespace/service:abc123"
+    ), result.stdout
+    assert "image not available anywhere" not in result.stdout
+
+
 def test_default_path_stdout_never_mentions_local_registry(tmp_path):
     """LOCAL_REGISTRY 未设置(默认)→ 输出里不出现 "local" 字样,防止后来者加一行
     诊断 log 就悄悄破坏了默认路径与下游 grep 的假设(OCR round-1 finding #8/#9)。"""
