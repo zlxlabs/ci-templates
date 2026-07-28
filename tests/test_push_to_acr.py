@@ -1,6 +1,7 @@
 """Contract tests for the ACR image publisher's bounded retries."""
 
 import os
+import shlex
 import subprocess
 import time
 from pathlib import Path
@@ -27,10 +28,21 @@ def _env(tmp_path: Path, docker_bin: Path, **overrides: str) -> dict[str, str]:
 
 def _write_fake_docker(tmp_path: Path, body: str) -> Path:
     docker = tmp_path / "docker"
-    docker.write_text("#!/bin/bash\nset -euo pipefail\n" + body)
+    argv_log = tmp_path / "docker-argv.log"
+    docker.write_text(
+        "#!/bin/bash\n"
+        "set -euo pipefail\n"
+        "{ printf 'CALL'; printf ' %q' \"$@\"; printf '\\n'; } >> "
+        f"\"{argv_log}\"\n"
+        + body
+    )
     docker.chmod(0o755)
     (tmp_path / "Dockerfile").write_text("FROM scratch\n")
     return docker
+
+
+def _recorded_argv(tmp_path: Path) -> list[list[str]]:
+    return [shlex.split(line)[1:] for line in (tmp_path / "docker-argv.log").read_text().splitlines()]
 
 
 def test_push_retries_a_transient_failure_without_rebuilding(tmp_path):
@@ -57,6 +69,21 @@ fi
         "push:registry.example/namespace/service:abc123",
         "push:registry.example/namespace/service:abc123",
     ]
+    assert _recorded_argv(tmp_path) == [
+        [
+            "build",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            str(tmp_path),
+        ],
+        ["push", "registry.example/namespace/service:abc123"],
+        ["push", "registry.example/namespace/service:abc123"],
+    ]
+    assert all(call[0] != "buildx" for call in _recorded_argv(tmp_path))
     assert "attempt 2/3" in result.stdout
 
 
@@ -140,11 +167,195 @@ if [ "$1" = push ]; then echo "push $2" >> "{calls}"; exit 0; fi
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert calls.read_text().splitlines() == [
-        "build",
         "tag registry.example/namespace/service:abc123 local.example:5001/namespace/service:abc123",
         "push local.example:5001/namespace/service:abc123",
         "push registry.example/namespace/service:abc123",
     ]
+    recorded = _recorded_argv(tmp_path)
+    assert recorded[0] == ["buildx", "inspect", "ci-templates-registry-cache"]
+    assert recorded[1] == [
+        "buildx",
+        "build",
+        "--builder",
+        "ci-templates-registry-cache",
+        "--build-arg",
+        "GIT_SHA=abc123",
+        "-f",
+        f"{tmp_path}/Dockerfile",
+        "-t",
+        "registry.example/namespace/service:abc123",
+        "--cache-from",
+        "type=registry,ref=local.example:5001/namespace/service:buildcache",
+        "--cache-to",
+        "type=registry,ref=local.example:5001/namespace/service:buildcache,mode=max,ignore-error=true",
+        "--load",
+        str(tmp_path),
+    ]
+    assert all(call[:2] != ["buildx", "create"] for call in recorded)
+    # --load 有专属守卫,而不只是上面那张大 argv 表里的一个元素:docker-container
+    # driver 的产物默认**不进**本地 daemon,少了它下面的 tag/push 会推一个陈旧或
+    # 不存在的镜像——静默出错,是本增量最危险的失败模式。断言独立一条,回归时的
+    # 报错才说得清是哪个不变式挂了,而不是一屏 argv 的 diff。
+    assert "--load" in recorded[1], (
+        "buildx build must --load into the local daemon, otherwise the tag/push below "
+        "would operate on a stale or missing image"
+    )
+    assert recorded[2:] == [
+        [
+            "tag",
+            "registry.example/namespace/service:abc123",
+            "local.example:5001/namespace/service:abc123",
+        ],
+        ["push", "local.example:5001/namespace/service:abc123"],
+        ["push", "registry.example/namespace/service:abc123"],
+    ]
+
+
+def test_builder_create_failure_falls_back_to_classic_build(tmp_path):
+    calls = tmp_path / "calls"
+    docker = _write_fake_docker(
+        tmp_path,
+        f'''if [ "$1" = buildx ] && [ "$2" = inspect ]; then exit 1; fi
+if [ "$1" = buildx ] && [ "$2" = create ]; then exit 1; fi
+if [ "$1" = build ]; then echo build >> "{calls}"; exit 0; fi
+if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001", PUSH_MAX_ATTEMPTS="1"),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::warning::buildx builder initialization failed; falling back to classic docker build" in result.stdout
+    assert _recorded_argv(tmp_path) == [
+        ["buildx", "inspect", "ci-templates-registry-cache"],
+        [
+            "buildx",
+            "create",
+            "--name",
+            "ci-templates-registry-cache",
+            "--driver",
+            "docker-container",
+            "--bootstrap",
+        ],
+        [
+            "build",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            str(tmp_path),
+        ],
+        [
+            "tag",
+            "registry.example/namespace/service:abc123",
+            "local.example:5001/namespace/service:abc123",
+        ],
+        ["push", "local.example:5001/namespace/service:abc123"],
+        ["push", "registry.example/namespace/service:abc123"],
+    ]
+
+
+def test_buildx_failure_falls_back_to_classic_build(tmp_path):
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = buildx ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = buildx ] && [ "$2" = build ]; then exit 1; fi
+if [ "$1" = build ]; then exit 0; fi
+if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001", PUSH_MAX_ATTEMPTS="1"),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "::warning::buildx build failed; falling back to classic docker build" in result.stdout
+    assert _recorded_argv(tmp_path) == [
+        ["buildx", "inspect", "ci-templates-registry-cache"],
+        [
+            "buildx",
+            "build",
+            "--builder",
+            "ci-templates-registry-cache",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            "--cache-from",
+            "type=registry,ref=local.example:5001/namespace/service:buildcache",
+            "--cache-to",
+            "type=registry,ref=local.example:5001/namespace/service:buildcache,mode=max,ignore-error=true",
+            "--load",
+            str(tmp_path),
+        ],
+        [
+            "build",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            str(tmp_path),
+        ],
+        [
+            "tag",
+            "registry.example/namespace/service:abc123",
+            "local.example:5001/namespace/service:abc123",
+        ],
+        ["push", "local.example:5001/namespace/service:abc123"],
+        ["push", "registry.example/namespace/service:abc123"],
+    ]
+
+
+def test_fallback_classic_build_failure_is_propagated(tmp_path):
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = buildx ] && [ "$2" = inspect ]; then exit 0; fi
+if [ "$1" = buildx ] && [ "$2" = build ]; then exit 1; fi
+if [ "$1" = build ]; then exit 17; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001", PUSH_MAX_ATTEMPTS="1"),
+        text=True,
+        capture_output=True,
+    )
+
+    assert result.returncode == 17
+    recorded = _recorded_argv(tmp_path)
+    # 恰好三次调用:inspect → buildx build(失败) → classic build(失败)。锁死调用
+    # 次数而不只是最后一条,否则「降级路径里多跑了一次 buildx build 才放弃」这类
+    # 回归不会被发现——降级必须只发生一次。
+    assert len(recorded) == 3, f"fallback must happen exactly once, got: {recorded}"
+    assert recorded[0] == ["buildx", "inspect", "ci-templates-registry-cache"]
+    assert recorded[1][:2] == ["buildx", "build"]
+    assert recorded[-1] == [
+        "build",
+        "--build-arg",
+        "GIT_SHA=abc123",
+        "-f",
+        f"{tmp_path}/Dockerfile",
+        "-t",
+        "registry.example/namespace/service:abc123",
+        str(tmp_path),
+    ]
+    assert all(call[0] not in {"tag", "push"} for call in recorded)
 
 
 def test_local_registry_push_failure_falls_back_to_acr_only(tmp_path):
@@ -344,7 +555,6 @@ if [ "$1" = push ]; then echo "push $2" >> "{calls}"; exit 0; fi
     assert result.returncode == 0, result.stdout + result.stderr
     assert "local retag" in result.stdout
     assert calls.read_text().splitlines() == [
-        "build",
         "tag registry.example/namespace/service:abc123 local.example:5001/namespace/service:abc123",
         "push registry.example/namespace/service:abc123",
     ]

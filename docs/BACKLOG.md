@@ -55,3 +55,27 @@
 **现象**：ci-templates 转 public 后 checkout 不再需要 PAT，两条 lane 已停用该 token；但 workflow_call 契约仍声明它为 required——立刻摘除会打破全舰队 caller 的显式 secrets 传递。
 
 **重评触发**：下一次需要动全舰队 caller 的大版本（v2）时，随版本一起从契约与所有 caller 中摘除；届时 test_workflow_contract 的 6-secret 断言同步改 5。
+
+## 2026-07-28 · Codex review(buildx 层缓存 R2) · P2(降级) · 构建阶段无脚本级超时
+
+**现象**：`docker build` / `docker buildx build` 都没有脚本级超时。若构建挂起不返回，`if ! cmd` 永远等不到非零退出码，classic fallback 不会执行，最终依赖 GitHub Actions 默认的 360 分钟 job 超时兜底——期间占着 VM201 八个槽中的一个。
+
+**降级理由**：三点。(1) 这是**存量行为**——改动前的 `docker build` 同样没有超时，非本次引入。(2) 评审当时引用的具体缺陷 [moby/buildkit#6008](https://github.com/moby/buildkit/issues/6008)（大型多阶段构建卡在 `preparing build cache for export`，`ignore-error=true` 也救不了）**已由 PR #6129 于 2025-09-19 修复**；实测本仓 buildx bootstrap 的是 `moby/buildkit:buildx-stable-1` = **v0.31.2**（2026-07-16 发布），`compare` API 确认 `behind_by: 0`，即已含该修复。该 issue 至今 open 只是无人关闭（label 仍是 status/triage）。(3) 加超时需引入新配置项，违反「修 P2/P3 不新增机制」。
+
+**重评触发**：真实发生一次构建挂起吃满 360 分钟的事故，或 VM201 槽位紧张到无法承受单槽长时间占用。届时复用 `push_with_retry` 已有的 `timeout --kill-after` 模式，而非发明新机制。
+
+## 2026-07-28 · Codex review(buildx 层缓存 R2) · P2 · buildx 失败降级会导致完整构建两次
+
+**现象**：`buildx build` 因 Dockerfile 自身错误（而非缓存问题）失败时，会再跑一次 classic build 才最终失败。对 url-parse-api 这种单次构建 80+ 分钟的仓，用户要等两倍时间才看到错误。
+
+**接受理由**：这是不变式 2「缓存故障不得转化为构建失败」的直接代价。区分「buildx 基础设施故障」与「构建本身失败」需要解析错误输出或分两步执行，属于新机制。`--cache-to` 已有 `ignore-error=true`、`--cache-from` 本身是 best-effort，因此 buildx 失败**基本等价于**构建本身失败，降级的真实价值只剩「builder 容器 OOM/崩溃」这一类。
+
+**重评触发**：观察到降级路径真实触发且原因确为 builder 基础设施问题（而非 Dockerfile 错误）。若长期只见到「两次都因同样的 Dockerfile 错误失败」，则应删掉降级、让 buildx 失败直接致命。
+
+## 2026-07-28 · 观察项 · deploy registry 的 20 GiB 整库 wipe 与 buildcache 的相互作用
+
+**现象**：`run-deploy-registry.sh` 的 size watchdog 是「超限即停容器 + 整库清空」（registry:2 的 manifest→link→blob 引用图不允许逐文件删）。`mode=max` 的 buildcache 会显著加快占用增长。
+
+**为何不预先加机制**：撞上之后三条路径全部自愈——部署镜像和 `last_good_tag` 都有 ACR fallback 兜底，buildcache 丢失只是下次构建 cache miss。是**自愈的性能退化，不是数据丢失或服务故障**。canary 期只有 1 个仓（起点 7.2M，磁盘余 129G），单仓稳态估算要几个月才撞到。
+
+**重评触发**：11 仓全量推广前必须重新评估（届时约 2 周~1 月量级会撞到）。选项是调高上限（20 GiB 相对 129G 磁盘定得很保守）或给 buildcache 单独 ref 加独立淘汰策略。
