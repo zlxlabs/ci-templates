@@ -95,6 +95,36 @@ jobs:
 > `host` 自 D3 激活起是 **Tailscale 可达地址**（IP/MagicDNS），不再是 `~/.ssh/config` 别名 ——
 > GitHub runner 上没有用户的 ssh config，临时入 tailnet 后只能按 IP 连。别名 `host-1` 仍用于 registry 与人读。
 
+## 本地网络 registry 拉取（可选）
+
+D3 部署链路现状是「VM201 构建 → push 公网阿里云 ACR → 目标机从公网 ACR 拉取」，
+2026-07-27/28 两天 4 次部署失败均由「目标机→ACR」这条公网链路超时导致（实测约
+20% 失败率 + 偶发分钟级完全中断）。已在 VM201 上搭一个可写的本地网络 registry
+（同网段拉取实测 0.458 秒），本仓支持把它接为部署的主拉取源，ACR 降级为异地存档
++ 拉取回退。
+
+opt-in 用法，在 caller 的 `with:` 块加一个 input（不加则行为与现状逐字节一致——
+纯 ACR 构建/推送/拉取，不受本特性影响）：
+
+```yaml
+    with:
+      # ...其余 input 照常...
+      local_registry: zlx-vm-work-i7-ci-runner.taile9071.ts.net:5001
+```
+
+开启后：
+- **构建阶段**双推:本地 registry(部署关键路径)+ ACR(异地存档 + 拉取回退)。只有
+  **两处都推失败**才判致命(镜像哪都不在,必须报错);单边失败允许降级继续,并打
+  醒目 `::warning::`——本地失败会退化为"这次纯 ACR",ACR 失败会警示"这次没有异地
+  备份/拉取回退",但不会静默放行。
+- **部署阶段**拉取时先试本地 registry(默认 2 次快速失败,基础延迟 1 秒,总预算
+  ~3 秒——同网段链路真出问题大概率是"整个不可达",给它套 ACR 的 150 秒预算纯属
+  浪费),不通就无缝回退到未改动的 ACR 拉取预算(`PULL_RETRIES`,默认 6 次、线性
+  退避、累计 150 秒)。本地拉到的字节会 retag 成规范 `ACR_IMAGE:tag` 名字——
+  `last_good_tag` / 回滚逻辑只认这个名字,不关心字节来自哪个 registry。
+- 其它部署目标机尚未验证 tailnet 可达性 / 域名解析,**逐仓手动 opt-in**,不要
+  批量打开。
+
 ## 部署门禁（可选）
 
 有的服务在跑不可打断任务（如录制、转写）时不希望被替换容器打断。开启后：
@@ -200,8 +230,9 @@ python -m pytest -q
 ```
 
 - `test_registry_schema.py` —— 8 个坏 fixture（缺字段/重复 id/port/slug/路径、DSN 明文、heartbeat 明文、坏 enum）全部报错；好 registry 通过。
-- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚不提升坏 tag（docker/curl mock，无需真实守护进程）。
-- `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency。
+- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
+- `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
 - `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、caller 钉 `@v1` / canary 钉 `@main`。
 
 ## 端到端 / canary（需真实凭证与主机，未在本机执行）

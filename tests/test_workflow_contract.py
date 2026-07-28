@@ -356,6 +356,45 @@ def test_ssh_user_and_host_are_syntax_validated_before_use():
     )
 
 
+# --- local registry pull/push (opt-in; empty default = today's ACR-only behavior) ---
+
+def test_local_registry_input_declared_with_safe_default():
+    raw, trigger = _load()
+    inputs = trigger["workflow_call"]["inputs"]
+
+    assert "local_registry" in inputs
+    assert inputs["local_registry"].get("default") == ""
+    assert inputs["local_registry"].get("required") is not True
+
+
+def test_local_registry_env_wired_to_push_and_deploy_steps():
+    text = WORKFLOW.read_text()
+    # 必须显式路由到两个 step 的 env:(push 步骤 + deploy 步骤),不能只接一处；
+    # 同一模式 "LOCAL_REGISTRY: ${{ inputs.local_registry }}" 出现两次即证明两处都接了。
+    assert text.count("LOCAL_REGISTRY: ${{ inputs.local_registry }}") == 2, (
+        "local_registry must be routed through env: to both the push step and "
+        "the deploy step"
+    )
+
+
+def test_local_image_is_composed_from_parts_and_conditioned_on_local_registry():
+    text = WORKFLOW.read_text()
+    assert 'LOCAL_IMAGE="${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"' in text, (
+        "LOCAL_IMAGE must mirror ACR_IMAGE's own composition (same namespace/image_name parts)"
+    )
+    # LOCAL_REGISTRY 为空(默认)时 LOCAL_IMAGE 必须保持空字符串——这是与 pull_and_deploy.sh
+    # 的 opt-in 判断 `[ -n "$LOCAL_IMAGE" ]` 对齐的前置条件。
+    assert '[ -n "$LOCAL_REGISTRY" ]' in text
+
+
+def test_local_image_passed_through_to_remote_script():
+    text = WORKFLOW.read_text()
+    assert "LOCAL_IMAGE='${LOCAL_IMAGE}'" in text, (
+        "LOCAL_IMAGE must be forwarded into the remote pull_and_deploy.sh invocation, "
+        "the same way ACR_IMAGE already is"
+    )
+
+
 def test_orphaned_remote_script_cleaned_up_when_retries_exhausted():
     # P2-B (codex review round 5): REMOTE_SCRIPT's path is fixed for the whole
     # job (constructed once before the retry loop, not per-attempt), so if

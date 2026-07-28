@@ -34,6 +34,14 @@ BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 PULL_RETRIES="${PULL_RETRIES:-6}"
 PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
 
+# opt-in 本地网络 registry 镜像全路径(如 host:port/namespace/image);留空(默认)=
+# 禁用,pull_image() 退化为改动前的纯 ACR 单路径,行为逐字节不变。不是 caller 可传
+# 的 workflow input——由 build-deploy.yml 的 deploy 步骤按 LOCAL_REGISTRY(若非空)
+# 现场拼出,与 ACR_IMAGE 的组装方式完全对称。
+LOCAL_IMAGE="${LOCAL_IMAGE:-}"
+LOCAL_PULL_RETRIES="${LOCAL_PULL_RETRIES:-2}"
+LOCAL_PULL_RETRY_DELAY="${LOCAL_PULL_RETRY_DELAY:-1}"  # base seconds; backoff = delay * attempt
+
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
 HEALTHCHECK_EXPECT_STATUS="${HEALTHCHECK_EXPECT_STATUS:-200}"
 HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
@@ -54,6 +62,59 @@ is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
 }
 
+is_non_negative_integer() {
+  [[ "$1" =~ ^[0-9]+$ ]]
+}
+
+# --- local registry input validation (opt-in; only runs when LOCAL_IMAGE is set) ---
+# 校验 LOCAL_IMAGE 的 host[:port] 前缀部分(第一个 "/" 之前),拒绝协议前缀
+# (http://)、凭据(user:pass@host)、多余路径——这些一旦混进镜像引用,会连同下面
+# 的 docker pull/tag 命令行和 log 一起被打进部署日志,凭据因此发生泄漏。
+# 错误信息里绝不回显原值,只说期望格式,否则校验本身就成了泄漏点。
+#
+# 首尾字符必须是字母/数字(OCR round-2 finding #7,high):不锚定首字符的话,
+# 形如 "--evil-flag"(不含 "/")的值能通过 `[A-Za-z0-9.-]+`,而
+# `"$DOCKER_BIN" pull "${LOCAL_IMAGE}:${tag}"` 会把它解析成
+# `docker pull --evil-flag:tag`——docker CLI 把它当 flag 而不是镜像名,是真实的
+# CLI flag 注入面。与 scripts/push_to_acr.sh 里同一个正则同步修。
+is_valid_registry_host() {
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?$ ]]
+}
+
+if [ -n "$LOCAL_IMAGE" ]; then
+  local_registry_host="${LOCAL_IMAGE%%/*}"
+  if ! is_valid_registry_host "$local_registry_host"; then
+    log "LOCAL_IMAGE has an invalid registry host — expected host[:port] with no scheme prefix, credentials, or path"
+    exit 1
+  fi
+  # LOCAL_PULL_RETRIES=0 会让本地路径的 while 循环一次都不执行 —— 表现和"本地
+  # registry 不可达"完全一样:每次都静默回退 ACR,而没有任何信号说明新链路根本
+  # 没生效。这正是要防的静默降级,必须是显式配置错误,不能被 bash 算术悄悄当 0
+  # 处理后伪装成"永远走 ACR 兜底"。
+  if ! is_positive_integer "$LOCAL_PULL_RETRIES"; then
+    log "LOCAL_PULL_RETRIES must be a positive integer, got: ${LOCAL_PULL_RETRIES}"
+    exit 1
+  fi
+  # 上限同样是防静默降级的另一半(OCR round-3 finding #3):这条快速路径存在的
+  # 唯一理由就是"本地是同网段直连,预算必须远小于 ACR 的 150s"——不设上限的话,
+  # 一次误配置(比如抄错成三位数)就会让"本地优先"在实际效果上退化成"本地几乎
+  # 总是先拖住部署很久才轮到 ACR",违背这条快速路径本身的设计意图。上限选取
+  # 与 push_to_acr.sh 的 PUSH_MAX_ATTEMPTS(<=3)同精神:给个足够宽松、但确实
+  # 挡住"整数量级"误配置的硬顶。
+  if [ "$LOCAL_PULL_RETRIES" -gt 5 ]; then
+    log "LOCAL_PULL_RETRIES must not exceed 5, got: ${LOCAL_PULL_RETRIES}"
+    exit 1
+  fi
+  if ! is_non_negative_integer "$LOCAL_PULL_RETRY_DELAY"; then
+    log "LOCAL_PULL_RETRY_DELAY must be a non-negative integer, got: ${LOCAL_PULL_RETRY_DELAY}"
+    exit 1
+  fi
+  if [ "$LOCAL_PULL_RETRY_DELAY" -gt 5 ]; then
+    log "LOCAL_PULL_RETRY_DELAY must not exceed 5, got: ${LOCAL_PULL_RETRY_DELAY}"
+    exit 1
+  fi
+fi
+
 # --- pull with retry + local fallback ----------------------------------------
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
 # 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
@@ -68,8 +129,39 @@ is_positive_integer() {
 # (13:00 / 15:12 / 16:24 UTC)全部因 3/3 pull 失败而中止。retries=6 把总等待预算
 # 提到 10+20+30+40+50=150 秒(线性退避算法不变,只调次数),足以跨过实测到的成簇
 # 失败窗口。该链路问题在 hosted runner 时代就存在,不是 self-hosted 迁移引入的。
+#
+# 本地 registry 快速路径(opt-in,LOCAL_IMAGE 非空才生效):2026-07-27 实测同网段
+# 端到端拉取只要 0.458 秒,真出问题大概率是"整个不可达"而不是"抖一下就好"——
+# 照搬上面 ACR 的 150 秒累计预算纯属浪费等待。默认 2 次、基础延迟 1 秒(线性退避
+# 1+2=3 秒)就足够分辨"能连"与"连不上",连不上就快速切到下面完全未改动的 ACR
+# 预算,不会把总部署时长拖长。拉到的字节 retag 成规范名 ${ACR_IMAGE}:${tag} ——
+# 下游 deploy_tag()/last_good_tag/回滚只认这个名字,不关心字节来自哪个 registry
+# (两个 registry 存的是同一个不可变 SHA tag 的逐字节相同内容)。
+pull_from_local_registry() {
+  local tag="$1" attempt=1
+  while [ "$attempt" -le "$LOCAL_PULL_RETRIES" ]; do
+    if "$DOCKER_BIN" pull "${LOCAL_IMAGE}:${tag}"; then
+      if "$DOCKER_BIN" tag "${LOCAL_IMAGE}:${tag}" "${ACR_IMAGE}:${tag}"; then
+        log "pulled ${LOCAL_IMAGE}:${tag} from local registry, retagged as ${ACR_IMAGE}:${tag}"
+        return 0
+      fi
+      log "local registry pull succeeded but retag to ${ACR_IMAGE}:${tag} failed — falling back to ACR"
+      return 1
+    fi
+    log "local registry pull attempt ${attempt}/${LOCAL_PULL_RETRIES} failed for ${LOCAL_IMAGE}:${tag}"
+    [ "$attempt" -lt "$LOCAL_PULL_RETRIES" ] && sleep $((LOCAL_PULL_RETRY_DELAY * attempt))
+    attempt=$((attempt + 1))
+  done
+  log "local registry unreachable after ${LOCAL_PULL_RETRIES} attempts — falling back to ACR"
+  return 1
+}
+
 pull_image() {
   local ref="$1" attempt=1
+  local tag="${ref##*:}"
+  if [ -n "$LOCAL_IMAGE" ] && pull_from_local_registry "$tag"; then
+    return 0
+  fi
   while [ "$attempt" -le "$PULL_RETRIES" ]; do
     if "$DOCKER_BIN" pull "$ref"; then return 0; fi
     log "pull attempt ${attempt}/${PULL_RETRIES} failed for ${ref}"

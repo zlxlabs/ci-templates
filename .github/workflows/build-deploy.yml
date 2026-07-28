@@ -66,6 +66,11 @@ on:
         required: false
         default: "10"
         type: string
+      local_registry:
+        description: "opt-in local-network registry mirror host:port (e.g. a tailnet MagicDNS name:5001), used as the primary push/pull target for this deploy; ACR remains the offsite archive + fallback. Empty (default) disables this entirely — same ACR-only code path, same exit codes, same success-path stdout as today; the one documented exception is that a default-path ACR-push failure now also prints one extra summary line before failing."
+        required: false
+        default: ""
+        type: string
       busy_lock_file:
         description: "opt-in deploy gate: path to a service-held flock busy lock (e.g. <deploy_dir>/.deploy-state/busy.lock). Empty (default) disables the gate — behavior unchanged."
         required: false
@@ -185,6 +190,7 @@ jobs:
           GIT_SHA: ${{ steps.sha.outputs.git_sha }}
           BUILD_CONTEXT: ${{ inputs.build_context }}
           DOCKERFILE: ${{ inputs.dockerfile }}
+          LOCAL_REGISTRY: ${{ inputs.local_registry }}
         run: bash "$RUNNER_TEMP/ci-templates/scripts/push_to_acr.sh"
 
       - name: Connect to Tailscale
@@ -222,6 +228,7 @@ jobs:
           DEPLOY_HOST: ${{ inputs.host }}
           SSH_USER: ${{ inputs.ssh_user }}
           DEPLOY_DIR: ${{ inputs.deploy_dir }}
+          LOCAL_REGISTRY: ${{ inputs.local_registry }}
           HEALTHCHECK_URL: ${{ inputs.healthcheck_url }}
           HEALTHCHECK_EXPECT_STATUS: ${{ inputs.healthcheck_expect_status }}
           HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
@@ -240,6 +247,11 @@ jobs:
           [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid host"; exit 1; }
 
           ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
+          # opt-in 本地 registry 镜像全路径,组装方式与上面 ACR_IMAGE 完全对称;
+          # LOCAL_REGISTRY 为空(默认)时 LOCAL_IMAGE 留空,pull_and_deploy.sh 收到
+          # 空值即整段跳过本地快速路径,回到改动前的纯 ACR 行为。
+          LOCAL_IMAGE=""
+          [ -n "$LOCAL_REGISTRY" ] && LOCAL_IMAGE="${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
           # keepalive 防 tailnet 上偶发的 `Connection reset ...:22`(canary 遇过,50 服务规模会常遇):
           # 15s 探一次,连丢 4 次(~60s)才判死;连接阶段也给 ConnectTimeout 兜底。
           SSH_OPTS="-i $HOME/.ssh/id_deploy \
@@ -270,6 +282,7 @@ jobs:
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
+               LOCAL_IMAGE='${LOCAL_IMAGE}' \
                GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
                HOST_LOCK='/var/lock/fleet-deploy.lock' \
                HEALTHCHECK_URL='${HEALTHCHECK_URL}' \

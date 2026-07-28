@@ -489,6 +489,326 @@ def test_host_lock_held_past_budget_defers(tmp_path):
     assert "compose up" not in log
 
 
+# --- local registry pull fast path (opt-in; LOCAL_IMAGE empty = ACR-only, unchanged) ---
+# 本地 registry 是部署关键路径(同网段实测端到端 0.458s),ACR 是拉取回退。LOCAL_IMAGE
+# 未设置时(上面所有既有测试都不设置它)pull_image() 必须逐字节复刻改动前的纯 ACR
+# 单路径 —— 这正是那些既有测试(如 test_deploys_immutable_git_sha_tag 对 pull 次数
+# 的精确断言)已经在锁的边界,这里再显式补一条便于按名字检索这条不变式。
+
+def _mock_docker_local_then_acr(log_path: Path, local_ref: str, local_fail_pulls: int, acr_ref: str) -> str:
+    """docker mock: pulls of `local_ref` fail `local_fail_pulls` times then succeed;
+    pulls of `acr_ref` always succeed immediately; tag/compose always succeed."""
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  ref="$2"
+  if [ "$ref" = "{local_ref}" ]; then
+    count_file="{log_path}.localcount"
+    n=$(cat "$count_file" 2>/dev/null || echo 0)
+    n=$((n+1)); echo "$n" > "$count_file"
+    [ "$n" -le {local_fail_pulls} ] && exit 1
+    exit 0
+  fi
+  if [ "$ref" = "{acr_ref}" ]; then
+    exit 0
+  fi
+  exit 1
+fi
+exit 0
+"""
+
+
+def _local_registry_env(tmp_path: Path, *, local_fail_pulls: int) -> dict:
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    local_ref = "local.example:5001/ns/demo:abc1234"
+    acr_ref = "registry.example.com/ns/demo:abc1234"  # matches ACR_IMAGE/GIT_SHA from _base_env
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_local_then_acr(Path(env["DOCKER_LOG"]), local_ref, local_fail_pulls, acr_ref),
+    )
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRY_DELAY"] = "0"
+    return env
+
+
+def test_local_image_rejects_credentials_in_host(tmp_path):
+    """user:pass@host 形式必须被拒绝——否则凭据会随镜像引用流进 pull/tag 命令行和
+    log(OCR round-1 finding #5/#13,P1 不变式:凭据不得泄漏)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "user:secretpw@local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+    # 校验本身绝不能回显原值,否则错误信息自己就是一条泄漏点。
+    assert "secretpw" not in res.stdout
+    assert "secretpw" not in res.stderr
+
+
+def test_local_image_rejects_leading_dash_flag_injection(tmp_path):
+    """"--evil-flag"(不含 @、不含协议前缀)必须被拒绝——拼进
+    `docker pull "${LOCAL_IMAGE}:${tag}"` 后会被 docker CLI 当成命令行 flag 解析,
+    而不是镜像名(OCR round-2 finding #7,high:CLI flag 注入)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "--evil-flag/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+
+
+def test_local_image_rejects_scheme_prefix(tmp_path):
+    """"https://host" 形式(协议前缀)必须被拒绝——第三条输入校验测试,与前两条
+    (凭据、leading-dash flag 注入)构成同一组 host 形状校验的完整覆盖
+    (OCR round-3 finding #15:补齐同组测试缺失的 docstring)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "https://local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+
+
+def test_local_pull_retries_zero_is_rejected(tmp_path):
+    """LOCAL_PULL_RETRIES=0 会让本地路径的循环一次都不执行,表现和"本地不可达"完全
+    一样——每次都静默回退 ACR,而没有任何信号说明新链路根本没生效。必须是显式
+    配置错误,不能被 bash 算术悄悄当 0 处理(OCR round-1 finding #12,防静默降级)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRIES"] = "0"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRIES must be a positive integer" in res.stdout
+
+
+def test_local_pull_retries_above_five_is_rejected(tmp_path):
+    """上限同样防静默降级(OCR round-3 finding #3):这条快速路径存在的理由是"本地
+    同网段直连,预算必须远小于 ACR 的 150s"——不设上限,一次误配置就能让"本地优先"
+    实际上变成"本地拖住部署很久才轮到 ACR",违背这条路径的设计意图。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRIES"] = "6"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRIES must not exceed 5" in res.stdout
+
+
+def test_local_pull_retry_delay_above_five_is_rejected(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRY_DELAY"] = "6"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRY_DELAY must not exceed 5" in res.stdout
+
+
+def test_local_pull_retry_delay_negative_is_rejected(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env["LOCAL_PULL_RETRY_DELAY"] = "-1"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "LOCAL_PULL_RETRY_DELAY must be a non-negative integer" in res.stdout
+
+
+def test_local_pull_retry_delay_zero_is_allowed(tmp_path):
+    """与 RETRIES 不同,DELAY=0(退避间隔为零、立即重试)是合法配置,不该被拒绝——
+    与 push_to_acr.sh 的 PUSH_RETRY_DELAY_SECONDS 使用同一条 is_non_negative_integer
+    规则保持一致。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    env["LOCAL_PULL_RETRY_DELAY"] = "0"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+
+def test_local_registry_last_good_tag_is_bare_sha_without_registry_prefix(tmp_path):
+    """P1 不变式:last_good_tag 只能记裸 SHA,不含 registry 前缀/冒号。本地 registry
+    拉到的字节已经 retag 成 ACR_IMAGE:tag 规范名,写入 last_good_tag 的必须还是那个
+    裸 tag,与字节来自哪个 registry 无关——一个把 LOCAL_IMAGE 前缀悄悄带进
+    last_good_tag 的回归,不会被"部署成功"的既有断言拦住,只有精确内容比对能拦
+    (OCR round-1 finding #10,P1:回滚拉错镜像 = 静默出错 + 故障放大)。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    content = good.read_text().strip()
+    assert content == "abc1234", content
+    assert "/" not in content and ":" not in content, (
+        f"last_good_tag must be a bare SHA with no registry prefix, got {content!r}"
+    )
+
+
+def test_local_registry_rollback_keeps_last_good_tag_bare_sha(tmp_path):
+    """回滚路径同理:探针失败触发回滚后,last_good_tag 必须还是原先那条裸 SHA——
+    两次部署(健康 + 回滚)都走本地 registry 拉取,retag 环节不能让任何一次把
+    registry 前缀带进 last_good_tag。复用 `_base_env` 而不是手搭一份环境(OCR
+    round-2 finding #0):与 test_probe_failure_triggers_rollback 完全同款的两次
+    _base_env(同一 tmp_path,故 STATE_DIR 共享)+ 改 status/GIT_SHA 套路,只多加
+    LOCAL_IMAGE 这一个变量,不会因为 `_base_env` 未来增删必需变量而悄悄脱节。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+
+    # 1st deploy: healthy via the local registry -> records bare "abc1234"
+    env_ok = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env_ok["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    assert _run(env_ok).returncode == 0
+
+    good = Path(env_ok["STATE_DIR"]) / "last_good_tag"
+    assert good.read_text().strip() == "abc1234"
+
+    # 2nd deploy: a new SHA, also pulled via the local registry, but unhealthy
+    # -> must roll back to abc1234 (re-pulled via the local registry too)
+    env_bad = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env_bad["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env_bad["GIT_SHA"] = "def5678"
+    Path(env_bad["DOCKER_LOG"]).write_text("")  # reset log for assertions
+    res_bad = _run(env_bad)
+    assert res_bad.returncode != 0
+    # 断言回滚分支真的跑过了,而不只是"凑巧"返回非零(比如 do_deploy 在到达回滚
+    # 之前就以别的原因失败,last_good_tag 会因为压根没被碰过而巧合等于第一次部署
+    # 写下的值,让下面的内容断言看似通过但其实没测到回滚逻辑,OCR round-3 finding #14)。
+    assert "rolling back to previous good tag abc1234" in res_bad.stdout
+
+    content = good.read_text().strip()
+    assert content == "abc1234", content
+    assert "/" not in content and ":" not in content, (
+        f"last_good_tag must stay a bare SHA through a local-registry rollback, got {content!r}"
+    )
+
+    log = Path(env_bad["DOCKER_LOG"]).read_text()
+    assert "pull local.example:5001/ns/demo:def5678" in log, log
+    assert "pull local.example:5001/ns/demo:abc1234" in log, log
+
+
+def test_local_registry_optout_leaves_behavior_unchanged(tmp_path):
+    """不传 LOCAL_IMAGE(或为空)→ pull_image() 完全走原 ACR 单路径,不产生任何
+    本地 registry 相关的 pull/tag 调用,不多一次 docker 调用。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 1, log
+    assert "local" not in log.lower(), log
+    # 不只断言 mock 调用序列,也断言脚本自身的 stdout/stderr——防止后来者加一行
+    # 诊断 log 就悄悄破坏了默认路径与下游 grep 的假设(OCR round-1 finding #8/#9)。
+    # 用 "local registry" 而不是裸 "local":HEALTHCHECK_URL 里的 "localhost" 本身
+    # 就含 "local" 子串,裸子串断言会被这个既有、无关的巧合坑到误判。
+    assert "local registry" not in res.stdout.lower()
+    assert "local registry" not in res.stderr.lower()
+
+
+def test_local_registry_explicit_empty_string_leaves_behavior_unchanged(tmp_path):
+    """不只测"没传 LOCAL_IMAGE"(未设置),还要测"传了空字符串"——脚本用
+    `[ -n "$LOCAL_IMAGE" ]` 判断,unset 和空串在 bash 里同样为假,但这是两条不同的
+    输入路径,一次针对 unset 的重构(比如换成别的判断写法)可能悄悄放过空串这条
+    分支(OCR round-3 finding #12)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = ""
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 1, log
+    assert "local registry" not in res.stdout.lower()
+    assert "local registry" not in res.stderr.lower()
+
+
+def test_local_registry_pull_succeeds_skips_acr_entirely(tmp_path):
+    """本地 registry 一次拉到 → 直接 retag 成 ACR_IMAGE:tag 规范名,完全不碰 ACR。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=0)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 1, log
+    assert "pull registry.example.com/ns/demo:abc1234" not in log, log
+    assert "tag local.example:5001/ns/demo:abc1234 registry.example.com/ns/demo:abc1234" in log, log
+    assert "compose up -d" in log
+
+
+def test_local_registry_pull_retries_default_is_two_then_falls_back_to_acr(tmp_path):
+    """本地 registry 全程不可达(2026-07-28 决策:同网段链路给它套 ACR 的 150s 预算
+    是浪费,默认只给 2 次快速失败)→ 精确耗尽 2 次本地尝试后切到 ACR,ACR 照常成功。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=99)
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 2, log
+    assert log.count("pull registry.example.com/ns/demo:abc1234") == 1, log
+    assert "falling back to ACR" in res.stdout
+    assert "compose up -d" in log
+
+
+def test_local_registry_retry_budget_is_configurable(tmp_path):
+    """LOCAL_PULL_RETRIES 可覆盖(不是硬编码),锁定"精确耗尽配置值才切 ACR"这条边界。
+    同时断言真的走了 fallback 分支(而不只是巧合地在别处也出现了一次 ACR pull)
+    ——OCR round-2 finding #1。"""
+    env = _local_registry_env(tmp_path, local_fail_pulls=99)
+    env["LOCAL_PULL_RETRIES"] = "4"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull local.example:5001/ns/demo:abc1234") == 4, log
+    assert log.count("pull registry.example.com/ns/demo:abc1234") == 1, log
+    assert "falling back to ACR" in res.stdout
+
+
+def test_local_registry_retag_failure_falls_back_to_acr(tmp_path):
+    """本地拉取成功但 retag 到 ACR_IMAGE:tag 规范名失败(极端情况)→ 不重试本地,
+    直接落到 ACR 路径,部署仍应成功(last_good_tag/回滚只认规范名,与来源 registry 无关)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    local_ref = "local.example:5001/ns/demo:abc1234"
+    acr_ref = "registry.example.com/ns/demo:abc1234"
+    docker_log = Path(env["DOCKER_LOG"])
+    _write_exec(
+        mock_dir / "docker",
+        f"""#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = "pull" ]; then
+  [ "$2" = "{local_ref}" ] && exit 0
+  [ "$2" = "{acr_ref}" ] && exit 0
+  exit 1
+fi
+if [ "$1" = "tag" ]; then
+  [ "$2" = "{local_ref}" ] && exit 1
+  exit 0
+fi
+exit 0
+""",
+    )
+    env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = docker_log.read_text()
+    assert log.count(f"pull {local_ref}") == 1, log
+    assert log.count(f"pull {acr_ref}") == 1, log
+    assert "retag" in res.stdout and "failed" in res.stdout
+    assert "compose up -d" in log
+    # P1 不变式同样适用于这条 fallback 路径:即便字节来自"本地拉到但 retag 失败,
+    # 转而从 ACR 拉"这条迂回路线,last_good_tag 也必须是裸 SHA(OCR round-3 finding #13)。
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    content = good.read_text().strip()
+    assert content == "abc1234", content
+    assert "/" not in content and ":" not in content
+
+
 def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
     """BUSY_LOCK_TIMEOUT 不是正整数 → 必须是显式的配置错误(rc=1),不能被 bash 算术
     悄悄当 0 处理后伪装成"服务忙"的 deferred(rc=3)——两者运维含义完全不同。"""
