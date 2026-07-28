@@ -548,6 +548,19 @@ def test_local_image_rejects_credentials_in_host(tmp_path):
     assert "secretpw" not in res.stderr
 
 
+def test_local_image_rejects_leading_dash_flag_injection(tmp_path):
+    """"--evil-flag"(不含 @、不含协议前缀)必须被拒绝——拼进
+    `docker pull "${LOCAL_IMAGE}:${tag}"` 后会被 docker CLI 当成命令行 flag 解析,
+    而不是镜像名(OCR round-2 finding #7,high:CLI flag 注入)。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["LOCAL_IMAGE"] = "--evil-flag/ns/demo"
+    res = _run(env)
+    assert res.returncode == 1, res.stdout + res.stderr
+    assert "invalid registry host" in res.stdout
+
+
 def test_local_image_rejects_scheme_prefix(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
@@ -613,81 +626,38 @@ def test_local_registry_last_good_tag_is_bare_sha_without_registry_prefix(tmp_pa
 def test_local_registry_rollback_keeps_last_good_tag_bare_sha(tmp_path):
     """回滚路径同理:探针失败触发回滚后,last_good_tag 必须还是原先那条裸 SHA——
     两次部署(健康 + 回滚)都走本地 registry 拉取,retag 环节不能让任何一次把
-    registry 前缀带进 last_good_tag。"""
+    registry 前缀带进 last_good_tag。复用 `_base_env` 而不是手搭一份环境(OCR
+    round-2 finding #0):与 test_probe_failure_triggers_rollback 完全同款的两次
+    _base_env(同一 tmp_path,故 STATE_DIR 共享)+ 改 status/GIT_SHA 套路,只多加
+    LOCAL_IMAGE 这一个变量,不会因为 `_base_env` 未来增删必需变量而悄悄脱节。"""
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
-    docker_log = tmp_path / "docker.log"
-    local_prefix = "local.example:5001/ns/demo:"
-
-    _write_exec(
-        mock_dir / "docker",
-        f"""#!/bin/bash
-echo "$@" >> "{docker_log}"
-if [ "$1" = "pull" ]; then
-  case "$2" in
-    {local_prefix}*) exit 0 ;;
-    *) exit 1 ;;
-  esac
-fi
-exit 0
-""",
-    )
-    curl_status_file = tmp_path / "curl_status"
-    curl = mock_dir / "curl"
-    _write_exec(
-        curl,
-        f"""#!/bin/bash
-printf '%s' "$(cat "{curl_status_file}")"
-exit 0
-""",
-    )
-
-    deploy_dir = tmp_path / "app"
-    deploy_dir.mkdir()
-    (deploy_dir / "docker-compose.yml").write_text("services: {}\n")
-
-    base_env = dict(os.environ)
-    base_env.update(
-        IMAGE_NAME="demo",
-        ACR_IMAGE="registry.example.com/ns/demo",
-        DEPLOY_DIR=str(deploy_dir),
-        STATE_DIR=str(tmp_path / "state"),
-        HOST_LOCK=str(tmp_path / "host.lock"),
-        HEALTHCHECK_URL="http://localhost/health",
-        HEALTHCHECK_EXPECT_STATUS="200",
-        HEALTHCHECK_RETRIES="1",
-        HEALTHCHECK_INTERVAL="0",
-        HEALTHCHECK_WARMUP="0",
-        HEALTHCHECK_TIMEOUT="1",
-        DOCKER_BIN=str(mock_dir / "docker"),
-        CURL_BIN=str(curl),
-        LOCAL_IMAGE="local.example:5001/ns/demo",
-    )
-
-    good = Path(base_env["STATE_DIR"]) / "last_good_tag"
 
     # 1st deploy: healthy via the local registry -> records bare "abc1234"
-    curl_status_file.write_text("200")
-    env_ok = dict(base_env, GIT_SHA="abc1234")
-    res_ok = subprocess.run(["bash", str(SCRIPT)], env=env_ok, capture_output=True, text=True)
-    assert res_ok.returncode == 0, res_ok.stdout + res_ok.stderr
+    env_ok = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env_ok["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    assert _run(env_ok).returncode == 0
+
+    good = Path(env_ok["STATE_DIR"]) / "last_good_tag"
     assert good.read_text().strip() == "abc1234"
 
     # 2nd deploy: a new SHA, also pulled via the local registry, but unhealthy
     # -> must roll back to abc1234 (re-pulled via the local registry too)
-    curl_status_file.write_text("500")
-    env_bad = dict(base_env, GIT_SHA="def5678")
-    docker_log.write_text("")
-    res_bad = subprocess.run(["bash", str(SCRIPT)], env=env_bad, capture_output=True, text=True)
-    assert res_bad.returncode != 0
+    env_bad = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env_bad["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
+    env_bad["GIT_SHA"] = "def5678"
+    Path(env_bad["DOCKER_LOG"]).write_text("")  # reset log for assertions
+    assert _run(env_bad).returncode != 0
 
     content = good.read_text().strip()
     assert content == "abc1234", content
-    assert "/" not in content and ":" not in content
+    assert "/" not in content and ":" not in content, (
+        f"last_good_tag must stay a bare SHA through a local-registry rollback, got {content!r}"
+    )
 
-    log = docker_log.read_text()
-    assert f"pull {local_prefix}def5678" in log, log
-    assert f"pull {local_prefix}abc1234" in log, log
+    log = Path(env_bad["DOCKER_LOG"]).read_text()
+    assert "pull local.example:5001/ns/demo:def5678" in log, log
+    assert "pull local.example:5001/ns/demo:abc1234" in log, log
 
 
 def test_local_registry_optout_leaves_behavior_unchanged(tmp_path):
@@ -735,7 +705,9 @@ def test_local_registry_pull_retries_default_is_two_then_falls_back_to_acr(tmp_p
 
 
 def test_local_registry_retry_budget_is_configurable(tmp_path):
-    """LOCAL_PULL_RETRIES 可覆盖(不是硬编码),锁定"精确耗尽配置值才切 ACR"这条边界。"""
+    """LOCAL_PULL_RETRIES 可覆盖(不是硬编码),锁定"精确耗尽配置值才切 ACR"这条边界。
+    同时断言真的走了 fallback 分支(而不只是巧合地在别处也出现了一次 ACR pull)
+    ——OCR round-2 finding #1。"""
     env = _local_registry_env(tmp_path, local_fail_pulls=99)
     env["LOCAL_PULL_RETRIES"] = "4"
     res = _run(env)
@@ -743,6 +715,7 @@ def test_local_registry_retry_budget_is_configurable(tmp_path):
     log = Path(env["DOCKER_LOG"]).read_text()
     assert log.count("pull local.example:5001/ns/demo:abc1234") == 4, log
     assert log.count("pull registry.example.com/ns/demo:abc1234") == 1, log
+    assert "falling back to ACR" in res.stdout
 
 
 def test_local_registry_retag_failure_falls_back_to_acr(tmp_path):

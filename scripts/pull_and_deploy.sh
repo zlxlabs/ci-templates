@@ -71,8 +71,14 @@ is_non_negative_integer() {
 # (http://)、凭据(user:pass@host)、多余路径——这些一旦混进镜像引用,会连同下面
 # 的 docker pull/tag 命令行和 log 一起被打进部署日志,凭据因此发生泄漏。
 # 错误信息里绝不回显原值,只说期望格式,否则校验本身就成了泄漏点。
+#
+# 首尾字符必须是字母/数字(OCR round-2 finding #7,high):不锚定首字符的话,
+# 形如 "--evil-flag"(不含 "/")的值能通过 `[A-Za-z0-9.-]+`,而
+# `"$DOCKER_BIN" pull "${LOCAL_IMAGE}:${tag}"` 会把它解析成
+# `docker pull --evil-flag:tag`——docker CLI 把它当 flag 而不是镜像名,是真实的
+# CLI flag 注入面。与 scripts/push_to_acr.sh 里同一个正则同步修。
 is_valid_registry_host() {
-  [[ "$1" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?$ ]]
 }
 
 if [ -n "$LOCAL_IMAGE" ]; then

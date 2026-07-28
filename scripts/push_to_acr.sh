@@ -65,8 +65,13 @@ fi
 # ${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME} 镜像引用,凭据会连同 docker
 # tag/push 命令行和 warning 文本一起被打进构建日志,发生泄漏。错误信息里绝不
 # 回显原值,只说期望格式,否则校验本身就成了泄漏点。
+#
+# 首尾字符必须是字母/数字(OCR round-2 finding #7/#4,high):不锚定首字符的话,
+# "--evil-flag" 这类值能通过 `[A-Za-z0-9.-]+`,拼进 docker tag/push 的镜像引用后,
+# 会被 docker CLI 当成一个以 "-" 开头的参数解析成 flag,而不是镜像名——是真实的
+# CLI flag 注入面。与 scripts/pull_and_deploy.sh 里同一个正则同步修。
 is_valid_registry_host() {
-  [[ "$1" =~ ^[A-Za-z0-9.-]+(:[0-9]+)?$ ]]
+  [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9.-]*[A-Za-z0-9])?(:[0-9]+)?$ ]]
 }
 
 if [ -n "$LOCAL_REGISTRY" ] && ! is_valid_registry_host "$LOCAL_REGISTRY"; then

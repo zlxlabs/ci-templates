@@ -257,6 +257,20 @@ def test_local_registry_rejects_embedded_path(tmp_path):
     assert "invalid shape" in result.stderr
 
 
+def test_local_registry_rejects_leading_dash_flag_injection(tmp_path):
+    """"--evil-flag" 形式(不含 @、不含 /、不含协议前缀)必须被拒绝——它能通过一个
+    不锚定首字符的正则,拼进 docker tag/push 的镜像引用后会被 docker CLI 当成
+    命令行 flag 解析,而不是镜像名(OCR round-2 finding #4/#7,high)。"""
+    docker = _write_fake_docker(tmp_path, "exit 0\n")
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="--evil-flag"),
+        text=True, capture_output=True,
+    )
+    assert result.returncode == 2
+    assert "invalid shape" in result.stderr
+
+
 def test_local_registry_accepts_plain_host_port(tmp_path):
     """回归护栏:合法的 host:port(含端口)不应该被新校验误伤。"""
     docker = _write_fake_docker(
