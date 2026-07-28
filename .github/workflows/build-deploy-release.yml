@@ -18,6 +18,12 @@ on:
         description: "Tailscale-reachable IP or MagicDNS name; also the concurrency key"
         required: true
         type: string
+      # 默认使用 VM201 的 self runner；hosted 仅作应急 fallback，确保 release 仍可恢复。
+      runner:
+        description: "运行器选择：self 使用 VM201 的 self-hosted/linux/x64/codex labels；hosted 使用 ubuntu-latest 作为应急 fallback"
+        required: false
+        default: "self"
+        type: string
       ssh_user:
         description: "SSH user on the deploy target host"
         required: false
@@ -76,7 +82,7 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","codex"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -148,7 +154,9 @@ jobs:
             done
           done < "$RUNNER_TEMP/d3-release.builds"
 
+      # self runner 在 VM201 容器经 NAT 已可达 tailnet；只有 hosted 应急 runner 需要临时入网。
       - name: Connect to Tailscale
+        if: inputs.runner == 'hosted'
         uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2
         with:
           authkey: ${{ secrets.TS_AUTHKEY }}

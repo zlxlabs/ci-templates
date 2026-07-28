@@ -25,6 +25,35 @@ def test_release_workflow_contract_and_six_secrets():
     assert "inputs.host" in str(raw["concurrency"]["group"])
 
 
+def test_release_runner_input_and_hosted_fallback_contract():
+    raw, trigger = load()
+    runner = trigger["workflow_call"]["inputs"]["runner"]
+    assert runner["type"] == "string"
+    assert runner["required"] is False
+    assert runner["default"] == "self"
+    description = runner["description"]
+    assert "VM201" in description
+    assert "self-hosted/linux/x64/codex" in description
+    assert "hosted" in description
+    assert "ubuntu-latest" in description
+
+    expected_runs_on = (
+        "${{ inputs.runner == 'self' && "
+        "fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"codex\"]') || "
+        "fromJSON('[\"ubuntu-latest\"]') }}"
+    )
+    assert raw["jobs"]["release"]["runs-on"] == expected_runs_on
+
+
+def test_release_tailscale_connects_only_for_hosted_runner():
+    raw, _ = load()
+    tailscale = next(
+        step for step in raw["jobs"]["release"]["steps"]
+        if step.get("name") == "Connect to Tailscale"
+    )
+    assert tailscale["if"] == "inputs.runner == 'hosted'"
+
+
 def test_release_workflow_pins_actions_and_has_atomic_build_gate():
     text = WORKFLOW.read_text()
     assert "actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5" in text
