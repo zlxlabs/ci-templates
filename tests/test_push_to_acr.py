@@ -273,11 +273,41 @@ if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
 
     assert result.returncode == 0, result.stdout + result.stderr
     assert "::warning::buildx build failed; falling back to classic docker build" in result.stdout
-    assert [call[0:2] for call in _recorded_argv(tmp_path)] == [
-        ["buildx", "inspect"],
-        ["buildx", "build"],
-        ["build", "--build-arg"],
-        ["tag", "registry.example/namespace/service:abc123"],
+    assert _recorded_argv(tmp_path) == [
+        ["buildx", "inspect", "ci-templates-registry-cache"],
+        [
+            "buildx",
+            "build",
+            "--builder",
+            "ci-templates-registry-cache",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            "--cache-from",
+            "type=registry,ref=local.example:5001/namespace/service:buildcache",
+            "--cache-to",
+            "type=registry,ref=local.example:5001/namespace/service:buildcache,mode=max,ignore-error=true",
+            "--load",
+            str(tmp_path),
+        ],
+        [
+            "build",
+            "--build-arg",
+            "GIT_SHA=abc123",
+            "-f",
+            f"{tmp_path}/Dockerfile",
+            "-t",
+            "registry.example/namespace/service:abc123",
+            str(tmp_path),
+        ],
+        [
+            "tag",
+            "registry.example/namespace/service:abc123",
+            "local.example:5001/namespace/service:abc123",
+        ],
         ["push", "local.example:5001/namespace/service:abc123"],
         ["push", "registry.example/namespace/service:abc123"],
     ]
@@ -300,8 +330,18 @@ if [ "$1" = build ]; then exit 17; fi
     )
 
     assert result.returncode == 17
-    assert _recorded_argv(tmp_path)[-1][0:2] == ["build", "--build-arg"]
-    assert all(call[0] not in {"tag", "push"} for call in _recorded_argv(tmp_path))
+    recorded = _recorded_argv(tmp_path)
+    assert recorded[-1] == [
+        "build",
+        "--build-arg",
+        "GIT_SHA=abc123",
+        "-f",
+        f"{tmp_path}/Dockerfile",
+        "-t",
+        "registry.example/namespace/service:abc123",
+        str(tmp_path),
+    ]
+    assert all(call[0] not in {"tag", "push"} for call in recorded)
 
 
 def test_local_registry_push_failure_falls_back_to_acr_only(tmp_path):
