@@ -22,6 +22,7 @@ PUSH_RETRY_DELAY_SECONDS="${PUSH_RETRY_DELAY_SECONDS:-10}"
 # opt-in 本地网络 registry 镜像(host:port,如 tailnet MagicDNS 名):部署关键路径。
 # 留空(默认)= 禁用,下面的双推逻辑整体退化成改动前的纯 ACR 单推,行为逐字节不变。
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-}"
+BUILDER_NAME="ci-templates-registry-cache"
 
 is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
@@ -116,12 +117,47 @@ push_with_retry() {
   done
 }
 
+# Classic docker build keeps the LOCAL_REGISTRY opt-out argv unchanged.
+build_classic_docker_image() {
+  "$DOCKER_BIN" build \
+    --build-arg "GIT_SHA=${GIT_SHA}" \
+    -f "${BUILD_CONTEXT}/${DOCKERFILE}" \
+    -t "${ACR_IMAGE}:${GIT_SHA}" \
+    "${BUILD_CONTEXT}"
+}
+
+# Registry cache build uses one stable builder and falls back without cache on any buildx failure.
+build_registry_cached_image() {
+  CACHE_REF="${LOCAL_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}:buildcache"
+
+  if ! "$DOCKER_BIN" buildx inspect "$BUILDER_NAME" >/dev/null 2>&1; then
+    if ! "$DOCKER_BIN" buildx create --name "$BUILDER_NAME" --driver docker-container --bootstrap >/dev/null 2>&1; then
+      echo "::warning::buildx builder initialization failed; falling back to classic docker build"
+      build_classic_docker_image
+      return
+    fi
+  fi
+
+  if ! "$DOCKER_BIN" buildx build \
+    --builder "$BUILDER_NAME" \
+    --build-arg "GIT_SHA=${GIT_SHA}" \
+    -f "${BUILD_CONTEXT}/${DOCKERFILE}" \
+    -t "${ACR_IMAGE}:${GIT_SHA}" \
+    --cache-from "type=registry,ref=${CACHE_REF}" \
+    --cache-to "type=registry,ref=${CACHE_REF},mode=max,ignore-error=true" \
+    --load \
+    "${BUILD_CONTEXT}"; then
+    echo "::warning::buildx build failed; falling back to classic docker build"
+    build_classic_docker_image
+  fi
+}
+
 echo "[push] building ${ACR_IMAGE}:${GIT_SHA}"
-"$DOCKER_BIN" build \
-  --build-arg "GIT_SHA=${GIT_SHA}" \
-  -f "${BUILD_CONTEXT}/${DOCKERFILE}" \
-  -t "${ACR_IMAGE}:${GIT_SHA}" \
-  "${BUILD_CONTEXT}"
+if [ -n "$LOCAL_REGISTRY" ]; then
+  build_registry_cached_image
+else
+  build_classic_docker_image
+fi
 
 # 双推:本地 registry(部署关键路径,opt-in) + ACR(异地存档 + 拉取回退,pull_and_deploy.sh
 # 的 pull_from_local_registry() 失败时会退回它)。LOCAL_REGISTRY 为空(默认)时
