@@ -226,6 +226,30 @@ def test_pull_flake_retries_then_succeeds(tmp_path):
     assert "compose up -d" in log
 
 
+def test_pull_retries_default_is_six_succeeds_on_sixth_attempt(tmp_path):
+    """2026-07-28 n305 实测 registry 探测 20% 失败率且成簇(见 pull_image 上方注释),
+    默认预算从 3 次(10+20=30s)提到 6 次(10+20+30+40+50=150s)。前 5 次失败、
+    第 6 次成功必须仍然放行部署 —— 锁定"退到第 6 次才判死"这条边界。"""
+    env = _flaky_env(tmp_path, fail_pulls=5, image_local=False)
+    assert env["PULL_RETRY_DELAY"] == "0"
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 6, log
+    assert "compose up -d" in log
+
+
+def test_pull_retries_default_exhausts_after_six_attempts(tmp_path):
+    """前 6 次(等于 PULL_RETRIES 默认值)全部失败、且本地无镜像 → 第 7 次不再尝试,
+    直接判死。锁定"至多 6 次 pull、不多不少"这条边界,防止后续改动悄悄漂移。"""
+    env = _flaky_env(tmp_path, fail_pulls=6, image_local=False)
+    res = _run(env)
+    assert res.returncode != 0
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert log.count("pull ") == 6, log
+    assert "compose up -d" not in log
+
+
 def test_pull_exhausted_but_local_image_proceeds(tmp_path):
     """registry 全程不可达,但 SHA 镜像已在本地(预热/回滚残留)→ 放行部署。"""
     env = _flaky_env(tmp_path, fail_pulls=99, image_local=True)

@@ -31,7 +31,7 @@ CURL_BIN="${CURL_BIN:-curl}"
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"        # opt-in deploy gate; empty = off
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 
-PULL_RETRIES="${PULL_RETRIES:-3}"
+PULL_RETRIES="${PULL_RETRIES:-6}"
 PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
 
 HEALTHCHECK_URL="${HEALTHCHECK_URL:-}"
@@ -58,6 +58,16 @@ is_positive_integer() {
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
 # 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
 # 不应该拦下部署(2026-07-09 n305→ACR 间歇抖,imflow 因此 9 连败)。
+#
+# 为什么 PULL_RETRIES 默认是 6(而不是 3):2026-07-28 10:20 CST 从部署目标机 n305
+# 对 crpi-0vsre5argteykh9m.cn-guangzhou.personal.cr.aliyuncs.com/v2/ 连续发 20 次
+# HTTPS 探测,结果 OK=16 FAIL=4(失败率 20%),且失败成簇出现(第 11、12 次连续失
+# 败),表现为 TCP connect 挂死到超时 —— 与 2026-07-27 晚间部署日志里的
+# "dial tcp 8.134.34.201:443: i/o timeout" 一致。旧预算 PULL_RETRIES=3 配线性退避
+# delay*attempt(10+20=30 秒)小于观测到的坏窗口,导致 2026-07-27 当晚三次部署
+# (13:00 / 15:12 / 16:24 UTC)全部因 3/3 pull 失败而中止。retries=6 把总等待预算
+# 提到 10+20+30+40+50=150 秒(线性退避算法不变,只调次数),足以跨过实测到的成簇
+# 失败窗口。该链路问题在 hosted runner 时代就存在,不是 self-hosted 迁移引入的。
 pull_image() {
   local ref="$1" attempt=1
   while [ "$attempt" -le "$PULL_RETRIES" ]; do
