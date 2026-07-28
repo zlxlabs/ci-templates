@@ -67,7 +67,7 @@ on:
         default: "10"
         type: string
       local_registry:
-        description: "opt-in local-network registry mirror host:port (e.g. a tailnet MagicDNS name:5001), used as the primary push/pull target for this deploy; ACR remains the offsite archive + fallback. Empty (default) disables this entirely — behavior is byte-for-byte identical to today (ACR-only push and pull)."
+        description: "opt-in local-network registry mirror host:port (e.g. a tailnet MagicDNS name:5001), used as the primary push/pull target for this deploy; ACR remains the offsite archive + fallback. Empty (default) disables this entirely — same ACR-only code path, same exit codes, same success-path stdout as today; the one documented exception is that a default-path ACR-push failure now also prints one extra summary line before failing."
         required: false
         default: ""
         type: string
