@@ -160,6 +160,35 @@ def test_deferred_exit_code_writes_output_before_nonzero_exit():
     assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
 
 
+def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers():
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    deploy_index = next(i for i, step in enumerate(steps) if step.get("id") == "deploy")
+    reconcile_index = next(
+        i for i, step in enumerate(steps)
+        if step.get("name", "").startswith("Reconcile deployed image")
+    )
+    reconcile = steps[reconcile_index]
+
+    assert reconcile_index == deploy_index + 1, (
+        "image reconciliation must run immediately after the deploy step"
+    )
+    assert reconcile["if"] == "success() && steps.deploy.outputs.deferred != 'true'", (
+        "reconciliation must only run after a real deploy success; deferred and "
+        "deploy failures must skip it"
+    )
+
+    run = reconcile["run"]
+    assert 'docker image inspect "${ACR_IMAGE}:${GIT_SHA}"' in run
+    assert 'docker image inspect "${IMAGE_NAME}:latest"' in run
+    assert 'docker compose ps -q --status running' in run
+    assert 'docker inspect "$container_id" --format' in run
+    assert "expected_id" in run and "latest_id" in run and "running_ids" in run
+    assert "::error::" in run
+    assert "SSH transport failed after ${max_attempts} attempts" in run
+    assert "ServerAliveInterval" in run and "ServerAliveCountMax" in run
+
+
 def test_remote_script_path_is_unique_per_run():
     # code review round 4 (P1): a fixed remote path (/tmp/pull_and_deploy.sh) is
     # NOT isolated across different service repos deploying to the same host —

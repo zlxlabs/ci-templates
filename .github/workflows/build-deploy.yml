@@ -366,6 +366,140 @@ jobs:
             sleep 10
           done
 
+      - name: Reconcile deployed image (expected SHA, latest tag, running container)
+        # Green must prove that this SHA is what production runs, not only that
+        # an already-healthy endpoint answered. success() also excludes both
+        # rc=3 deferred and rc=1 deploy-failed/rolled-back paths.
+        if: success() && steps.deploy.outputs.deferred != 'true'
+        env:
+          ACR_REGISTRY: ${{ inputs.acr_registry }}
+          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
+          IMAGE_NAME: ${{ inputs.image_name }}
+          GIT_SHA: ${{ steps.sha.outputs.git_sha }}
+          DEPLOY_HOST: ${{ inputs.host }}
+          SSH_USER: ${{ inputs.ssh_user }}
+          DEPLOY_DIR: ${{ inputs.deploy_dir }}
+        run: |
+          set -euo pipefail
+
+          # Keep the same option validation and tailnet keepalive contract as
+          # the deploy step. A malformed target must fail before SSH parses it.
+          [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid ssh_user"; exit 1; }
+          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid host"; exit 1; }
+
+          ACR_IMAGE="${ACR_REGISTRY}/${ACR_NAMESPACE}/${IMAGE_NAME}"
+          SSH_OPTS="-i $HOME/.ssh/id_deploy \
+            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=20"
+
+          # %q makes the remote environment assignment shell-safe even though
+          # the values originate in workflow inputs. The reconciliation body is
+          # sent on stdin so it is never written to a shared remote pathname.
+          printf -v RECONCILE_COMMAND \
+            'ACR_IMAGE=%q IMAGE_NAME=%q GIT_SHA=%q DEPLOY_DIR=%q bash -s' \
+            "$ACR_IMAGE" "$IMAGE_NAME" "$GIT_SHA" "$DEPLOY_DIR"
+
+          reconcile_once() {
+            ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "$RECONCILE_COMMAND" <<'REMOTE'
+          set -u -o pipefail
+
+          expected_id="<unavailable>"
+          latest_id="<unavailable>"
+          expected_rc=0
+          latest_rc=0
+          compose_rc=0
+          running_match=0
+          running_ids="<none>"
+
+          if expected_id="$(docker image inspect "${ACR_IMAGE}:${GIT_SHA}" --format '{{.Id}}')"; then
+            [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
+          else
+            expected_rc=$?
+            expected_id="<inspect failed>"
+          fi
+
+          if latest_id="$(docker image inspect "${IMAGE_NAME}:latest" --format '{{.Id}}')"; then
+            [ -n "$latest_id" ] || { latest_id="<empty>"; latest_rc=1; }
+          else
+            latest_rc=$?
+            latest_id="<inspect failed>"
+          fi
+
+          compose_output="<compose ps failed>"
+          if compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running)"; then
+            running_ids=""
+            while IFS= read -r container_id; do
+              [ -n "$container_id" ] || continue
+              image_id="<inspect failed>"
+              if image_id="$(docker inspect "$container_id" --format '{{.Image}}')"; then
+                running_ids="${running_ids}${container_id}=${image_id}"$'\n'
+                [ "$image_id" = "$expected_id" ] && running_match=1
+              else
+                running_ids="${running_ids}${container_id}=<inspect failed>"$'\n'
+              fi
+            done <<< "$compose_output"
+            [ -n "$running_ids" ] || running_ids="<none>"
+          else
+            compose_rc=$?
+            running_ids="<compose ps failed>"
+          fi
+
+          echo "image reconcile values:"
+          printf '  expected_id=%s\n' "$expected_id"
+          printf '  latest_id=%s\n' "$latest_id"
+          printf '  running_ids=%s\n' "$running_ids"
+
+          reconcile_rc=0
+          if [ "$expected_rc" -ne 0 ]; then
+            echo "::error::image reconcile expected SHA image is unavailable: ${ACR_IMAGE}:${GIT_SHA} (expected_id=${expected_id})"
+            reconcile_rc=1
+          fi
+          if [ "$latest_rc" -ne 0 ]; then
+            echo "::error::image reconcile latest tag could not be inspected: ${IMAGE_NAME}:latest (latest_id=${latest_id})"
+            reconcile_rc=1
+          elif [ "$expected_rc" -ne 0 ]; then
+            echo "::error::image reconcile latest tag cannot be compared because expected_id is unavailable (latest_id=${latest_id})"
+            reconcile_rc=1
+          elif [ "$latest_id" != "$expected_id" ]; then
+            echo "::error::image reconcile latest tag mismatch: expected_id=${expected_id}, latest_id=${latest_id} (if this service has a concurrent or alternative deploy source, this can also mean a newer deploy superseded this run)"
+            reconcile_rc=1
+          fi
+          if [ "$compose_rc" -ne 0 ]; then
+            echo "::error::image reconcile could not list running containers with docker compose ps -q --status running (running_ids=${running_ids})"
+            reconcile_rc=1
+          elif [ "$expected_rc" -ne 0 ]; then
+            echo "::error::image reconcile running container cannot be compared because expected_id is unavailable (running_ids=${running_ids})"
+            reconcile_rc=1
+          elif [ "$running_match" -ne 1 ]; then
+            echo "::error::image reconcile running container mismatch: expected_id=${expected_id}, running_ids=${running_ids}"
+            reconcile_rc=1
+          fi
+
+          if [ "$reconcile_rc" -ne 0 ]; then
+            exit 1
+          fi
+          echo "::notice::image reconcile passed: ${GIT_SHA} is the image ID used by latest and at least one running container"
+          REMOTE
+          }
+
+          attempt=1; max_attempts=3
+          while true; do
+            rc=0; reconcile_once || rc=$?
+            if [ "$rc" -eq 0 ]; then
+              break
+            fi
+            if [ "$rc" -ne 255 ]; then
+              echo "::error::image reconcile assertion failed (rc=${rc}); deployment may have succeeded, but production image identity is not proven"
+              exit "$rc"
+            fi
+            if [ "$attempt" -ge "$max_attempts" ]; then
+              echo "::error::image reconcile SSH transport failed after ${max_attempts} attempts (rc=255); deployment result is unverified"
+              exit 1
+            fi
+            echo "::warning::image reconcile SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"
+            attempt=$((attempt + 1))
+            sleep 10
+          done
+
       # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
       # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
@@ -397,10 +531,21 @@ jobs:
           run_url = os.environ["RUN_URL"]
           # 关键词模式:机器人关键词由标题前缀保证命中,与 repo 路径解耦
           # (2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
+          # 三条处置分流必须并列写全:对账失败是第五种失败源,它既不是「已回滚」也不是「未上线」
+          # ——deploy 已 rc=0 过了探针门、last_good 标记已推进,新镜像很可能已经在跑。
+          # 只写前两种时 on-call 最坏会读成「未上线,不用管」,而生产正跑着未验证的镜像
+          # (issue #21 的母题在人的环节重演)。
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
-                  f"部署失败(build / ACR / SSH / 探针 其一)。若为探针失败,host 端已按探针门"
-                  f"**自动回滚到 last_good**,生产不受影响;否则本次未上线。点按钮看详情。\n"
+                  f"部署失败。**按红掉的 step 分流处置**(打开 Run 一眼可见是哪个):\n"
+                  f"· **Deploy 步骤**红:未部署成功、或已按探针门**自动回滚到 last_good**。"
+                  f"两种情况生产都停在上一个可用版本,不需要紧急上机。\n"
+                  f"· **Reconcile 步骤**红(镜像对账):deploy 已过探针、last_good 已推进,"
+                  f"**无自动回滚**,生产可能正在跑**未验证的镜像**,"
+                  f"**必须上机核对**,不可按「未上线」处置。\n"
+                  f"· 更早的步骤(checkout / Tailscale / SSH 准备 / build / ACR push)红:"
+                  f"本次未上线,生产仍是上一版本。\n"
+                  f"点按钮看详情。\n"
                   f"<at id=all></at>")
           card = {
               "msg_type": "interactive",
