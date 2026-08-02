@@ -460,7 +460,7 @@ jobs:
             echo "::error::image reconcile latest tag cannot be compared because expected_id is unavailable (latest_id=${latest_id})"
             reconcile_rc=1
           elif [ "$latest_id" != "$expected_id" ]; then
-            echo "::error::image reconcile latest tag mismatch: expected_id=${expected_id}, latest_id=${latest_id}"
+            echo "::error::image reconcile latest tag mismatch: expected_id=${expected_id}, latest_id=${latest_id} (if this service has a concurrent or alternative deploy source, this can also mean a newer deploy superseded this run)"
             reconcile_rc=1
           fi
           if [ "$compose_rc" -ne 0 ]; then
@@ -531,10 +531,19 @@ jobs:
           run_url = os.environ["RUN_URL"]
           # 关键词模式:机器人关键词由标题前缀保证命中,与 repo 路径解耦
           # (2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
+          # 三条处置分流必须并列写全:对账失败是第五种失败源,它既不是「已回滚」也不是「未上线」
+          # ——deploy 已 rc=0 过了探针门、last_good 标记已推进,新镜像很可能已经在跑。
+          # 只写前两种时 on-call 最坏会读成「未上线,不用管」,而生产正跑着未验证的镜像
+          # (issue #21 的母题在人的环节重演)。
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
-                  f"部署失败(build / ACR / SSH / 探针 其一)。若为探针失败,host 端已按探针门"
-                  f"**自动回滚到 last_good**,生产不受影响;否则本次未上线。点按钮看详情。\n"
+                  f"部署失败(build / ACR / SSH / 探针 / 镜像对账 其一)。\n"
+                  f"· 若为**探针失败**:host 端已按探针门**自动回滚到 last_good**,生产不受影响。\n"
+                  f"· 若为 build / ACR / SSH 失败:本次未上线,生产仍是上一版本。\n"
+                  f"· 若为**镜像对账失败**(deploy 已过探针但 reconcile 判红):**无自动回滚**,"
+                  f"last_good 已推进,生产可能正在跑**未验证的镜像**,必须上机核对,"
+                  f"不可按「未上线」处置。\n"
+                  f"点按钮看详情。\n"
                   f"<at id=all></at>")
           card = {
               "msg_type": "interactive",
