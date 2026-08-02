@@ -425,7 +425,7 @@ jobs:
           fi
 
           compose_output="<compose ps failed>"
-          if compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q)"; then
+          if compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running)"; then
             running_ids=""
             while IFS= read -r container_id; do
               [ -n "$container_id" ] || continue
@@ -464,7 +464,7 @@ jobs:
             reconcile_rc=1
           fi
           if [ "$compose_rc" -ne 0 ]; then
-            echo "::error::image reconcile could not list running containers with docker compose ps -q (running_ids=${running_ids})"
+            echo "::error::image reconcile could not list running containers with docker compose ps -q --status running (running_ids=${running_ids})"
             reconcile_rc=1
           elif [ "$expected_rc" -ne 0 ]; then
             echo "::error::image reconcile running container cannot be compared because expected_id is unavailable (running_ids=${running_ids})"

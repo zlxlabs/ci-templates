@@ -181,7 +181,7 @@ def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers(
     run = reconcile["run"]
     assert 'docker image inspect "${ACR_IMAGE}:${GIT_SHA}"' in run
     assert 'docker image inspect "${IMAGE_NAME}:latest"' in run
-    assert 'docker compose ps -q' in run
+    assert 'docker compose ps -q --status running' in run
     assert 'docker inspect "$container_id" --format' in run
     assert "expected_id" in run and "latest_id" in run and "running_ids" in run
     assert "::error::" in run
