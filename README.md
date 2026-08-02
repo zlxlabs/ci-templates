@@ -160,7 +160,8 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 
 `build-deploy.yml` 的健康探针通过后，还会在同一目标机上无条件对账三段事实：本次
 `${GIT_SHA}` 镜像 tag 可 inspect、`<image_name>:latest` 与它拥有相同 image ID、以及
-`docker compose ps -q` 找到的至少一个运行容器通过 `docker inspect` 使用该 image ID。
+`docker compose ps -q --status running` 找到的至少一个运行容器通过 `docker inspect` 使用该
+image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过滤）。
 三段中任一不成立，workflow 判红并打印 expected / latest / running 的实际值；SSH
 对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
 延期和 `rc=1` 已回滚的部署不会执行对账。
