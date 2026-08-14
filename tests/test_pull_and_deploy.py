@@ -371,7 +371,6 @@ def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "[deploy][evidence] probe-attempts: 000(curl=28),503(curl=0)" in result.stdout
-    assert "[deploy][evidence] probe-attempts: 200(curl=0)" in result.stdout
     assert "old version passed the same-budget health probe" in result.stdout
 
 

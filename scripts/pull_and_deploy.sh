@@ -206,7 +206,6 @@ health_probe() {
       probe_attempts="${code}(curl=${curl_rc})"
     fi
     if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ]; then
-      echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
       log "health probe OK (attempt ${attempt}, status ${code})"
       return 0
     fi
