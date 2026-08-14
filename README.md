@@ -170,11 +170,19 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
 | `rc=255` | SSH 传输层失败 | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
 
-`rc=1` 有两种情形，但对 on-call 是同一条指引。一是表中这种：回滚后的旧版本已在**同一探针预算**
-内通过探针——这是本次新增的证明步骤，在此之前 `rc=1` 只证明回滚 compose 被执行过，
-并不证明旧版本真的在应答。二是 release lane 特有的：**本次发布尚未替换过任何容器就失败了**
-（例如 `compose config --images` 身份门禁不通过）。两种情形下生产要么停在已验证的 `last_good`、
-要么根本没被碰过，都不需要紧急上机。`rc=1` 与 `rc=4` 的处置严格互斥。
+`rc=1` 有两种情形，但对 on-call 是同一条指引。
+
+**情形一：已执行回滚，且回滚后的旧版本在同一探针预算内通过了探针。** 这是本次新增的证明
+步骤；在此之前 `rc=1` 只证明回滚 compose 被执行过，并不证明旧版本真的在应答。注意 release
+lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门禁不通过）**也会落进这一类**
+——只要存在 `last_good_release`，脚本仍会执行一次旧版本的 `compose up -d` 并探针验证。
+也就是说生产确实发生过一次 compose 行为（旧版本可能被重启），只是结果已被证明健康。
+
+**情形二：本次运行从未执行过任何 `compose up -d`。** 只在没有 `last_good_release` 可回滚、
+新版本又没走到替换那一步时出现（release lane 特有），此时生产真的一动没动。
+
+两种情形下生产要么停在已验证的 `last_good`、要么根本没被碰过，都不需要紧急上机。
+`rc=1` 与 `rc=4` 的处置严格互斥。
 
 `rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署、
 `last_good` 等于本次 SHA）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
@@ -208,21 +216,34 @@ release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollba
 
 ### 探针预算与冷启动调参
 
-当前默认探针预算为：
+**两条 lane 的默认值不同**，因为单镜像 lane 的探针参数是 `build-deploy.yml` 的 workflow
+input（caller 不传就吃 input 的默认值），而 release lane 没有对应 input，直接吃脚本默认值：
 
-| 参数 | 默认值 |
-|---|---:|
-| `HEALTHCHECK_WARMUP` | `5` 秒 |
-| `HEALTHCHECK_RETRIES` | `5` 次 |
-| `HEALTHCHECK_INTERVAL` | `3` 秒 |
-| `HEALTHCHECK_TIMEOUT` | `5` 秒 |
+| 参数 | 单镜像 lane（workflow input） | release lane（脚本默认） |
+|---|---:|---:|
+| warmup | `10` 秒 | `5` 秒 |
+| retries | `5` 次 | `5` 次 |
+| interval | `3` 秒 | `3` 秒 |
+| timeout（每次 curl） | `5` 秒 | `5` 秒 |
 
-最坏耗时约为 `HEALTHCHECK_WARMUP + HEALTHCHECK_RETRIES × (HEALTHCHECK_TIMEOUT + HEALTHCHECK_INTERVAL)`，
-即 `5 + 5×(5+3) = 45` 秒；最好是 warmup 结束后首探立即通过，也就是 5 秒后判定成功。
+最坏耗时不是 `warmup + retries×(timeout+interval)`——**最后一次尝试之后不再 sleep**，
+所以 interval 只乘 `retries-1`：
 
-注意这 45 秒是**单次探针**的预算，不是一次部署的总预算：回滚后的旧版本要**各自独立地再跑一遍
-完整预算**才可以返回 `rc=1`。所以一次「探针失败 → 回滚」的部署最坏要花约 `45×2 = 90` 秒在探针上，
-外加两次 `compose up -d` 的时间。调大预算时按这个倍数估算部署超时。
+```
+单次探针最坏 = warmup + retries×timeout + (retries-1)×interval
+单镜像 lane  = 10 + 5×5 + 4×3 = 47 秒
+release lane = 5  + N×(5×5 + 4×3) = 5 + 37N 秒   # N = probes_json 里的探针条数
+             = 79 秒（N=2，即 README 上文推荐的 frontend + backend 两条）
+```
+
+release lane 的 N 个探针**共用一次 warmup、但各自跑满自己的重试预算**，所以探针数直接线性
+放大总时间。最好的情况都是 warmup 结束后首探即过。
+
+以上都是**单次探针**的预算，不是一次部署的总预算：回滚后的旧版本要**再独立跑一遍完整预算**
+才可以返回 `rc=1`。所以一次「探针失败 → 回滚」的部署最坏花在探针上的时间是上面的两倍——
+单镜像约 `47×2 = 94` 秒，release（N=2）约 `79×2 = 158` 秒，外加两次 `compose up -d`。
+**设置 job timeout 时按这个两倍值估算**，否则可能在回滚探针还没跑完时就被 timeout 砍掉，
+那时生产状态反而需要人工确认。
 
 Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务，应在 caller 中显式调大预算，尤其是
 warmup、retries 或 timeout；否则服务可能只是尚未完成启动，就被判定为不健康并触发**误回滚**。
