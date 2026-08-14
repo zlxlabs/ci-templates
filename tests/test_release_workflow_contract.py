@@ -410,6 +410,27 @@ def test_release_rc4_output_and_notification_routing_contract():
     assert "<at id=all>" not in payload_line
 
 
+def test_release_notifications_surface_delivery_failures_without_changing_job_result():
+    raw, _ = load()
+    cards = [
+        next(step for step in raw["jobs"]["release"]["steps"] if step.get("name") == name)
+        for name in (
+            "Feishu release busy defer card (yellow, fail-open)",
+            "Feishu release rollback unhealthy card (urgent, fail-open)",
+            "Feishu release failure card (P0, fail-open)",
+        )
+    ]
+    for card in cards:
+        assert card["continue-on-error"] is True
+        assert "FEISHU_CI_WEBHOOK is not configured" in card["run"]
+        assert "request failed or timed out" in card["run"]
+        assert "response parse failed" in card["run"]
+        assert "json.loads" in card["run"]
+        assert 'result["code"]' in card["run"]
+        assert 'result.get("msg"' in card["run"]
+        assert "business error" in card["run"]
+
+
 def test_release_output_write_failures_do_not_skip_failure_exit():
     text = WORKFLOW.read_text()
     start = text.index('if [[ "$rc" -ne 255 ]]; then')

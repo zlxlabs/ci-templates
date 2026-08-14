@@ -352,13 +352,37 @@ jobs:
           FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
         run: |
-          set -u
+          set -u -o pipefail
           webhook="${FEISHU_CI_WEBHOOK:-}"
-          [[ -n "$webhook" ]] || exit 0
-          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu release busy defer card not sent: FEISHU_CI_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
           import json, sys
           print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release deferred: service busy"}}))
           PY
+          )"; then
+            echo "::warning::Feishu release busy defer card request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 "Feishu release busy defer card" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu release busy defer card response parser failed"
+          fi
 
       - name: Feishu release rollback unhealthy card (urgent, fail-open)
         if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
@@ -372,10 +396,14 @@ jobs:
           SHA: ${{ steps.sha.outputs.git_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          set -u
+          set -u -o pipefail
           webhook="${FEISHU_CI_WEBHOOK:-}"
-          [[ -n "$webhook" ]] || exit 0
-          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu release rollback unhealthy card not sent: FEISHU_CI_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
           import json, os, sys
           svc = os.environ.get("SVC", "") or "?"
           host = os.environ.get("HOST", "") or "?"
@@ -395,6 +423,26 @@ jobs:
           # 静默失去 @ 效果 —— 而这张卡的全部价值就是把人叫醒。
           print(json.dumps({"msg_type":"text", "content":{"text":body + ' <at user_id="all">所有人</at>'}}))
           PY
+          )"; then
+            echo "::warning::Feishu release rollback unhealthy card request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 "Feishu release rollback unhealthy card" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu release rollback unhealthy card response parser failed"
+          fi
 
       - name: Feishu release failure card (P0, fail-open)
         if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
@@ -403,10 +451,34 @@ jobs:
           FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
         run: |
-          set -u
+          set -u -o pipefail
           webhook="${FEISHU_CI_WEBHOOK:-}"
-          [[ -n "$webhook" ]] || exit 0
-          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu release failure card not sent: FEISHU_CI_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
           import json, sys
           print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release failed"}}))
           PY
+          )"; then
+            echo "::warning::Feishu release failure card request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 "Feishu release failure card" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu release failure card response parser failed"
+          fi
