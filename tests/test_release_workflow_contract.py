@@ -426,6 +426,7 @@ def test_release_notifications_surface_delivery_failures_without_changing_job_re
         assert "request failed or timed out" in card["run"]
         assert "response parse failed" in card["run"]
         assert "json.loads" in card["run"]
+        assert "if ! python3 -" in card["run"]
         assert 'result["code"]' in card["run"]
         assert 'result.get("msg"' in card["run"]
         assert "business error" in card["run"]
