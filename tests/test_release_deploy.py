@@ -168,24 +168,24 @@ exit 0
 
 
 @pytest.mark.parametrize(
-    ("axis", "expected_rc"),
+    ("axis", "expected_rc", "expected_up_count"),
     [
-        ("healthy", 0),
-        ("identity_gate_failed", 1),
-        ("identity_gate_failed_with_previous_good", 1),
-        ("no_previous_good", 4),
-        ("no_previous_good_pending_signal", 4),
-        ("image_set_changed", 4),
-        ("image_set_changed_pending_signal", 4),
-        ("rollback_compose_failed", 4),
-        ("rollback_healthy", 1),
-        ("rollback_unhealthy", 4),
-        ("signal_before_rollback", 130),
-        ("rollback_unhealthy_pending_signal", 4),
-        ("rollback_healthy_pending_signal", 130),
+        ("healthy", 0, 1),
+        ("identity_gate_failed", 1, 0),
+        ("identity_gate_failed_with_previous_good", 1, 2),
+        ("no_previous_good", 4, 1),
+        ("no_previous_good_pending_signal", 4, 1),
+        ("image_set_changed", 4, 2),
+        ("image_set_changed_pending_signal", 4, 2),
+        ("rollback_compose_failed", 4, 3),
+        ("rollback_healthy", 1, 3),
+        ("rollback_unhealthy", 4, 3),
+        ("signal_before_rollback", 130, 3),
+        ("rollback_unhealthy_pending_signal", 4, 3),
+        ("rollback_healthy_pending_signal", 130, 3),
     ],
 )
-def test_release_outcome_axis_table(tmp_path, axis, expected_rc):
+def test_release_outcome_axis_table(tmp_path, axis, expected_rc, expected_up_count):
     env, log = base(tmp_path)
     if axis == "healthy":
         result = run(env)
@@ -283,6 +283,11 @@ exit 0
                 result = run(env)
 
     assert result.returncode == expected_rc, result.stdout + result.stderr
+    up_count = sum(line.endswith(" up -d") for line in log.read_text().splitlines())
+    assert up_count == expected_up_count, (
+        f"axis {axis} executed {up_count} compose up calls, expected "
+        f"{expected_up_count}; log:\n{log.read_text()}"
+    )
 
 
 def test_probe_evidence_records_http_and_curl_exit_sequence(tmp_path):
