@@ -334,13 +334,13 @@ probe_release() {
       if [[ "$code" == "${PROBE_STATUS[$i]}" ]]; then break; fi
       log "probe ${PROBE_URLS[$i]} got ${code}, want ${PROBE_STATUS[$i]} (${attempt}/${HEALTHCHECK_RETRIES})"
       if (( attempt == HEALTHCHECK_RETRIES )); then
-        log "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
+        echo "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
         return 1
       fi
       sleep "$HEALTHCHECK_INTERVAL"
       attempt=$((attempt + 1))
     done
-    log "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
+    echo "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
   done
   return 0
 }
@@ -492,19 +492,19 @@ do_release() {
       local evidence_output evidence_rc evidence_line
       evidence_rc=0
       evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose ps 2>&1)" || evidence_rc=$?
-      log "[deploy][evidence] compose-ps rc=${evidence_rc}"
+      echo "[deploy][evidence] compose-ps rc=${evidence_rc}"
       if [[ -n "$evidence_output" ]]; then
         while IFS= read -r evidence_line; do
-          log "[deploy][evidence] compose-ps ${evidence_line}"
+          echo "[deploy][evidence] compose-ps ${evidence_line}"
         done <<< "$evidence_output"
       fi
 
       evidence_rc=0
       evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose logs --no-color --tail 100 2>&1)" || evidence_rc=$?
-      log "[deploy][evidence] container-logs rc=${evidence_rc}"
+      echo "[deploy][evidence] container-logs rc=${evidence_rc}"
       if [[ -n "$evidence_output" ]]; then
         while IFS= read -r evidence_line; do
-          log "[deploy][evidence] container-logs ${evidence_line}"
+          echo "[deploy][evidence] container-logs ${evidence_line}"
         done <<< "$evidence_output"
       fi
 
