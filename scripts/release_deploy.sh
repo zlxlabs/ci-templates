@@ -111,6 +111,7 @@ STAGING_PREFIX="$STATE_DIR/.release-${D3_RELEASE_TAG}-$$"
 PENDING_SIGNAL=""
 ROLLBACK_MODE=0
 CURRENT_STAGED=0
+MUTATED=0
 
 [[ "$D3_RELEASE_TAG" =~ ^[0-9a-f]{12}$ ]] || {
   echo "[release] D3_RELEASE_TAG must be a 12-character lowercase git SHA" >&2
@@ -308,6 +309,7 @@ compose_release() {
   compose_args+=(up -d)
   local compose_rc=0
   (cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
+  MUTATED=1
   check_pending || return 130
   return "$compose_rc"
 }
@@ -395,7 +397,7 @@ stage_current_release() {
 }
 
 do_release() {
-  local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 rollback_attempted=0 rollback_healthy=0 first_line=1 line
+  local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 rollback_healthy=0 first_line=1 line
   mkdir -p "$STATE_DIR" || return 1
   [[ -z "$PENDING_SIGNAL" ]] || return 130
   if [[ -f "$GOOD_RELEASE_FILE" ]]; then
@@ -509,7 +511,6 @@ do_release() {
       # Once rollback starts, a second signal must not interrupt the group
       # transition or leave the host on a half-staged release.
       ROLLBACK_MODE=1
-      rollback_attempted=1
       trap ':' INT TERM HUP
       deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
       if (( rollback_rc == 0 )); then
@@ -529,7 +530,7 @@ do_release() {
     log "no previous good release available; refusing pseudo-rollback" >&2
     rollback_rc=4
   fi
-  if (( rollback_attempted == 1 && rollback_healthy == 0 )) || (( rollback_rc == 4 )); then
+  if (( MUTATED == 1 && rollback_healthy == 0 )); then
     return 4
   fi
   [[ -n "$PENDING_SIGNAL" ]] && return 130
