@@ -82,9 +82,12 @@ exit 0
 """
 
 
-def _mock_docker_evidence(log_path: Path) -> str:
+def _mock_docker_evidence(log_path: Path, evidence_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
+if [ "$1" = "compose" ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
+  sleep {evidence_sleep}
+fi
 if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
   printf '%s\n' 'new-container running'
 fi
@@ -144,12 +147,12 @@ def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
     return env
 
 
-def _run(env, extra=None):
+def _run(env, extra=None, timeout=None):
     e = dict(env)
     if extra:
         e.update(extra)
     return subprocess.run(
-        ["bash", str(SCRIPT)], env=e, capture_output=True, text=True
+        ["bash", str(SCRIPT)], env=e, capture_output=True, text=True, timeout=timeout
     )
 
 
@@ -411,6 +414,37 @@ def test_rollback_evidence_is_captured_before_redeploy(tmp_path):
 
     docker_log = Path(env["DOCKER_LOG"]).read_text()
     assert "compose logs --tail 100 --no-color" in docker_log
+
+
+def test_rollback_evidence_timeout_does_not_block_rollback(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env.update(GIT_SHA="new2222", EVIDENCE_TIMEOUT="1")
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_evidence(Path(env["DOCKER_LOG"]), evidence_sleep=30),
+    )
+
+    started = time.monotonic()
+    result = _run(env, timeout=6)
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert elapsed < 6, f"evidence timeout did not bound the deploy: {elapsed:.2f}s"
+    assert "compose-ps timed out after 1s" in result.stdout
+    assert "container-logs timed out after 1s" in result.stdout
+    assert "old1111" in Path(env["DOCKER_LOG"]).read_text(), "rollback must still run"
 
 
 def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):

@@ -48,6 +48,7 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"   # seconds between probes
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"       # seconds before first probe
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"     # per-probe curl timeout
+EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"           # per-evidence-command timeout
 
 # optional test/observability hooks
 DEPLOY_EVENT_LOG="${DEPLOY_EVENT_LOG:-}"
@@ -222,7 +223,7 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good="" compose_ps container_logs rollback_rc=0
+  local prev_good="" compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
 
   deploy_tag "$GIT_SHA"
@@ -236,14 +237,28 @@ do_deploy() {
 
   log "health probe FAILED for ${GIT_SHA}"
   echo "[deploy][evidence] compose-ps:"
+  compose_ps=""
   compose_ps="$(
-    cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose ps 2>&1 || true
-  )"
+    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+      "$DOCKER_BIN" compose ps 2>&1
+  )" || compose_ps_rc=$?
+  if [ "$compose_ps_rc" -eq 124 ]; then
+    log "[deploy][evidence] compose-ps timed out after ${EVIDENCE_TIMEOUT}s"
+  elif [ "$compose_ps_rc" -ne 0 ]; then
+    log "[deploy][evidence] compose-ps failed (rc=${compose_ps_rc})"
+  fi
   printf '%s\n' "$compose_ps" | sed 's/^/[deploy][evidence] /' || true
   echo "[deploy][evidence] container-logs:"
+  container_logs=""
   container_logs="$(
-    cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1 || true
-  )"
+    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+      "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1
+  )" || container_logs_rc=$?
+  if [ "$container_logs_rc" -eq 124 ]; then
+    log "[deploy][evidence] container-logs timed out after ${EVIDENCE_TIMEOUT}s"
+  elif [ "$container_logs_rc" -ne 0 ]; then
+    log "[deploy][evidence] container-logs failed (rc=${container_logs_rc})"
+  fi
   printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
     log "rolling back to previous good tag ${prev_good}"
