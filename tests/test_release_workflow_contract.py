@@ -437,6 +437,10 @@ def test_release_output_write_failures_do_not_skip_failure_exit():
     end = text.index('had_transport_failure=1', start)
     branch = text[start:end]
     assert (
+        'echo "deploy_rc=${rc}" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert (
         'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || '
         'echo "::warning::'
     ) in branch
@@ -445,3 +449,22 @@ def test_release_output_write_failures_do_not_skip_failure_exit():
         'echo "::warning::'
     ) in branch
     assert branch.index("::error::release deploy failed") < branch.index('exit "$rc"')
+
+
+def test_release_failure_card_has_remote_rc_split_and_identity_fields():
+    raw, _ = load()
+    ordinary = next(
+        step for step in raw["jobs"]["release"]["steps"]
+        if step.get("name") == "Feishu release failure card (P0, fail-open)"
+    )
+    assert ordinary["env"]["REMOTE_RC"] == "${{ steps.deploy.outputs.deploy_rc }}"
+    for field in ("SVC", "HOST", "REPO", "SHA", "RUN_URL"):
+        assert field in ordinary["env"]
+    for label in ("服务:", "目标机:", "仓库:", "SHA:", "远端 rc:", "Run:"):
+        assert label in ordinary["run"]
+    assert "rc=130" in ordinary["run"]
+    assert "立即确认远端状态" in ordinary["run"]
+    assert "rc=1" in ordinary["run"]
+    assert "生产停在已验证的 last_good，不需要紧急上机" in ordinary["run"]
+    assert "未知/更早阶段失败" in ordinary["run"]
+    assert "本次未上线，生产仍是上一版本" in ordinary["run"]
