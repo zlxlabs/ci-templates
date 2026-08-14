@@ -1290,7 +1290,11 @@ def test_pending_signal_rechecked_after_promotion_trap_before_promote():
     idx_promote = text.index('promote "$D3_RELEASE_TAG"')
     assert idx_trap < idx_promote, "the promotion trap must be installed before promote() is called"
     between = text[idx_trap:idx_promote]
-    assert "check_pending" in between or "PENDING_SIGNAL" in between, (
+    assert any(
+        line.strip() == "if check_pending; then"
+        for line in between.splitlines()
+        if not line.lstrip().startswith("#")
+    ), (
         "a pending-signal recheck must appear between installing the promotion "
         "trap and calling promote() -- otherwise a signal that lands in the gap "
         "before the trap is installed gets recorded, then is silently ignored "
