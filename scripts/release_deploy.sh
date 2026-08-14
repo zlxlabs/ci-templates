@@ -395,7 +395,7 @@ stage_current_release() {
 }
 
 do_release() {
-  local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 first_line=1 line
+  local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 rollback_attempted=0 rollback_healthy=0 first_line=1 line
   mkdir -p "$STATE_DIR" || return 1
   [[ -z "$PENDING_SIGNAL" ]] || return 130
   if [[ -f "$GOOD_RELEASE_FILE" ]]; then
@@ -484,6 +484,7 @@ do_release() {
     fi
     if [[ "${#old_names[@]}" -eq 0 || "${#cur_names[@]}" -eq 0 || "${#added[@]}" -gt 0 || "${#removed[@]}" -gt 0 ]]; then
       log "rollback impossible: image set changed since last good release (added: ${added[*]:-none} / removed: ${removed[*]:-none}); manual intervention required, containers left as-is" >&2
+      rollback_rc=4
     else
       log "rolling back complete image group to ${previous_sha}"
       local evidence_output evidence_rc evidence_line
@@ -508,23 +509,31 @@ do_release() {
       # Once rollback starts, a second signal must not interrupt the group
       # transition or leave the host on a half-staged release.
       ROLLBACK_MODE=1
+      rollback_attempted=1
       trap ':' INT TERM HUP
       deploy_group "$previous_sha" "$previous_manifest" 0 1 || rollback_rc=$?
       if (( rollback_rc == 0 )); then
         if probe_release; then
+          rollback_healthy=1
           log "rollback to ${previous_sha} healthy"
         else
           log "rollback compose succeeded but probes still fail" >&2
-          rollback_rc=1
+          rollback_rc=4
         fi
       else
+        rollback_rc=4
         log "rollback failed; last_good remains ${previous_sha}" >&2
       fi
     fi
   else
     log "no previous good release available; refusing pseudo-rollback" >&2
+    rollback_rc=4
+  fi
+  if (( rollback_attempted == 1 && rollback_healthy == 0 )); then
+    return 4
   fi
   [[ -n "$PENDING_SIGNAL" ]] && return 130
+  (( rollback_rc == 4 )) && return 4
   return 1
 }
 
