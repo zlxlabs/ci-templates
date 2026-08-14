@@ -149,10 +149,30 @@ exit 0
     )
 
 
+def mock_identity_gate_docker(path: Path, log: Path, *, failed_tag):
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  if [ "$D3_RELEASE_TAG" = "{failed_tag}" ]; then
+    printf 'frontend:latest\\nbackend:latest\\n'
+  else
+    printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  fi
+  exit 0
+fi
+exit 0
+''',
+    )
+
+
 @pytest.mark.parametrize(
     ("axis", "expected_rc"),
     [
         ("healthy", 0),
+        ("identity_gate_failed", 1),
+        ("identity_gate_failed_with_previous_good", 1),
         ("no_previous_good", 4),
         ("no_previous_good_pending_signal", 4),
         ("image_set_changed", 4),
@@ -168,6 +188,14 @@ exit 0
 def test_release_outcome_axis_table(tmp_path, axis, expected_rc):
     env, log = base(tmp_path)
     if axis == "healthy":
+        result = run(env)
+    elif axis in {"identity_gate_failed", "identity_gate_failed_with_previous_good"}:
+        failed_tag = env["D3_RELEASE_TAG"]
+        if axis == "identity_gate_failed_with_previous_good":
+            assert run(env).returncode == 0
+            env["D3_RELEASE_TAG"] = "def567890123"
+            failed_tag = env["D3_RELEASE_TAG"]
+        mock_identity_gate_docker(Path(env["DOCKER_BIN"]), log, failed_tag=failed_tag)
         result = run(env)
     elif axis in {"no_previous_good", "no_previous_good_pending_signal"}:
         if axis.endswith("pending_signal"):
@@ -1152,9 +1180,9 @@ exit 0
         time.sleep(0.01)
     proc.send_signal(signal.SIGTERM)
     stdout, stderr = proc.communicate(timeout=5)
-    assert proc.returncode == 4, (
-        "a signal caught during a first deploy with no rollback target must "
-        f"preserve the rc=4 production-state conclusion: got {proc.returncode}; "
+    assert proc.returncode == 130, (
+        "a signal caught during the identity-gate check must drive the script "
+        f"through the normal pending-signal exit (rc=130): got {proc.returncode}; "
         + stdout + stderr
     )
     lines = log.read_text().splitlines()
