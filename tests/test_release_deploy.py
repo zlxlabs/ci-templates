@@ -158,7 +158,7 @@ if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
   n=$(cat "{count_file}" 2>/dev/null || echo 0)
   n=$((n + 1))
   echo "$n" > "{count_file}"
-  if [ "$n" -ge 2 ]; then
+  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
     {marker_line}
     {sleep_line}
     exit {rollback_rc}
