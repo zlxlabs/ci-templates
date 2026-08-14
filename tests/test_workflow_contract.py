@@ -160,6 +160,35 @@ def test_deferred_exit_code_writes_output_before_nonzero_exit():
     assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
 
 
+def test_rollback_unhealthy_rc4_is_routed_before_transport_guard():
+    text = WORKFLOW.read_text()
+    idx_rc4 = text.index('"$rc" -eq 4')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    assert idx_rc4 < idx_rc_ne_255, "rc=4 分支必须在 != 255 判断之前"
+    assert "rollback_unhealthy=true" in text
+    assert 'echo "::error::deploy failed (rc=4)' in text
+    assert 'exit 4' in text
+
+
+def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
+    text = WORKFLOW.read_text()
+    assert "failure() && steps.deploy.outputs.deferred == 'true'" in text
+    assert (
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'"
+    ) in text
+    assert (
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true'"
+    ) in text
+
+    urgent_idx = text.index("回滚健康未证紧急卡")
+    yellow_idx = text.index("Feishu 部署延期卡")
+    urgent_section = text[urgent_idx:yellow_idx]
+    assert "生产可能不可用，必须立即上机" in urgent_section
+    assert "不需要紧急上机" not in urgent_section
+
+
 def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers():
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
@@ -277,6 +306,7 @@ def test_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
 def test_red_card_step_skips_when_deferred():
     text = WORKFLOW.read_text()
     assert "deferred != 'true'" in text
+    assert "rollback_unhealthy != 'true'" in text
 
 
 def test_yellow_card_step_exists_for_deferred_without_at_all():
