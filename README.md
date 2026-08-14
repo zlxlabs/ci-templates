@@ -64,10 +64,11 @@ services:
 状态 `.deploy-state/release/last_good_release`（首行是 SHA，其余是完整 manifest 内容，同目录
 rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后尽力而为写入的兼容视图，
 供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
-`last_good_release` 为准。失败时按旧 manifest 整组回滚，首次发布没有旧版本则明确失败，
-不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死基镜像、锁定依赖，
-才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受支持——脚本会显式
-拒绝并保持容器现状，绝不做部分回滚，需要人工介入。
+`last_good_release` 为准。失败时按旧 manifest 整组回滚；回滚 compose 后还必须用同预算的
+`probe_release` 证明旧版本在应答，证明通过才返回 `rc=1`。首次发布没有旧版本时拒绝伪回滚，
+直接返回 `rc=4`，不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死
+基镜像、锁定依赖，才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受
+支持——脚本会显式拒绝并保持容器现状，返回 `rc=4`，绝不做部分回滚，需要立即人工介入。
 
 ## 调用方（每服务 ~10 行）
 
@@ -225,7 +226,7 @@ warmup、retries 或 timeout；否则服务可能只是尚未完成启动，就�
 image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过滤）。
 三段中任一不成立，workflow 判红并打印 expected / latest / running 的实际值；SSH
 对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
-延期和 `rc=1` 已回滚的部署不会执行对账。
+延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
 
 部署失败通知读取调用方 repo variables:
 - `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
@@ -250,7 +251,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
-| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚** | `pull_and_deploy.sh` `health_probe()` |
+| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账 | `build-deploy.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
 
@@ -302,7 +303,8 @@ python -m pytest -q
 ```
 
 - `test_registry_schema.py` —— 8 个坏 fixture（缺字段/重复 id/port/slug/路径、DSN 明文、heartbeat 明文、坏 enum）全部报错；好 registry 通过。
-- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚后探针、`rc=4` 分流、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_release_deploy.py` —— release lane 多镜像发布与整组回滚、回滚后探针、`rc=4` 分流（docker/curl mock，无需真实守护进程）。
 - `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
 - `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、caller 钉 `@v1` / canary 钉 `@main`。
