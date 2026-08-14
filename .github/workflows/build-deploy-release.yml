@@ -480,7 +480,14 @@ jobs:
           elif remote_rc:
               guidance = f"远端返回 rc={remote_rc}，请打开 Run 查看部署日志并按实际阶段处置。"
           else:
-              guidance = "未知/更早阶段失败（build / ACR push / Tailscale / SSH 准备），本次未上线，生产仍是上一版本。"
+              # 拿不到 remote_rc 有两种成因，处置完全相反,不能合并成一句:
+              #   a) 更早阶段失败(build / ACR push / Tailscale / SSH 准备)——远端没跑过,生产没动;
+              #   b) SSH 传输三次 255 耗尽后 exit 1——远端可能已经跑完并推进了状态。
+              # 断言成 (a) 会让 on-call 按「未上线,不用管」处置,而实际可能是 (b)。
+              guidance = ("未拿到远端 rc,两种可能且处置相反:更早阶段失败"
+                          "(build / ACR push / Tailscale / SSH 准备)时生产仍是上一版本;"
+                          "SSH 传输耗尽(日志出现 rc=255)时远端状态未知、可能已推进,需上机确认。"
+                          "打开 Run 看红在哪个 step 再定。")
           body = (f'{sys.argv[1]} D3 release failed\n'
                   f'服务: {svc} · 目标机: {host}\n'
                   f'仓库: {repo} · SHA: {sha}\n'

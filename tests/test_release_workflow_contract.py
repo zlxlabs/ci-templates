@@ -468,4 +468,11 @@ def test_release_failure_card_has_remote_rc_split_and_identity_fields():
     assert "rc=1" in ordinary["run"]
     assert "生产停在已验证的 last_good，不需要紧急上机" in ordinary["run"]
     assert "未知/更早阶段失败" in ordinary["run"]
-    assert "本次未上线，生产仍是上一版本" in ordinary["run"]
+    # 拿不到 remote_rc 有两种成因、处置相反：更早阶段失败（生产没动）与 SSH 传输
+    # 255 耗尽（远端可能已推进）。卡片必须两种都讲，不能断言成前者——build-deploy.yml
+    # 早有留痕：本 run 出过 255 之后远端状态本质不确定。
+    assert "SSH 传输耗尽" in ordinary["run"]
+    assert "远端状态未知" in ordinary["run"]
+    assert "本次未上线，生产仍是上一版本" not in ordinary["run"], (
+        "拿不到远端 rc 时不得单方面断言「未上线」——SSH 传输耗尽也走这一支"
+    )
