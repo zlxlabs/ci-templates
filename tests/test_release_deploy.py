@@ -1152,9 +1152,9 @@ exit 0
         time.sleep(0.01)
     proc.send_signal(signal.SIGTERM)
     stdout, stderr = proc.communicate(timeout=5)
-    assert proc.returncode == 130, (
-        "a signal caught during the identity-gate check must drive the script "
-        f"through the normal pending-signal exit (rc=130): got {proc.returncode}; "
+    assert proc.returncode == 4, (
+        "a signal caught during a first deploy with no rollback target must "
+        f"preserve the rc=4 production-state conclusion: got {proc.returncode}; "
         + stdout + stderr
     )
     lines = log.read_text().splitlines()
