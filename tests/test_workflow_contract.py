@@ -330,20 +330,33 @@ def test_red_card_step_skips_when_deferred():
 
 
 def test_yellow_card_step_exists_for_deferred_without_at_all():
-    text = WORKFLOW.read_text()
-    assert "deferred == 'true'" in text
-    assert "部署延期" in text
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    cards = {
+        step["name"]: step
+        for step in steps
+        if step.get("name") in {
+            "Feishu 部署延期卡 (deferred, fail-open)",
+            "Feishu 部署失败卡 (P0, fail-open)",
+            "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
+        }
+    }
 
-    # 定位黄卡那一段(从"部署延期"关键词往后切),只在这一段里断言不含 <at id=all>;
-    # 红卡那段仍然应该含 <at id=all>,不能用"全文不含"这种粗暴断言。
-    idx = text.index("部署延期")
-    yellow_section = text[idx:]
-    assert "<at id=all>" not in yellow_section
+    def at_all_payload_lines(step):
+        return [
+            line.strip()
+            for line in step["run"].splitlines()
+            if line.strip().startswith('f"<at id=all></at>')
+        ]
 
-    red_idx = text.index("Feishu 部署失败卡")
-    # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
-    red_section = text[red_idx:idx]
-    assert "<at id=all>" in red_section
+    yellow = cards["Feishu 部署延期卡 (deferred, fail-open)"]
+    ordinary = cards["Feishu 部署失败卡 (P0, fail-open)"]
+    urgent = cards["Feishu 回滚健康未证紧急卡 (P0, fail-open)"]
+    assert yellow["if"] == "failure() && steps.deploy.outputs.deferred == 'true'"
+    assert "部署延期" in yellow["name"]
+    assert not at_all_payload_lines(yellow)
+    assert at_all_payload_lines(ordinary)
+    assert at_all_payload_lines(urgent)
 
 
 def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
