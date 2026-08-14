@@ -46,6 +46,74 @@ exit 0
 """
 
 
+def _mock_curl_sequence(log_path: Path, sequence: list[tuple[str, int]]) -> str:
+    """Return a curl mock with a deterministic (HTTP code, curl rc) sequence."""
+    cases = []
+    for attempt, (status, curl_rc) in enumerate(sequence, start=1):
+        cases.append(
+            f"{attempt}) echo '{attempt}' >> \"{log_path}\"; "
+            f"printf '%s' '{status}'; exit {curl_rc};;"
+        )
+    cases_text = "\n".join(cases)
+    return f"""#!/bin/bash
+count_file="{log_path}.count"
+attempt=$(cat "$count_file" 2>/dev/null || echo 0)
+attempt=$((attempt + 1)); echo "$attempt" > "$count_file"
+case "$attempt" in
+{cases_text}
+*) echo "$attempt" >> "{log_path}"; printf '%s' '500'; exit 0;;
+esac
+"""
+
+
+def _mock_docker_matrix(log_path: Path, fail_compose_on: int | None = None) -> str:
+    """Docker mock for the rollback outcome matrix."""
+    fail_clause = ""
+    if fail_compose_on is not None:
+        fail_clause = f";\n  [ \"$count\" -eq {fail_compose_on} ] && exit 23"
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "compose" ]; then
+  count_file="{log_path}.compose-count"
+  count=$(cat "$count_file" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$count_file"{fail_clause}
+fi
+exit 0
+"""
+
+
+def _mock_docker_evidence(log_path: Path, evidence_sleep: float = 0.0) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "compose" ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
+  sleep {evidence_sleep}
+fi
+if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
+  printf '%s\n' 'new-container running'
+fi
+if [ "$1" = "compose" ] && [ "$2" = "logs" ]; then
+  printf '%s\n' 'new-container last-line'
+fi
+exit 0
+"""
+
+
+def _mock_docker_rollback_pull_failure(log_path: Path) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  count_file="{log_path}.pull-count"
+  count=$(cat "$count_file" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$count_file"
+  [ "$count" -ge 2 ] && exit 23
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 ]]; then
+  exit 1
+fi
+exit 0
+"""
+
+
 def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
               compose_sleep: float = 0.0) -> dict:
     docker_log = tmp_path / "docker.log"
@@ -79,12 +147,12 @@ def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
     return env
 
 
-def _run(env, extra=None):
+def _run(env, extra=None, timeout=None):
     e = dict(env)
     if extra:
         e.update(extra)
     return subprocess.run(
-        ["bash", str(SCRIPT)], env=e, capture_output=True, text=True
+        ["bash", str(SCRIPT)], env=e, capture_output=True, text=True, timeout=timeout
     )
 
 
@@ -151,6 +219,299 @@ def test_probe_failure_without_previous_good_just_fails(tmp_path):
     assert res.returncode != 0
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert not good.exists(), "must not record a bad deploy as good"
+
+
+# 单镜像 lane 退出状态轴表：首次探针 × prev_good × 回滚 compose × 回滚探针。
+# 这张表刻意把无 HEALTHCHECK_URL 的不可达格子也锁住：它必须成功且不回滚。
+@pytest.mark.parametrize(
+    "case",
+    [
+        {
+            "name": "probe-pass-with-prev-good",
+            "status_sequence": [("200", 0)],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 0,
+            "expected_last_good": "new2222",
+            "rollback_tag": None,
+        },
+        {
+            "name": "probe-skipped-with-prev-good",
+            "status_sequence": [],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "",
+            "expected_rc": 0,
+            "expected_last_good": "new2222",
+            "rollback_tag": None,
+        },
+        {
+            "name": "probe-fails-without-prev-good",
+            "status_sequence": [("500", 0), ("500", 0)],
+            "prev_good": None,
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 4,
+            "expected_last_good": None,
+            "rollback_tag": None,
+        },
+        {
+            "name": "probe-fails-with-same-prev-good",
+            "status_sequence": [("500", 0), ("500", 0)],
+            "prev_good": "new2222",
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 4,
+            "expected_last_good": "new2222",
+            "rollback_tag": None,
+        },
+        {
+            "name": "rollback-probe-passes",
+            "status_sequence": [("500", 0), ("500", 0), ("200", 0)],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 1,
+            "expected_last_good": "old1111",
+            "rollback_tag": "old1111",
+        },
+        {
+            "name": "rollback-probe-fails",
+            "status_sequence": [("500", 0), ("500", 0), ("500", 0), ("500", 0)],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 4,
+            "expected_last_good": "old1111",
+            "rollback_tag": "old1111",
+        },
+        {
+            "name": "rollback-compose-fails",
+            "status_sequence": [("500", 0), ("500", 0)],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "http://localhost/health",
+            "expected_rc": 4,
+            "expected_last_good": "old1111",
+            "rollback_tag": "old1111",
+            "fail_compose_on": 2,
+        },
+        {
+            "name": "probe-skipped-never-rolls-back",
+            "status_sequence": [],
+            "prev_good": "old1111",
+            "git_sha": "new2222",
+            "healthcheck_url": "",
+            "expected_rc": 0,
+            "expected_last_good": "new2222",
+            "rollback_tag": None,
+        },
+    ],
+    ids=lambda case: case["name"],
+)
+def test_single_image_outcome_matrix(tmp_path, case):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = case["git_sha"]
+    env["HEALTHCHECK_URL"] = case["healthcheck_url"]
+
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    if case["prev_good"] is not None:
+        good.parent.mkdir(parents=True)
+        good.write_text(case["prev_good"] + "\n")
+
+    curl_log = tmp_path / "curl-attempts.log"
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(curl_log, case["status_sequence"]),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(
+            Path(env["DOCKER_LOG"]), case.get("fail_compose_on")
+        ),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == case["expected_rc"], result.stdout + result.stderr
+    actual_last_good = good.read_text().strip() if good.exists() else None
+    assert actual_last_good == case["expected_last_good"]
+
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    rollback_tag = case["rollback_tag"]
+    if rollback_tag is None:
+        assert "old1111" not in docker_log
+    else:
+        assert f":{rollback_tag}" in docker_log
+
+
+def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+
+    curl_log = tmp_path / "curl-attempts.log"
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            curl_log,
+            [("000", 28), ("503", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[deploy][evidence] probe-attempts: 000(curl=28),503(curl=0)" in result.stdout
+    assert "old version passed the same-budget health probe" in result.stdout
+
+
+def test_rollback_evidence_is_captured_before_redeploy(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+
+    curl_log = tmp_path / "curl-attempts.log"
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            curl_log,
+            [("500", 0), ("500", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_evidence(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    ps_marker = "[deploy][evidence] compose-ps:"
+    logs_marker = "[deploy][evidence] container-logs:"
+    rollback_marker = "[deploy] rolling back to previous good tag old1111"
+    assert ps_marker in result.stdout
+    assert "[deploy][evidence] new-container running" in result.stdout
+    assert logs_marker in result.stdout
+    assert "[deploy][evidence] new-container last-line" in result.stdout
+    assert result.stdout.index(ps_marker) < result.stdout.index(logs_marker)
+    assert result.stdout.index(logs_marker) < result.stdout.index(rollback_marker)
+
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    assert "compose logs --tail 100 --no-color" in docker_log
+
+
+def test_rollback_evidence_timeout_does_not_block_rollback(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env.update(GIT_SHA="new2222", EVIDENCE_TIMEOUT="1")
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_evidence(Path(env["DOCKER_LOG"]), evidence_sleep=30),
+    )
+
+    started = time.monotonic()
+    result = _run(env, timeout=6)
+    elapsed = time.monotonic() - started
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert elapsed < 6, f"evidence timeout did not bound the deploy: {elapsed:.2f}s"
+    assert "compose-ps timed out after 1s" in result.stdout
+    assert "container-logs timed out after 1s" in result.stdout
+    assert "old1111" in Path(env["DOCKER_LOG"]).read_text(), "rollback must still run"
+
+
+def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    env["PULL_RETRIES"] = "1"
+    env["PULL_RETRY_DELAY"] = "0"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_rollback_pull_failure(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert good.read_text().strip() == "old1111"
+    assert "rollback to old1111 failed" in result.stdout
+
+
+def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0)],
+        ),
+    )
+    docker_log = Path(env["DOCKER_LOG"])
+    compose_count = tmp_path / "compose-up.count"
+    _write_exec(
+        mock_dir / "docker",
+        f'''#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+  count=$(cat "{compose_count}" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "{compose_count}"
+  [ "$count" -eq 2 ] && exit 23
+fi
+exit 0
+''',
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert good.read_text().strip() == "old1111"
+    assert "rollback to old1111 failed" in result.stdout
+    assert "rollback to old1111 complete" not in result.stdout
 
 
 def test_concurrent_same_host_deploys_serialize(tmp_path):

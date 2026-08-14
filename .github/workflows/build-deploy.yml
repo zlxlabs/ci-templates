@@ -260,8 +260,9 @@ jobs:
           # 退出码语义(决定能不能重试):
           #   0   = 部署健康
           #   255 = SSH/scp 传输层失败(Connection reset / timeout)→ 瞬时,安全重试
-          #   1   = pull_and_deploy.sh 主动失败(探针挂,且已在 host 端自动回滚)
+          #   1   = 探针失败、已回滚,且回滚后同预算探针已验证旧版本在应答
           #         → 真实坏部署,绝不重试(否则重拉/重部/重滚 3 遍,搅乱生产)
+          #   4   = 新版本不健康,但无法证明生产停在健康版本 → 立即上机,绝不重试
           #   3   = deferred:busy-lock 门禁(opt-in)超时未等到,服务忙,旧容器保留
           #         → 不是故障,不重试;写 deferred=true 分流去黄卡,等空闲手动 re-run
           # scp 只是拷个脚本文件(无副作用),失败一律归到 255 当瞬时重试;
@@ -315,9 +316,14 @@ jobs:
                 # 确认一次,成本低于维护这套证明机器。
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
               fi
-              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              echo "deferred=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deferred output"
               echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
               exit 3
+            fi
+            if [ "$rc" -eq 4 ]; then
+              echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
+              echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required"
+              exit 4
             fi
             if [ "$rc" -ne 255 ]; then
               # 脚本主动失败(已回滚)—— 真实问题,立即上报,不重试
@@ -507,7 +513,7 @@ jobs:
       # 凭据 = 调用方服务仓的 repo 变量 vars.FEISHU_CI_WEBHOOK(关键词模式,无 secret);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
-        if: failure() && steps.deploy.outputs.deferred != 'true'
+        if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
         continue-on-error: true
         env:
           FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
@@ -538,8 +544,8 @@ jobs:
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
                   f"部署失败。**按红掉的 step 分流处置**(打开 Run 一眼可见是哪个):\n"
-                  f"· **Deploy 步骤**红:未部署成功、或已按探针门**自动回滚到 last_good**。"
-                  f"两种情况生产都停在上一个可用版本,不需要紧急上机。\n"
+                  f"· **Deploy 步骤**红:未部署成功；若是探针失败,已按探针门**自动回滚到 last_good**,"
+                  f"且回滚后已用同预算探针验证旧版本在应答,不需要紧急上机。其它部署脚本错误按日志处理。\n"
                   f"· **Reconcile 步骤**红(镜像对账):deploy 已过探针、last_good 已推进,"
                   f"**无自动回滚**,生产可能正在跑**未验证的镜像**,"
                   f"**必须上机核对**,不可按「未上线」处置。\n"
@@ -558,6 +564,62 @@ jobs:
                       {"tag": "action", "actions": [
                           {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
                            "type": "primary", "url": run_url},
+                      ]},
+                  ],
+              },
+          }
+          req = urllib.request.Request(
+              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
+          try:
+              with urllib.request.urlopen(req, timeout=10) as r:
+                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
+          except Exception as e:
+              print("feishu notify failed (swallowed):", e)
+          PY
+
+      # rollback_unhealthy=true(rc=4):新版本不健康,且主机未能证明生产停在健康版本。
+      # 这是独立的紧急卡,不能与 rc=1 的普通红卡共用「不需要紧急上机」文案。
+      - name: Feishu 回滚健康未证紧急卡 (P0, fail-open)
+        if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          python3 - <<'PY'
+          import json, os, urllib.request
+          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
+          if not hook:
+              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          svc     = os.environ.get("SVC", "") or "?"
+          host    = os.environ.get("HOST", "") or "?"
+          repo    = os.environ["REPO"]
+          sha     = os.environ.get("SHA", "") or "?"
+          run_url = os.environ["RUN_URL"]
+          body = (f"服务 {svc} · 目标机 {host}\n"
+                  f"仓库 {repo} · SHA {sha}\n"
+                  f"新版本健康探针失败,且回滚未能用同预算探针证明旧版本在应答。\n"
+                  f"生产可能不可用，必须立即上机。请先查看回滚前现场证据"
+                  f"(compose ps / 容器日志 / 探针 code 与 curl 退出码序列),再人工确认生产状态。\n"
+                  f"点按钮看详情。\n"
+                  f"<at id=all></at>")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {"template": "red",
+                             "title": {"tag": "plain_text", "content": f"🚨 {title_prefix} P0 回滚健康未证 · {svc}"}},
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "立即上机处置"},
+                           "type": "danger", "url": run_url},
                       ]},
                   ],
               },

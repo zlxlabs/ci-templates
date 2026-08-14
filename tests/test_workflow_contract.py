@@ -160,6 +160,55 @@ def test_deferred_exit_code_writes_output_before_nonzero_exit():
     assert idx_rc3 < idx_rc_ne_255, "rc=3 分支必须在 != 255 判断之前"
 
 
+def test_rollback_unhealthy_rc4_is_routed_before_transport_guard():
+    text = WORKFLOW.read_text()
+    idx_rc4 = text.index('"$rc" -eq 4')
+    idx_rc_ne_255 = text.index('"$rc" -ne 255')
+    assert idx_rc4 < idx_rc_ne_255, "rc=4 分支必须在 != 255 判断之前"
+    assert "rollback_unhealthy=true" in text
+    assert 'echo "::error::deploy failed (rc=4)' in text
+    assert 'exit 4' in text
+
+
+def test_deploy_output_write_failures_do_not_skip_rc4_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [ "$rc" -eq 4 ]; then')
+    end = text.index('if [ "$rc" -ne 255 ]; then', start)
+    branch = text[start:end]
+    output = 'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"'
+    assert f'{output} || echo "::warning::' in branch
+    assert branch.index("::error::") < branch.index("exit 4")
+
+
+def test_deferred_output_write_failure_does_not_skip_rc3_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [ "$rc" -eq 3 ]; then')
+    end = text.index('if [ "$rc" -eq 4 ]; then', start)
+    branch = text[start:end]
+    output = 'echo "deferred=true" >> "$GITHUB_OUTPUT"'
+    assert f'{output} || echo "::warning::' in branch
+    assert branch.index("::warning::deploy DEFERRED") < branch.index("exit 3")
+
+
+def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
+    text = WORKFLOW.read_text()
+    assert "failure() && steps.deploy.outputs.deferred == 'true'" in text
+    assert (
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'"
+    ) in text
+    assert (
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true'"
+    ) in text
+
+    urgent_idx = text.index("回滚健康未证紧急卡")
+    yellow_idx = text.index("Feishu 部署延期卡")
+    urgent_section = text[urgent_idx:yellow_idx]
+    assert "生产可能不可用，必须立即上机" in urgent_section
+    assert "不需要紧急上机" not in urgent_section
+
+
 def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers():
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
@@ -277,23 +326,37 @@ def test_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
 def test_red_card_step_skips_when_deferred():
     text = WORKFLOW.read_text()
     assert "deferred != 'true'" in text
+    assert "rollback_unhealthy != 'true'" in text
 
 
 def test_yellow_card_step_exists_for_deferred_without_at_all():
-    text = WORKFLOW.read_text()
-    assert "deferred == 'true'" in text
-    assert "部署延期" in text
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    cards = {
+        step["name"]: step
+        for step in steps
+        if step.get("name") in {
+            "Feishu 部署延期卡 (deferred, fail-open)",
+            "Feishu 部署失败卡 (P0, fail-open)",
+            "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
+        }
+    }
 
-    # 定位黄卡那一段(从"部署延期"关键词往后切),只在这一段里断言不含 <at id=all>;
-    # 红卡那段仍然应该含 <at id=all>,不能用"全文不含"这种粗暴断言。
-    idx = text.index("部署延期")
-    yellow_section = text[idx:]
-    assert "<at id=all>" not in yellow_section
+    def at_all_payload_lines(step):
+        return [
+            line.strip()
+            for line in step["run"].splitlines()
+            if line.strip().startswith('f"<at id=all></at>')
+        ]
 
-    red_idx = text.index("Feishu 部署失败卡")
-    # 红卡段落(该 step 起,到黄卡关键词出现前)仍然要 @全员
-    red_section = text[red_idx:idx]
-    assert "<at id=all>" in red_section
+    yellow = cards["Feishu 部署延期卡 (deferred, fail-open)"]
+    ordinary = cards["Feishu 部署失败卡 (P0, fail-open)"]
+    urgent = cards["Feishu 回滚健康未证紧急卡 (P0, fail-open)"]
+    assert yellow["if"] == "failure() && steps.deploy.outputs.deferred == 'true'"
+    assert "部署延期" in yellow["name"]
+    assert not at_all_payload_lines(yellow)
+    assert at_all_payload_lines(ordinary)
+    assert at_all_payload_lines(urgent)
 
 
 def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():

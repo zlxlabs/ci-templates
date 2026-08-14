@@ -1,6 +1,7 @@
 """TDD tests for atomic multi-image release deployment on the SSH host."""
 
 import os
+import pytest
 import signal
 import stat
 import subprocess
@@ -81,8 +82,328 @@ def base(tmp_path, *, status="200", compose_rc=0, fail_pull=False, fail_tag=Fals
     return env, log
 
 
-def run(env):
-    return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+def mock_curl_sequence(path: Path, statuses, *, pause_marker=None):
+    count_file = path.parent / "curl.count"
+    values = " ".join(statuses)
+    marker_line = f'touch "{pause_marker}"; sleep 0.25' if pause_marker else ":"
+    write_exec(
+        path,
+        f'''#!/bin/bash
+count_file="{count_file}"
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$count_file"
+statuses=({values})
+printf '%s' "${{statuses[$((n - 1))]}}"
+if [ "$n" -eq 1 ]; then {marker_line}; fi
+''',
+    )
+
+
+def mock_curl_status_exit_sequence(path: Path, attempts):
+    count_file = path.parent / "curl.count"
+    statuses = " ".join(status for status, _ in attempts)
+    exit_codes = " ".join(str(rc) for _, rc in attempts)
+    write_exec(
+        path,
+        f'''#!/bin/bash
+count_file="{count_file}"
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$count_file"
+statuses=({statuses})
+exit_codes=({exit_codes})
+printf '%s' "${{statuses[$((n - 1))]}}"
+exit "${{exit_codes[$((n - 1))]}}"
+''',
+    )
+
+
+def mock_rollback_docker(path: Path, log: Path, *, image_names=("frontend", "backend"),
+                         rollback_rc=0, rollback_marker=None, evidence_sleep=0.0,
+                         remove_deploy_dir_on_rollback_config: Path | None = None,
+                         identity_gate_failed_tag: str | None = None):
+    count_file = log.parent / "compose-up.count"
+    rendered = "".join(f"{name}:%s\\n" for name in image_names)
+    rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
+    marker_line = f'touch "{rollback_marker}"' if rollback_marker else ":"
+    sleep_line = "sleep 0.25" if rollback_marker else ":"
+    remove_line = ":"
+    if remove_deploy_dir_on_rollback_config is not None:
+        deploy_dir = str(remove_deploy_dir_on_rollback_config)
+        remove_line = f'mv -- "{deploy_dir}" "{deploy_dir}.gone"'
+    if identity_gate_failed_tag is None:
+        rendered_config = f"  printf '{rendered}' {rendered_args}"
+    else:
+        rendered_config = f'''  if [ "$D3_RELEASE_TAG" = "{identity_gate_failed_tag}" ]; then
+    printf 'frontend:latest\\nbackend:latest\\n'
+  else
+    printf '{rendered}' {rendered_args}
+  fi'''
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+{rendered_config}
+  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
+    {remove_line}
+  fi
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
+  sleep {evidence_sleep}
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  n=$(cat "{count_file}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "{count_file}"
+  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
+    {marker_line}
+    {sleep_line}
+    exit {rollback_rc}
+  fi
+fi
+exit 0
+''',
+    )
+
+
+def mock_identity_gate_docker(path: Path, log: Path, *, failed_tag):
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  if [ "$D3_RELEASE_TAG" = "{failed_tag}" ]; then
+    printf 'frontend:latest\\nbackend:latest\\n'
+  else
+    printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  fi
+  exit 0
+fi
+exit 0
+''',
+    )
+
+
+@pytest.mark.parametrize(
+    ("axis", "expected_rc", "expected_up_count"),
+    [
+        ("healthy", 0, 1),
+        ("identity_gate_failed", 1, 0),
+        ("identity_gate_failed_with_previous_good", 1, 2),
+        ("no_previous_good", 4, 1),
+        ("no_previous_good_pending_signal", 4, 1),
+        ("image_set_changed", 4, 2),
+        ("image_set_changed_pending_signal", 4, 2),
+        ("rollback_compose_failed", 4, 3),
+        ("rollback_healthy", 1, 3),
+        ("rollback_unhealthy", 4, 3),
+        ("signal_before_rollback", 130, 3),
+        ("rollback_unhealthy_pending_signal", 4, 3),
+        ("rollback_healthy_pending_signal", 130, 3),
+    ],
+)
+def test_release_outcome_axis_table(tmp_path, axis, expected_rc, expected_up_count):
+    env, log = base(tmp_path)
+    if axis == "healthy":
+        result = run(env)
+    elif axis in {"identity_gate_failed", "identity_gate_failed_with_previous_good"}:
+        failed_tag = env["D3_RELEASE_TAG"]
+        if axis == "identity_gate_failed_with_previous_good":
+            assert run(env).returncode == 0
+            env["D3_RELEASE_TAG"] = "def567890123"
+            failed_tag = env["D3_RELEASE_TAG"]
+        mock_identity_gate_docker(Path(env["DOCKER_BIN"]), log, failed_tag=failed_tag)
+        result = run(env)
+    elif axis in {"no_previous_good", "no_previous_good_pending_signal"}:
+        if axis.endswith("pending_signal"):
+            marker = tmp_path / "probe.started"
+            mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
+            result = run_with_signal_on_marker(env, marker)
+        else:
+            mock_curl(Path(env["CURL_BIN"]), "500")
+            result = run(env)
+    else:
+        assert run(env).returncode == 0
+        env["D3_RELEASE_TAG"] = "def567890123"
+
+        if axis in {"image_set_changed", "image_set_changed_pending_signal"}:
+            changed_manifest = tmp_path / "release2.manifest"
+            changed_manifest.write_text(
+                "D3_RELEASE_MANIFEST=1\n"
+                "image\tfrontend\tfrontend\n"
+                "image\tbackend2\tbackend2\n"
+                "probe\thttp://localhost/frontend\t200\n"
+                "probe\thttp://localhost/api/health\t200\n"
+            )
+            env["RELEASE_MANIFEST"] = str(changed_manifest)
+            mock_rollback_docker(Path(env["DOCKER_BIN"]), log, image_names=("frontend", "backend2"))
+            if axis.endswith("pending_signal"):
+                marker = tmp_path / "probe.started"
+                mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
+                result = run_with_signal_on_marker(env, marker)
+            else:
+                mock_curl(Path(env["CURL_BIN"]), "500")
+                result = run(env)
+        elif axis in {"rollback_compose_failed", "rollback_healthy", "rollback_unhealthy"}:
+            rollback_rc = 1 if axis == "rollback_compose_failed" else 0
+            mock_rollback_docker(Path(env["DOCKER_BIN"]), log, rollback_rc=rollback_rc)
+            statuses = ["500", "500"]
+            if axis == "rollback_healthy":
+                statuses = ["500", "200", "200"]
+            else:
+                statuses = ["500", "500"]
+            mock_curl_sequence(Path(env["CURL_BIN"]), statuses)
+            result = run(env)
+        elif axis == "signal_before_rollback":
+            marker = tmp_path / "new-compose.started"
+            count_file = tmp_path / "compose-up.count"
+            write_exec(
+                Path(env["DOCKER_BIN"]),
+                f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  n=$(cat "{count_file}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "{count_file}"
+  if [ "$n" -eq 1 ]; then touch "{marker}"; sleep 0.25; fi
+fi
+exit 0
+''',
+            )
+            proc = subprocess.Popen(
+                ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            deadline = time.time() + 3
+            while time.time() < deadline and not marker.exists():
+                time.sleep(0.01)
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=5)
+            result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        else:
+            marker = tmp_path / "probe.started"
+            mock_rollback_docker(
+                Path(env["DOCKER_BIN"]), log,
+            )
+            statuses = ["500", "200", "200"]
+            if axis == "rollback_unhealthy_pending_signal":
+                statuses = ["500", "500"]
+            pause_marker = marker if axis.endswith("pending_signal") else None
+            mock_curl_sequence(Path(env["CURL_BIN"]), statuses, pause_marker=pause_marker)
+            if pause_marker is not None:
+                result = run_with_signal_on_marker(env, marker)
+            else:
+                result = run(env)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
+    up_count = sum(line.endswith(" up -d") for line in log.read_text().splitlines())
+    assert up_count == expected_up_count, (
+        f"axis {axis} executed {up_count} compose up calls, expected "
+        f"{expected_up_count}; log:\n{log.read_text()}"
+    )
+
+
+def test_probe_evidence_records_http_and_curl_exit_sequence(tmp_path):
+    env, _ = base(tmp_path)
+    env["HEALTHCHECK_RETRIES"] = "2"
+    mock_curl_status_exit_sequence(
+        Path(env["CURL_BIN"]), [("000", 28), ("000", 7)],
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "[deploy][evidence] probe-attempts url=http://localhost/frontend 000(curl=28),000(curl=7)" in out
+
+
+def test_rollback_evidence_is_emitted_before_rollback_deploy(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    evidence_positions = [
+        out.index("[deploy][evidence] compose-ps"),
+        out.index("[deploy][evidence] container-logs"),
+        out.index("[deploy][evidence] probe-attempts"),
+    ]
+    assert evidence_positions[2] < out.index("rolling back complete")
+    lines = log.read_text().splitlines()
+    evidence_commands = [
+        index for index, line in enumerate(lines)
+        if line == "compose ps" or line.startswith("compose logs ")
+    ]
+    rollback_up = [index for index, line in enumerate(lines) if line.endswith(" up -d")]
+    assert evidence_commands
+    assert rollback_up
+    assert max(evidence_commands) < max(rollback_up)
+
+
+def test_rollback_evidence_timeout_does_not_block_rollback(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env.update(D3_RELEASE_TAG="def567890123", EVIDENCE_TIMEOUT="1")
+    mock_curl_sequence(Path(env["CURL_BIN"]), ["500", "200", "200"])
+    mock_rollback_docker(Path(env["DOCKER_BIN"]), log, evidence_sleep=30)
+
+    started = time.monotonic()
+    result = run(env, timeout=8)
+    elapsed = time.monotonic() - started
+    out = result.stdout + result.stderr
+
+    assert result.returncode == 1, out
+    assert elapsed < 8, f"evidence timeout did not bound the deploy: {elapsed:.2f}s"
+    assert "compose-ps timed out after 1s" in out
+    assert "container-logs timed out after 1s" in out
+    assert sum(line.endswith(" up -d") for line in log.read_text().splitlines()) == 3
+
+
+def test_rollback_cd_failure_does_not_mark_mutated(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    log.write_text("")
+    mock_curl(Path(env["CURL_BIN"]), "500")
+    mock_rollback_docker(
+        Path(env["DOCKER_BIN"]), log,
+        remove_deploy_dir_on_rollback_config=Path(env["DEPLOY_DIR"]),
+        identity_gate_failed_tag=env["D3_RELEASE_TAG"],
+    )
+
+    result = run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not any(line.endswith(" up -d") for line in log.read_text().splitlines())
+
+
+def run(env, timeout=None):
+    return subprocess.run(
+        ["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
+        timeout=timeout,
+    )
+
+
+def run_with_signal_on_marker(env, marker):
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    deadline = time.time() + 3
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 def fail_mv_target(path: Path, suffix: str):
@@ -969,7 +1290,11 @@ def test_pending_signal_rechecked_after_promotion_trap_before_promote():
     idx_promote = text.index('promote "$D3_RELEASE_TAG"')
     assert idx_trap < idx_promote, "the promotion trap must be installed before promote() is called"
     between = text[idx_trap:idx_promote]
-    assert "check_pending" in between or "PENDING_SIGNAL" in between, (
+    assert any(
+        line.strip() == "if check_pending; then"
+        for line in between.splitlines()
+        if not line.lstrip().startswith("#")
+    ), (
         "a pending-signal recheck must appear between installing the promotion "
         "trap and calling promote() -- otherwise a signal that lands in the gap "
         "before the trap is installed gets recorded, then is silently ignored "

@@ -64,10 +64,11 @@ services:
 状态 `.deploy-state/release/last_good_release`（首行是 SHA，其余是完整 manifest 内容，同目录
 rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后尽力而为写入的兼容视图，
 供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
-`last_good_release` 为准。失败时按旧 manifest 整组回滚，首次发布没有旧版本则明确失败，
-不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死基镜像、锁定依赖，
-才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受支持——脚本会显式
-拒绝并保持容器现状，绝不做部分回滚，需要人工介入。
+`last_good_release` 为准。失败时按旧 manifest 整组回滚；回滚 compose 后还必须用同预算的
+`probe_release` 证明旧版本在应答，证明通过才返回 `rc=1`。首次发布没有旧版本时拒绝伪回滚，
+直接返回 `rc=4`，不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死
+基镜像、锁定依赖，才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受
+支持——脚本会显式拒绝并保持容器现状，返回 `rc=4`，绝不做部分回滚，需要立即人工介入。
 
 ## 调用方（每服务 ~10 行）
 
@@ -156,6 +157,105 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 机制细节、锁文件挂载约定、退出码表、验收矩阵见
 [`docs/design/d3-busy-lock-gate.md`](docs/design/d3-busy-lock-gate.md)。
 
+### 部署退出码与处置
+
+两条 lane 共用以下退出码语义。每次部署的生产状态和 on-call 处置以这张表为准：
+
+| 退出码 | 语义 | 生产状态 | on-call 处置 |
+|---|---|---|---|
+| `rc=0` | 新版本已上线且通过健康探针 | 新版本，已验证在应答 | 无需动作 |
+| `rc=1` | 新版本探针失败，已回滚，且**回滚后的同预算探针已通过** | `last_good`（单镜像 lane 为 `last_good_tag`，release lane 为 `last_good_release`），已验证在应答 | 不需要紧急上机 |
+| `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | 上一版本，完全未动 | 空闲后点黄卡按钮重跑 |
+| `rc=4` | 新版本不健康，且脚本未能证明生产停在一个健康版本上 | 不确定，可能不可用 | **立即上机** |
+| `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
+| `rc=255` | SSH 传输层失败 | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
+
+`rc=1` 有两种情形，但对 on-call 是同一条指引。
+
+**情形一：已执行回滚，且回滚后的旧版本在同一探针预算内通过了探针。** 这是本次新增的证明
+步骤；在此之前 `rc=1` 只证明回滚 compose 被执行过，并不证明旧版本真的在应答。注意 release
+lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门禁不通过）**也会落进这一类**
+——只要存在 `last_good_release`，脚本仍会执行一次旧版本的 `compose up -d` 并探针验证。
+也就是说生产确实发生过一次 compose 行为（旧版本可能被重启），只是结果已被证明健康。
+
+**情形二：本次运行从未执行过任何 `compose up -d`。** 只在没有 `last_good_release` 可回滚、
+新版本又没走到替换那一步时出现（release lane 特有），此时生产真的一动没动。
+
+两种情形下生产要么停在已验证的 `last_good`、要么根本没被碰过，都不需要紧急上机。
+`rc=1` 与 `rc=4` 的处置严格互斥。
+
+`rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署、
+`last_good` 等于本次 SHA）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
+release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollback）、镜像集较上次发布已变化
+而不支持回滚（rollback impossible）、回滚的 `deploy_group` 执行失败、回滚 compose 成功但
+`probe_release` 仍失败。无论来源是哪一项，`rc=4` 都表示生产可能不可用，不能按「未上线、无需处理」理解。
+
+但所有来源都受同一个前提约束：**本次发布必须已经实际执行过至少一次 `docker compose up -d`**
+（正向替换或回滚替换都算）。没碰过生产容器就绝不返回 `rc=4`——因为 `rc=4` 的紧急卡会 `@全员`
+说「生产可能不可用，必须立即上机」，而那时生产一动没动；这种误报会让这条唯一的强告警通道
+失去可信度，下次真的 `rc=4` 时反而被当噪音。
+
+这个前提也决定了 `rc=4` 与 `rc=130` 的优先级：已经替换过容器、又未能自证健康时返回 `4`，
+因为生产状态的坏消息比「被中断」更需要人知道；而尚未替换过容器时收到信号，就老实返回 `130`。
+飞书通知分流为：`rc=3` 发不 `@全员` 的延期黄卡；`rc=4` 发 `@全员` 的紧急卡，明确提示「生产可能不可用，
+必须立即上机」；其余失败发普通 P0 卡，并按失败 step 处置。
+
+### 回滚前现场取证
+
+回滚 compose 会永久销毁新版本容器的日志，因此脚本在**回滚之前**先把现场写入 workflow 日志：
+`docker compose ps`、容器尾部日志，以及探针每次尝试的 HTTP code 与 curl 退出码。三段证据统一使用
+`[deploy][evidence]` 前缀，格式分别是 `compose-ps`、`container-logs`、`probe-attempts`；例如：
+
+```
+[deploy][evidence] probe-attempts: 000(curl=28),000(curl=28),000(curl=7)
+```
+
+证据用于判断回滚是否可能是误判：探针序列全为 `000` 说明连不上（很可能只是服务还没起来），而
+`5xx` 说明服务活着但返回了坏结果。回滚前保留的这组信号，是 on-call 判断「刚才那次回滚是不是误判」
+的关键信息。
+
+### 探针预算与冷启动调参
+
+**两条 lane 的默认值不同**，因为单镜像 lane 的探针参数是 `build-deploy.yml` 的 workflow
+input（caller 不传就吃 input 的默认值），而 release lane 没有对应 input，直接吃脚本默认值：
+
+| 参数 | 单镜像 lane（workflow input） | release lane（脚本默认） |
+|---|---:|---:|
+| warmup | `10` 秒 | `5` 秒 |
+| retries | `5` 次 | `5` 次 |
+| interval | `3` 秒 | `3` 秒 |
+| timeout（每次 curl） | `5` 秒 | `5` 秒 |
+
+最坏耗时不是 `warmup + retries×(timeout+interval)`——**最后一次尝试之后不再 sleep**，
+所以 interval 只乘 `retries-1`：
+
+```
+单次探针最坏 = warmup + retries×timeout + (retries-1)×interval
+单镜像 lane  = 10 + 5×5 + 4×3 = 47 秒
+release lane = 5  + N×(5×5 + 4×3) = 5 + 37N 秒   # N = probes_json 里的探针条数
+             = 79 秒（N=2，即 README 上文推荐的 frontend + backend 两条）
+```
+
+release lane 的 N 个探针**共用一次 warmup、但各自跑满自己的重试预算**，所以探针数直接线性
+放大总时间。最好的情况都是 warmup 结束后首探即过。
+
+以上都是**单次探针**的预算，不是一次部署的总预算：回滚后的旧版本要**再独立跑一遍完整预算**
+才可以返回 `rc=1`。所以一次「探针失败 → 回滚」的部署最坏花在探针上的时间是上面的两倍——
+单镜像约 `47×2 = 94` 秒，release（N=2）约 `79×2 = 158` 秒，外加两次 `compose up -d`。
+**设置 job timeout 时按这个两倍值估算**，否则可能在回滚探针还没跑完时就被 timeout 砍掉，
+那时生产状态反而需要人工确认。
+
+Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务，应显式调大预算；否则服务可能只是
+尚未完成启动，就被判定为不健康并触发**误回滚**。但**能调什么按 lane 有硬性差别**：
+
+- **单镜像 lane**：caller 可传 `healthcheck_warmup` / `healthcheck_retries` /
+  `healthcheck_interval` 三项。**`healthcheck_timeout` 没有对应 input**，改不了
+  （硬编码走脚本默认 5 秒）；照着写会在 `workflow_call` 处报 `Unexpected input`。
+- **release lane**：探针预算**完全不可由 caller 调整**，`HEALTHCHECK_*` 一个都不经 SSH 传递，
+  全部走脚本默认值。这条 lane 上的慢启动服务目前只能靠自身启动更快，或先给本仓加 input。
+误回滚会在生产中连续做两次容器替换，可用性抖动是不回滚时的两倍。默认值本次刻意不改，因为静默
+调大它会改变 50+ 个存量服务的部署行为；请服务方根据自己的启动时间显式调参。
+
 ### 部署后镜像事实对账（单镜像 lane）
 
 `build-deploy.yml` 的健康探针通过后，还会在同一目标机上无条件对账三段事实：本次
@@ -164,7 +264,7 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过滤）。
 三段中任一不成立，workflow 判红并打印 expected / latest / running 的实际值；SSH
 对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
-延期和 `rc=1` 已回滚的部署不会执行对账。
+延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
 
 部署失败通知读取调用方 repo variables:
 - `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
@@ -189,7 +289,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
-| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚** | `pull_and_deploy.sh` `health_probe()` |
+| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账 | `build-deploy.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
 
@@ -241,7 +341,8 @@ python -m pytest -q
 ```
 
 - `test_registry_schema.py` —— 8 个坏 fixture（缺字段/重复 id/port/slug/路径、DSN 明文、heartbeat 明文、坏 enum）全部报错；好 registry 通过。
-- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚后探针、`rc=4` 分流、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_release_deploy.py` —— release lane 多镜像发布与整组回滚、回滚后探针、`rc=4` 分流（docker/curl mock，无需真实守护进程）。
 - `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
 - `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、caller 钉 `@v1` / canary 钉 `@main`。

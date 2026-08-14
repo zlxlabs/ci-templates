@@ -366,3 +366,113 @@ def test_release_busy_lock_and_compose_identity_contract():
     assert "json.dumps" in text
     assert 'python3 - "$webhook"' not in text
     assert '--data-binary @- "$webhook"' in text
+
+
+def test_release_rc4_output_and_notification_routing_contract():
+    raw, _ = load()
+    steps = raw["jobs"]["release"]["steps"]
+    text = WORKFLOW.read_text()
+
+    output = 'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"'
+    idx_non255 = text.index('if [[ "$rc" -ne 255 ]]; then')
+    idx_output = text.index(output, idx_non255)
+    idx_exit = text.index('exit "$rc"', idx_non255)
+    assert idx_non255 < idx_output < idx_exit
+    assert text.count(output) == 1
+
+    busy = next(step for step in steps if step.get("name") == "Feishu release busy defer card (yellow, fail-open)")
+    urgent = next(step for step in steps if step.get("name") == "Feishu release rollback unhealthy card (urgent, fail-open)")
+    ordinary = next(step for step in steps if step.get("name") == "Feishu release failure card (P0, fail-open)")
+    assert busy["if"] == "failure() && steps.deploy.outputs.busy_deferred == 'true'"
+    assert urgent["if"] == (
+        "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'"
+    )
+    assert ordinary["if"] == (
+        "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true'"
+    )
+    assert "production may be unavailable" in urgent["run"]
+    assert "immediate host intervention required" in urgent["run"]
+    assert "生产可能不可用，必须立即上机" in urgent["run"]
+    for field in ("SVC", "HOST", "REPO", "SHA", "RUN_URL"):
+        assert field in urgent["env"]
+    for label in ("服务:", "目标机:", "仓库:", "SHA:", "Run:"):
+        assert label in urgent["run"]
+    assert '"msg_type":"text"' in urgent["run"]
+    # 纯 text 消息的 @全员语法是 <at user_id="all">，卡片 lark_md 的那一套在这里不产生
+    # @ 效果，只会显示成字面文本。断言只盯真正发出去的 payload 行——run 块里的说明性
+    # 注释会同时提到两种语法，对整块做 not-in 会误伤。
+    payload_line = next(
+        line for line in urgent["run"].splitlines() if "json.dumps" in line
+    )
+    assert '<at user_id="all">' in payload_line
+    assert "<at id=all>" not in payload_line
+
+
+def test_release_notifications_surface_delivery_failures_without_changing_job_result():
+    raw, _ = load()
+    cards = [
+        next(step for step in raw["jobs"]["release"]["steps"] if step.get("name") == name)
+        for name in (
+            "Feishu release busy defer card (yellow, fail-open)",
+            "Feishu release rollback unhealthy card (urgent, fail-open)",
+            "Feishu release failure card (P0, fail-open)",
+        )
+    ]
+    for card in cards:
+        assert card["continue-on-error"] is True
+        assert "FEISHU_CI_WEBHOOK is not configured" in card["run"]
+        assert "request failed or timed out" in card["run"]
+        assert "response parse failed" in card["run"]
+        assert "json.loads" in card["run"]
+        assert "if ! python3 -" in card["run"]
+        assert 'result["code"]' in card["run"]
+        assert 'result.get("msg"' in card["run"]
+        assert "business error" in card["run"]
+
+
+def test_release_output_write_failures_do_not_skip_failure_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [[ "$rc" -ne 255 ]]; then')
+    end = text.index('had_transport_failure=1', start)
+    branch = text[start:end]
+    assert (
+        'echo "deploy_rc=${rc}" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert (
+        'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert (
+        'echo "busy_deferred=true" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert branch.index("::error::release deploy failed") < branch.index('exit "$rc"')
+
+
+def test_release_failure_card_has_remote_rc_split_and_identity_fields():
+    raw, _ = load()
+    ordinary = next(
+        step for step in raw["jobs"]["release"]["steps"]
+        if step.get("name") == "Feishu release failure card (P0, fail-open)"
+    )
+    assert ordinary["env"]["REMOTE_RC"] == "${{ steps.deploy.outputs.deploy_rc }}"
+    for field in ("SVC", "HOST", "REPO", "SHA", "RUN_URL"):
+        assert field in ordinary["env"]
+    for label in ("服务:", "目标机:", "仓库:", "SHA:", "远端 rc:", "Run:"):
+        assert label in ordinary["run"]
+    assert "rc=130" in ordinary["run"]
+    assert "立即确认远端状态" in ordinary["run"]
+    assert "rc=1" in ordinary["run"]
+    assert "生产停在已验证的 last_good，不需要紧急上机" in ordinary["run"]
+    assert "未知/更早阶段失败" in ordinary["run"]
+    # 拿不到 remote_rc 有两种成因、处置相反：更早阶段失败（生产没动）与 SSH 传输
+    # 255 耗尽（远端可能已推进）。卡片必须两种都讲，不能断言成前者——build-deploy.yml
+    # 早有留痕：本 run 出过 255 之后远端状态本质不确定。
+    assert "SSH 传输耗尽" in ordinary["run"]
+    assert "远端状态未知" in ordinary["run"]
+    assert "本次未上线，生产仍是上一版本" not in ordinary["run"], (
+        "拿不到远端 rc 时不得单方面断言「未上线」——SSH 传输耗尽也走这一支"
+    )

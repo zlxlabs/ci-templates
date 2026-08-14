@@ -48,6 +48,7 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"   # seconds between probes
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"       # seconds before first probe
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"     # per-probe curl timeout
+EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"           # per-evidence-command timeout
 
 # optional test/observability hooks
 DEPLOY_EVENT_LOG="${DEPLOY_EVENT_LOG:-}"
@@ -180,8 +181,8 @@ pull_image() {
 deploy_tag() {
   local tag="$1"
   log "deploying ${ACR_IMAGE}:${tag}"
-  pull_image "${ACR_IMAGE}:${tag}"
-  "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest"
+  pull_image "${ACR_IMAGE}:${tag}" || return $?
+  "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest" || return $?
   ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
 }
 
@@ -190,11 +191,21 @@ health_probe() {
   [ -z "$HEALTHCHECK_URL" ] && { log "no HEALTHCHECK_URL, skipping probe"; return 0; }
   log "warmup ${HEALTHCHECK_WARMUP}s before probing ${HEALTHCHECK_URL}"
   sleep "$HEALTHCHECK_WARMUP"
-  local attempt=1
+  local attempt=1 probe_attempts=""
   while [ "$attempt" -le "$HEALTHCHECK_RETRIES" ]; do
-    local code
-    code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' \
-             --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL" || true)"
+    local code curl_rc
+    if code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' \
+             --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL")"; then
+      curl_rc=0
+    else
+      curl_rc=$?
+    fi
+    [ -n "$code" ] || code="000"
+    if [ -n "$probe_attempts" ]; then
+      probe_attempts+=",${code}(curl=${curl_rc})"
+    else
+      probe_attempts="${code}(curl=${curl_rc})"
+    fi
     if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ]; then
       log "health probe OK (attempt ${attempt}, status ${code})"
       return 0
@@ -203,6 +214,7 @@ health_probe() {
     attempt=$((attempt + 1))
     [ "$attempt" -le "$HEALTHCHECK_RETRIES" ] && sleep "$HEALTHCHECK_INTERVAL"
   done
+  echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
   return 1
 }
 
@@ -211,7 +223,7 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good=""
+  local prev_good="" compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
 
   deploy_tag "$GIT_SHA"
@@ -224,16 +236,53 @@ do_deploy() {
   fi
 
   log "health probe FAILED for ${GIT_SHA}"
+  echo "[deploy][evidence] compose-ps:"
+  compose_ps=""
+  compose_ps="$(
+    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+      "$DOCKER_BIN" compose ps 2>&1
+  )" || compose_ps_rc=$?
+  if [ "$compose_ps_rc" -eq 124 ]; then
+    log "[deploy][evidence] compose-ps timed out after ${EVIDENCE_TIMEOUT}s"
+  elif [ "$compose_ps_rc" -ne 0 ]; then
+    log "[deploy][evidence] compose-ps failed (rc=${compose_ps_rc})"
+  fi
+  printf '%s\n' "$compose_ps" | sed 's/^/[deploy][evidence] /' || true
+  echo "[deploy][evidence] container-logs:"
+  container_logs=""
+  container_logs="$(
+    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+      "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1
+  )" || container_logs_rc=$?
+  if [ "$container_logs_rc" -eq 124 ]; then
+    log "[deploy][evidence] container-logs timed out after ${EVIDENCE_TIMEOUT}s"
+  elif [ "$container_logs_rc" -ne 0 ]; then
+    log "[deploy][evidence] container-logs failed (rc=${container_logs_rc})"
+  fi
+  printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
     log "rolling back to previous good tag ${prev_good}"
-    deploy_tag "$prev_good"
-    # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
-    log "rollback to ${prev_good} complete"
+    rollback_rc=0
+    deploy_tag "$prev_good" || rollback_rc=$?
+    if [ "$rollback_rc" -ne 0 ]; then
+      log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
+      event exit
+      return 4
+    fi
+    if health_probe; then
+      # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
+      log "rollback to ${prev_good} complete; old version passed the same-budget health probe"
+      event exit
+      return 1
+    fi
+    log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
+    event exit
+    return 4
   else
     log "no previous good tag to roll back to"
+    event exit
+    return 4
   fi
-  event exit
-  return 1
 }
 
 # --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----
