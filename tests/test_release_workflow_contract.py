@@ -366,3 +366,32 @@ def test_release_busy_lock_and_compose_identity_contract():
     assert "json.dumps" in text
     assert 'python3 - "$webhook"' not in text
     assert '--data-binary @- "$webhook"' in text
+
+
+def test_release_rc4_output_and_notification_routing_contract():
+    raw, _ = load()
+    steps = raw["jobs"]["release"]["steps"]
+    text = WORKFLOW.read_text()
+
+    output = 'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"'
+    idx_non255 = text.index('if [[ "$rc" -ne 255 ]]; then')
+    idx_output = text.index(output, idx_non255)
+    idx_exit = text.index('exit "$rc"', idx_non255)
+    assert idx_non255 < idx_output < idx_exit
+    assert text.count(output) == 1
+
+    busy = next(step for step in steps if step.get("name") == "Feishu release busy defer card (yellow, fail-open)")
+    urgent = next(step for step in steps if step.get("name") == "Feishu release rollback unhealthy card (urgent, fail-open)")
+    ordinary = next(step for step in steps if step.get("name") == "Feishu release failure card (P0, fail-open)")
+    assert busy["if"] == "failure() && steps.deploy.outputs.busy_deferred == 'true'"
+    assert urgent["if"] == (
+        "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'"
+    )
+    assert ordinary["if"] == (
+        "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true'"
+    )
+    assert "production may be unavailable" in urgent["run"]
+    assert "immediate host intervention required" in urgent["run"]
+    assert "生产可能不可用，必须立即上机" in urgent["run"]
