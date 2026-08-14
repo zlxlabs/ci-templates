@@ -120,7 +120,7 @@ exit "${{exit_codes[$((n - 1))]}}"
 
 
 def mock_rollback_docker(path: Path, log: Path, *, image_names=("frontend", "backend"),
-                         rollback_rc=0, rollback_marker=None):
+                         rollback_rc=0, rollback_marker=None, evidence_sleep=0.0):
     count_file = log.parent / "compose-up.count"
     rendered = "".join(f"{name}:%s\\n" for name in image_names)
     rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
@@ -133,6 +133,9 @@ echo "$@" >> "{log}"
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   printf '{rendered}' {rendered_args}
   exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
+  sleep {evidence_sleep}
 fi
 if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
   n=$(cat "{count_file}" 2>/dev/null || echo 0)
@@ -329,8 +332,30 @@ def test_rollback_evidence_is_emitted_before_rollback_deploy(tmp_path):
     assert max(evidence_commands) < max(rollback_up)
 
 
-def run(env):
-    return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+def test_rollback_evidence_timeout_does_not_block_rollback(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env.update(D3_RELEASE_TAG="def567890123", EVIDENCE_TIMEOUT="1")
+    mock_curl_sequence(Path(env["CURL_BIN"]), ["500", "200", "200"])
+    mock_rollback_docker(Path(env["DOCKER_BIN"]), log, evidence_sleep=30)
+
+    started = time.monotonic()
+    result = run(env, timeout=8)
+    elapsed = time.monotonic() - started
+    out = result.stdout + result.stderr
+
+    assert result.returncode == 1, out
+    assert elapsed < 8, f"evidence timeout did not bound the deploy: {elapsed:.2f}s"
+    assert "compose-ps timed out after 1s" in out
+    assert "container-logs timed out after 1s" in out
+    assert sum(line.endswith(" up -d") for line in log.read_text().splitlines()) == 3
+
+
+def run(env, timeout=None):
+    return subprocess.run(
+        ["bash", str(SCRIPT)], env=env, capture_output=True, text=True,
+        timeout=timeout,
+    )
 
 
 def run_with_signal_on_marker(env, marker):

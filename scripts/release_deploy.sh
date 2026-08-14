@@ -99,6 +99,7 @@ HEALTHCHECK_RETRIES="${HEALTHCHECK_RETRIES:-5}"
 HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
+EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 
@@ -490,7 +491,13 @@ do_release() {
       log "rolling back complete image group to ${previous_sha}"
       local evidence_output evidence_rc evidence_line
       evidence_rc=0
-      evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose ps 2>&1)" || evidence_rc=$?
+      evidence_output="$(cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+        "$DOCKER_BIN" compose ps 2>&1)" || evidence_rc=$?
+      if (( evidence_rc == 124 )); then
+        log "[deploy][evidence] compose-ps timed out after ${EVIDENCE_TIMEOUT}s"
+      elif (( evidence_rc != 0 )); then
+        log "[deploy][evidence] compose-ps failed (rc=${evidence_rc})"
+      fi
       echo "[deploy][evidence] compose-ps rc=${evidence_rc}"
       if [[ -n "$evidence_output" ]]; then
         while IFS= read -r evidence_line; do
@@ -499,7 +506,13 @@ do_release() {
       fi
 
       evidence_rc=0
-      evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose logs --no-color --tail 100 2>&1)" || evidence_rc=$?
+      evidence_output="$(cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+        "$DOCKER_BIN" compose logs --no-color --tail 100 2>&1)" || evidence_rc=$?
+      if (( evidence_rc == 124 )); then
+        log "[deploy][evidence] container-logs timed out after ${EVIDENCE_TIMEOUT}s"
+      elif (( evidence_rc != 0 )); then
+        log "[deploy][evidence] container-logs failed (rc=${evidence_rc})"
+      fi
       echo "[deploy][evidence] container-logs rc=${evidence_rc}"
       if [[ -n "$evidence_output" ]]; then
         while IFS= read -r evidence_line; do
