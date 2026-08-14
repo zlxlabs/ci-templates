@@ -223,7 +223,7 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good=""
+  local prev_good="" compose_ps container_logs
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
 
   deploy_tag "$GIT_SHA"
@@ -236,6 +236,16 @@ do_deploy() {
   fi
 
   log "health probe FAILED for ${GIT_SHA}"
+  echo "[deploy][evidence] compose-ps:"
+  compose_ps="$(
+    cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose ps 2>&1 || true
+  )"
+  printf '%s\n' "$compose_ps" | sed 's/^/[deploy][evidence] /' || true
+  echo "[deploy][evidence] container-logs:"
+  container_logs="$(
+    cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1 || true
+  )"
+  printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
     log "rolling back to previous good tag ${prev_good}"
     deploy_tag "$prev_good"
