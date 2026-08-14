@@ -486,7 +486,6 @@ do_release() {
     fi
     if [[ "${#old_names[@]}" -eq 0 || "${#cur_names[@]}" -eq 0 || "${#added[@]}" -gt 0 || "${#removed[@]}" -gt 0 ]]; then
       log "rollback impossible: image set changed since last good release (added: ${added[*]:-none} / removed: ${removed[*]:-none}); manual intervention required, containers left as-is" >&2
-      rollback_rc=4
     else
       log "rolling back complete image group to ${previous_sha}"
       local evidence_output evidence_rc evidence_line
@@ -528,7 +527,6 @@ do_release() {
     fi
   else
     log "no previous good release available; refusing pseudo-rollback" >&2
-    rollback_rc=4
   fi
   if (( MUTATED == 1 && rollback_healthy == 0 )); then
     return 4
