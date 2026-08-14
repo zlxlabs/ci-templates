@@ -309,8 +309,10 @@ compose_release() {
   check_pending || return 130
   compose_args+=(up -d)
   local compose_rc=0
-  (cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
-  MUTATED=1
+  # 200 is outside Docker/Compose's documented 0-125 process exit range, so
+  # reserve it as a private sentinel for a failed cd before docker is called.
+  (cd "$DEPLOY_DIR" || exit 200; D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
+  (( compose_rc != 200 )) && MUTATED=1
   check_pending || return 130
   return "$compose_rc"
 }

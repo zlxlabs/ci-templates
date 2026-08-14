@@ -120,18 +120,35 @@ exit "${{exit_codes[$((n - 1))]}}"
 
 
 def mock_rollback_docker(path: Path, log: Path, *, image_names=("frontend", "backend"),
-                         rollback_rc=0, rollback_marker=None, evidence_sleep=0.0):
+                         rollback_rc=0, rollback_marker=None, evidence_sleep=0.0,
+                         remove_deploy_dir_on_rollback_config: Path | None = None,
+                         identity_gate_failed_tag: str | None = None):
     count_file = log.parent / "compose-up.count"
     rendered = "".join(f"{name}:%s\\n" for name in image_names)
     rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
     marker_line = f'touch "{rollback_marker}"' if rollback_marker else ":"
     sleep_line = "sleep 0.25" if rollback_marker else ":"
+    remove_line = ":"
+    if remove_deploy_dir_on_rollback_config is not None:
+        deploy_dir = str(remove_deploy_dir_on_rollback_config)
+        remove_line = f'mv -- "{deploy_dir}" "{deploy_dir}.gone"'
+    if identity_gate_failed_tag is None:
+        rendered_config = f"  printf '{rendered}' {rendered_args}"
+    else:
+        rendered_config = f'''  if [ "$D3_RELEASE_TAG" = "{identity_gate_failed_tag}" ]; then
+    printf 'frontend:latest\\nbackend:latest\\n'
+  else
+    printf '{rendered}' {rendered_args}
+  fi'''
     write_exec(
         path,
         f'''#!/bin/bash
 echo "$@" >> "{log}"
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
-  printf '{rendered}' {rendered_args}
+{rendered_config}
+  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
+    {remove_line}
+  fi
   exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
@@ -349,6 +366,24 @@ def test_rollback_evidence_timeout_does_not_block_rollback(tmp_path):
     assert "compose-ps timed out after 1s" in out
     assert "container-logs timed out after 1s" in out
     assert sum(line.endswith(" up -d") for line in log.read_text().splitlines()) == 3
+
+
+def test_rollback_cd_failure_does_not_mark_mutated(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    log.write_text("")
+    mock_curl(Path(env["CURL_BIN"]), "500")
+    mock_rollback_docker(
+        Path(env["DOCKER_BIN"]), log,
+        remove_deploy_dir_on_rollback_config=Path(env["DEPLOY_DIR"]),
+        identity_gate_failed_tag=env["D3_RELEASE_TAG"],
+    )
+
+    result = run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not any(line.endswith(" up -d") for line in log.read_text().splitlines())
 
 
 def run(env, timeout=None):
