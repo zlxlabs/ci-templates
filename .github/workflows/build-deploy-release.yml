@@ -366,18 +366,34 @@ jobs:
         env:
           FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          SVC: ${{ github.event.repository.name }}
+          HOST: ${{ inputs.host }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u
           webhook="${FEISHU_CI_WEBHOOK:-}"
           [[ -n "$webhook" ]] || exit 0
           python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
-          import json, sys
+          import json, os, sys
+          svc = os.environ.get("SVC", "") or "?"
+          host = os.environ.get("HOST", "") or "?"
+          repo = os.environ.get("REPO", "") or "?"
+          sha = os.environ.get("SHA", "") or "?"
+          run_url = os.environ.get("RUN_URL", "") or "?"
+          body = (f'{sys.argv[1]} D3 release rollback unhealthy\n'
+                  f'服务: {svc} · 目标机: {host}\n'
+                  f'仓库: {repo} · SHA: {sha}\n'
+                  f'Run: {run_url}\n'
+                  f'production may be unavailable; immediate host intervention required '
+                  f'(生产可能不可用，必须立即上机)')
           # @全员的语法按消息类型分两套,不能互换(飞书自定义机器人文档):
           #   msg_type=text     -> <at user_id="all">所有人</at>
           #   卡片的 lark_md    -> <at id=all></at>
           # 本 lane 三张卡都是纯 text,用错成卡片语法不会报错,只会把标记当字面文本显示出来,
           # 静默失去 @ 效果 —— 而这张卡的全部价值就是把人叫醒。
-          print(json.dumps({"msg_type":"text", "content":{"text":f'{sys.argv[1]} D3 release rollback unhealthy: production may be unavailable; immediate host intervention required (生产可能不可用，必须立即上机) <at user_id="all">所有人</at>'}}))
+          print(json.dumps({"msg_type":"text", "content":{"text":body + ' <at user_id="all">所有人</at>'}}))
           PY
 
       - name: Feishu release failure card (P0, fail-open)

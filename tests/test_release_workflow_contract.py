@@ -395,6 +395,10 @@ def test_release_rc4_output_and_notification_routing_contract():
     assert "production may be unavailable" in urgent["run"]
     assert "immediate host intervention required" in urgent["run"]
     assert "生产可能不可用，必须立即上机" in urgent["run"]
+    for field in ("SVC", "HOST", "REPO", "SHA", "RUN_URL"):
+        assert field in urgent["env"]
+    for label in ("服务:", "目标机:", "仓库:", "SHA:", "Run:"):
+        assert label in urgent["run"]
     assert '"msg_type":"text"' in urgent["run"]
     # 纯 text 消息的 @全员语法是 <at user_id="all">，卡片 lark_md 的那一套在这里不产生
     # @ 效果，只会显示成字面文本。断言只盯真正发出去的 payload 行——run 块里的说明性
