@@ -395,3 +395,5 @@ def test_release_rc4_output_and_notification_routing_contract():
     assert "production may be unavailable" in urgent["run"]
     assert "immediate host intervention required" in urgent["run"]
     assert "生产可能不可用，必须立即上机" in urgent["run"]
+    assert '"msg_type":"text"' in urgent["run"]
+    assert "<at id=all></at>" in urgent["run"]
