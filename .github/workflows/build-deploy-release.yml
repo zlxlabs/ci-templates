@@ -314,7 +314,9 @@ jobs:
             # failure has already rolled back (or reported first-deploy failure)
             # and must not be replayed.
             if [[ "$rc" -ne 255 ]]; then
-              if [[ "$rc" -eq 3 ]]; then
+              if [[ "$rc" -eq 4 ]]; then
+                echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"
+              elif [[ "$rc" -eq 3 ]]; then
                 if [[ "$had_transport_failure" -eq 1 ]]; then
                   # Design decision (2026-07-24 subtractive refactor: dropped the
                   # post-255 auto-promotion machine). Once this run has seen a 255,
@@ -358,8 +360,23 @@ jobs:
           print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release deferred: service busy"}}))
           PY
 
+      - name: Feishu release rollback unhealthy card (urgent, fail-open)
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
+        continue-on-error: true
+        env:
+          FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+        run: |
+          set -u
+          webhook="${FEISHU_CI_WEBHOOK:-}"
+          [[ -n "$webhook" ]] || exit 0
+          python3 - "${FEISHU_CI_TITLE_PREFIX:-[zlxlabs·CI]}" <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" >/dev/null || true
+          import json, sys
+          print(json.dumps({"msg_type":"text", "content":{"text":f"{sys.argv[1]} D3 release rollback unhealthy: production may be unavailable; immediate host intervention required (生产可能不可用，必须立即上机)"}}))
+          PY
+
       - name: Feishu release failure card (P0, fail-open)
-        if: failure() && steps.deploy.outputs.busy_deferred != 'true'
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
         continue-on-error: true
         env:
           FEISHU_CI_WEBHOOK: ${{ vars.FEISHU_CI_WEBHOOK }}
