@@ -442,6 +442,44 @@ def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
     assert "rollback to old1111 failed" in result.stdout
 
 
+def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0)],
+        ),
+    )
+    docker_log = Path(env["DOCKER_LOG"])
+    compose_count = tmp_path / "compose-up.count"
+    _write_exec(
+        mock_dir / "docker",
+        f'''#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+  count=$(cat "{compose_count}" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "{compose_count}"
+  [ "$count" -eq 2 ] && exit 23
+fi
+exit 0
+''',
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert good.read_text().strip() == "old1111"
+    assert "rollback to old1111 failed" in result.stdout
+    assert "rollback to old1111 complete" not in result.stdout
+
+
 def test_concurrent_same_host_deploys_serialize(tmp_path):
     """Two deploys sharing HOST_LOCK must not run their critical sections at once."""
     mock_dir = tmp_path / "bin"
