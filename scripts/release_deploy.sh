@@ -313,23 +313,32 @@ compose_release() {
 }
 
 probe_release() {
-  local i attempt code
+  local i attempt code curl_rc attempt_sequence
   (( ${#PROBE_URLS[@]} == 0 )) && { log "no release probes declared"; return 0; }
   check_pending || return 130
   sleep "$HEALTHCHECK_WARMUP"
   check_pending || return 130
   for ((i = 0; i < ${#PROBE_URLS[@]}; i++)); do
     attempt=1
+    attempt_sequence=""
     while (( attempt <= HEALTHCHECK_RETRIES )); do
       check_pending || return 130
-      code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' --max-time "$HEALTHCHECK_TIMEOUT" "${PROBE_URLS[$i]}" 2>/dev/null || true)"
+      curl_rc=0
+      code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' --max-time "$HEALTHCHECK_TIMEOUT" "${PROBE_URLS[$i]}" 2>/dev/null)" || curl_rc=$?
+      [[ -n "$code" ]] || code="000"
+      [[ -z "$attempt_sequence" ]] || attempt_sequence+=","
+      attempt_sequence+="${code}(curl=${curl_rc})"
       check_pending || return 130
       if [[ "$code" == "${PROBE_STATUS[$i]}" ]]; then break; fi
       log "probe ${PROBE_URLS[$i]} got ${code}, want ${PROBE_STATUS[$i]} (${attempt}/${HEALTHCHECK_RETRIES})"
-      if (( attempt == HEALTHCHECK_RETRIES )); then return 1; fi
+      if (( attempt == HEALTHCHECK_RETRIES )); then
+        log "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
+        return 1
+      fi
       sleep "$HEALTHCHECK_INTERVAL"
       attempt=$((attempt + 1))
     done
+    log "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
   done
   return 0
 }
@@ -477,6 +486,25 @@ do_release() {
       log "rollback impossible: image set changed since last good release (added: ${added[*]:-none} / removed: ${removed[*]:-none}); manual intervention required, containers left as-is" >&2
     else
       log "rolling back complete image group to ${previous_sha}"
+      local evidence_output evidence_rc evidence_line
+      evidence_rc=0
+      evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose ps 2>&1)" || evidence_rc=$?
+      log "[deploy][evidence] compose-ps rc=${evidence_rc}"
+      if [[ -n "$evidence_output" ]]; then
+        while IFS= read -r evidence_line; do
+          log "[deploy][evidence] compose-ps ${evidence_line}"
+        done <<< "$evidence_output"
+      fi
+
+      evidence_rc=0
+      evidence_output="$(cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose logs --no-color --tail 100 2>&1)" || evidence_rc=$?
+      log "[deploy][evidence] container-logs rc=${evidence_rc}"
+      if [[ -n "$evidence_output" ]]; then
+        while IFS= read -r evidence_line; do
+          log "[deploy][evidence] container-logs ${evidence_line}"
+        done <<< "$evidence_output"
+      fi
+
       # Once rollback starts, a second signal must not interrupt the group
       # transition or leave the host on a half-staged release.
       ROLLBACK_MODE=1

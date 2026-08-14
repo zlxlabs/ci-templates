@@ -100,6 +100,25 @@ if [ "$n" -eq 1 ]; then {marker_line}; fi
     )
 
 
+def mock_curl_status_exit_sequence(path: Path, attempts):
+    count_file = path.parent / "curl.count"
+    statuses = " ".join(status for status, _ in attempts)
+    exit_codes = " ".join(str(rc) for _, rc in attempts)
+    write_exec(
+        path,
+        f'''#!/bin/bash
+count_file="{count_file}"
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$count_file"
+statuses=({statuses})
+exit_codes=({exit_codes})
+printf '%s' "${{statuses[$((n - 1))]}}"
+exit "${{exit_codes[$((n - 1))]}}"
+''',
+    )
+
+
 def mock_rollback_docker(path: Path, log: Path, *, image_names=("frontend", "backend"),
                          rollback_rc=0, rollback_marker=None):
     count_file = log.parent / "compose-up.count"
@@ -231,6 +250,45 @@ exit 0
             result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
     assert result.returncode == expected_rc, result.stdout + result.stderr
+
+
+def test_probe_evidence_records_http_and_curl_exit_sequence(tmp_path):
+    env, _ = base(tmp_path)
+    env["HEALTHCHECK_RETRIES"] = "2"
+    mock_curl_status_exit_sequence(
+        Path(env["CURL_BIN"]), [("000", 28), ("000", 7)],
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    assert "[deploy][evidence] probe-attempts url=http://localhost/frontend 000(curl=28),000(curl=7)" in out
+
+
+def test_rollback_evidence_is_emitted_before_rollback_deploy(tmp_path):
+    env, log = base(tmp_path)
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    mock_curl(Path(env["CURL_BIN"]), "500")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0
+    evidence_positions = [
+        out.index("[deploy][evidence] compose-ps"),
+        out.index("[deploy][evidence] container-logs"),
+        out.index("[deploy][evidence] probe-attempts"),
+    ]
+    assert evidence_positions[2] < out.index("rolling back complete")
+    lines = log.read_text().splitlines()
+    evidence_commands = [
+        index for index, line in enumerate(lines)
+        if line == "compose ps" or line.startswith("compose logs ")
+    ]
+    rollback_up = [index for index, line in enumerate(lines) if line.endswith(" up -d")]
+    assert evidence_commands
+    assert rollback_up
+    assert max(evidence_commands) < max(rollback_up)
 
 
 def run(env):
