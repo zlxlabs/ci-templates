@@ -404,3 +404,19 @@ def test_release_rc4_output_and_notification_routing_contract():
     )
     assert '<at user_id="all">' in payload_line
     assert "<at id=all>" not in payload_line
+
+
+def test_release_output_write_failures_do_not_skip_failure_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [[ "$rc" -ne 255 ]]; then')
+    end = text.index('had_transport_failure=1', start)
+    branch = text[start:end]
+    assert (
+        'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert (
+        'echo "busy_deferred=true" >> "$GITHUB_OUTPUT" || '
+        'echo "::warning::'
+    ) in branch
+    assert branch.index("::error::release deploy failed") < branch.index('exit "$rc"')

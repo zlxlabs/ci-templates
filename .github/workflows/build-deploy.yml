@@ -316,12 +316,12 @@ jobs:
                 # 确认一次,成本低于维护这套证明机器。
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
               fi
-              echo "deferred=true" >> "$GITHUB_OUTPUT"
+              echo "deferred=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deferred output"
               echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
               exit 3
             fi
             if [ "$rc" -eq 4 ]; then
-              echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"
+              echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
               echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required"
               exit 4
             fi

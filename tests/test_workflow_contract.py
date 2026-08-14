@@ -170,6 +170,26 @@ def test_rollback_unhealthy_rc4_is_routed_before_transport_guard():
     assert 'exit 4' in text
 
 
+def test_deploy_output_write_failures_do_not_skip_rc4_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [ "$rc" -eq 4 ]; then')
+    end = text.index('if [ "$rc" -ne 255 ]; then', start)
+    branch = text[start:end]
+    output = 'echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"'
+    assert f'{output} || echo "::warning::' in branch
+    assert branch.index("::error::") < branch.index("exit 4")
+
+
+def test_deferred_output_write_failure_does_not_skip_rc3_exit():
+    text = WORKFLOW.read_text()
+    start = text.index('if [ "$rc" -eq 3 ]; then')
+    end = text.index('if [ "$rc" -eq 4 ]; then', start)
+    branch = text[start:end]
+    output = 'echo "deferred=true" >> "$GITHUB_OUTPUT"'
+    assert f'{output} || echo "::warning::' in branch
+    assert branch.index("::warning::deploy DEFERRED") < branch.index("exit 3")
+
+
 def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
     text = WORKFLOW.read_text()
     assert "failure() && steps.deploy.outputs.deferred == 'true'" in text

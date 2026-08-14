@@ -315,7 +315,7 @@ jobs:
             # and must not be replayed.
             if [[ "$rc" -ne 255 ]]; then
               if [[ "$rc" -eq 4 ]]; then
-                echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT"
+                echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
               elif [[ "$rc" -eq 3 ]]; then
                 if [[ "$had_transport_failure" -eq 1 ]]; then
                   # Design decision (2026-07-24 subtractive refactor: dropped the
@@ -330,7 +330,7 @@ jobs:
                   # cheaper than maintaining that machine.
                   echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
                 fi
-                echo "busy_deferred=true" >> "$GITHUB_OUTPUT"
+                echo "busy_deferred=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write busy_deferred output"
               fi
               echo "::error::release deploy failed (rc=${rc}); no transport retry"
               exit "$rc"
