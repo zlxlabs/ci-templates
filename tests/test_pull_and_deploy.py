@@ -419,6 +419,8 @@ def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
     mock_dir.mkdir()
     env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
     env["GIT_SHA"] = "new2222"
+    env["PULL_RETRIES"] = "1"
+    env["PULL_RETRY_DELAY"] = "0"
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     good.parent.mkdir(parents=True)
     good.write_text("old1111\n")

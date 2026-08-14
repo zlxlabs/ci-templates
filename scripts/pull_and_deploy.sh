@@ -180,8 +180,8 @@ pull_image() {
 deploy_tag() {
   local tag="$1"
   log "deploying ${ACR_IMAGE}:${tag}"
-  pull_image "${ACR_IMAGE}:${tag}"
-  "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest"
+  pull_image "${ACR_IMAGE}:${tag}" || return $?
+  "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest" || return $?
   ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
 }
 
