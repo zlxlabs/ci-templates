@@ -245,8 +245,14 @@ release lane 的 N 个探针**共用一次 warmup、但各自跑满自己的重�
 **设置 job timeout 时按这个两倍值估算**，否则可能在回滚探针还没跑完时就被 timeout 砍掉，
 那时生产状态反而需要人工确认。
 
-Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务，应在 caller 中显式调大预算，尤其是
-warmup、retries 或 timeout；否则服务可能只是尚未完成启动，就被判定为不健康并触发**误回滚**。
+Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务，应显式调大预算；否则服务可能只是
+尚未完成启动，就被判定为不健康并触发**误回滚**。但**能调什么按 lane 有硬性差别**：
+
+- **单镜像 lane**：caller 可传 `healthcheck_warmup` / `healthcheck_retries` /
+  `healthcheck_interval` 三项。**`healthcheck_timeout` 没有对应 input**，改不了
+  （硬编码走脚本默认 5 秒）；照着写会在 `workflow_call` 处报 `Unexpected input`。
+- **release lane**：探针预算**完全不可由 caller 调整**，`HEALTHCHECK_*` 一个都不经 SSH 传递，
+  全部走脚本默认值。这条 lane 上的慢启动服务目前只能靠自身启动更快，或先给本仓加 input。
 误回滚会在生产中连续做两次容器替换，可用性抖动是不回滚时的两倍。默认值本次刻意不改，因为静默
 调大它会改变 50+ 个存量服务的部署行为；请服务方根据自己的启动时间显式调参。
 
