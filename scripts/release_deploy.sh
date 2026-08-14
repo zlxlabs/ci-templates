@@ -529,11 +529,10 @@ do_release() {
     log "no previous good release available; refusing pseudo-rollback" >&2
     rollback_rc=4
   fi
-  if (( rollback_attempted == 1 && rollback_healthy == 0 )); then
+  if (( rollback_attempted == 1 && rollback_healthy == 0 )) || (( rollback_rc == 4 )); then
     return 4
   fi
   [[ -n "$PENDING_SIGNAL" ]] && return 130
-  (( rollback_rc == 4 )) && return 4
   return 1
 }
 
