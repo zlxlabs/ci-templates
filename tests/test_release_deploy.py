@@ -1,6 +1,7 @@
 """TDD tests for atomic multi-image release deployment on the SSH host."""
 
 import os
+import pytest
 import signal
 import stat
 import subprocess
@@ -79,6 +80,157 @@ def base(tmp_path, *, status="200", compose_rc=0, fail_pull=False, fail_tag=Fals
         PULL_RETRY_DELAY="0",
     )
     return env, log
+
+
+def mock_curl_sequence(path: Path, statuses, *, pause_marker=None):
+    count_file = path.parent / "curl.count"
+    values = " ".join(statuses)
+    marker_line = f'touch "{pause_marker}"; sleep 0.25' if pause_marker else ":"
+    write_exec(
+        path,
+        f'''#!/bin/bash
+count_file="{count_file}"
+n=$(cat "$count_file" 2>/dev/null || echo 0)
+n=$((n + 1))
+echo "$n" > "$count_file"
+statuses=({values})
+printf '%s' "${{statuses[$((n - 1))]}}"
+if [ "$n" -eq 1 ]; then {marker_line}; fi
+''',
+    )
+
+
+def mock_rollback_docker(path: Path, log: Path, *, image_names=("frontend", "backend"),
+                         rollback_rc=0, rollback_marker=None):
+    count_file = log.parent / "compose-up.count"
+    rendered = "".join(f"{name}:%s\\n" for name in image_names)
+    rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
+    marker_line = f'touch "{rollback_marker}"' if rollback_marker else ":"
+    sleep_line = "sleep 0.25" if rollback_marker else ":"
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf '{rendered}' {rendered_args}
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  n=$(cat "{count_file}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "{count_file}"
+  if [ "$n" -ge 2 ]; then
+    {marker_line}
+    {sleep_line}
+    exit {rollback_rc}
+  fi
+fi
+exit 0
+''',
+    )
+
+
+@pytest.mark.parametrize(
+    ("axis", "expected_rc"),
+    [
+        ("healthy", 0),
+        ("no_previous_good", 4),
+        ("image_set_changed", 4),
+        ("rollback_compose_failed", 4),
+        ("rollback_healthy", 1),
+        ("rollback_unhealthy", 4),
+        ("signal_before_rollback", 130),
+        ("rollback_unhealthy_pending_signal", 4),
+        ("rollback_healthy_pending_signal", 130),
+    ],
+)
+def test_release_outcome_axis_table(tmp_path, axis, expected_rc):
+    env, log = base(tmp_path)
+    if axis == "healthy":
+        result = run(env)
+    elif axis == "no_previous_good":
+        mock_curl(Path(env["CURL_BIN"]), "500")
+        result = run(env)
+    else:
+        assert run(env).returncode == 0
+        env["D3_RELEASE_TAG"] = "def567890123"
+
+        if axis == "image_set_changed":
+            changed_manifest = tmp_path / "release2.manifest"
+            changed_manifest.write_text(
+                "D3_RELEASE_MANIFEST=1\n"
+                "image\tfrontend\tfrontend\n"
+                "image\tbackend2\tbackend2\n"
+                "probe\thttp://localhost/frontend\t200\n"
+                "probe\thttp://localhost/api/health\t200\n"
+            )
+            env["RELEASE_MANIFEST"] = str(changed_manifest)
+            mock_rollback_docker(Path(env["DOCKER_BIN"]), log, image_names=("frontend", "backend2"))
+            mock_curl(Path(env["CURL_BIN"]), "500")
+            result = run(env)
+        elif axis in {"rollback_compose_failed", "rollback_healthy", "rollback_unhealthy"}:
+            rollback_rc = 1 if axis == "rollback_compose_failed" else 0
+            mock_rollback_docker(Path(env["DOCKER_BIN"]), log, rollback_rc=rollback_rc)
+            statuses = ["500", "500"]
+            if axis == "rollback_healthy":
+                statuses = ["500", "200", "200"]
+            else:
+                statuses = ["500", "500"]
+            mock_curl_sequence(Path(env["CURL_BIN"]), statuses)
+            result = run(env)
+        elif axis == "signal_before_rollback":
+            marker = tmp_path / "new-compose.started"
+            count_file = tmp_path / "compose-up.count"
+            write_exec(
+                Path(env["DOCKER_BIN"]),
+                f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  n=$(cat "{count_file}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "{count_file}"
+  if [ "$n" -eq 1 ]; then touch "{marker}"; sleep 0.25; fi
+fi
+exit 0
+''',
+            )
+            proc = subprocess.Popen(
+                ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            deadline = time.time() + 3
+            while time.time() < deadline and not marker.exists():
+                time.sleep(0.01)
+            proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=5)
+            result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+        else:
+            marker = tmp_path / "probe.started"
+            mock_rollback_docker(
+                Path(env["DOCKER_BIN"]), log,
+            )
+            statuses = ["500", "200", "200"]
+            if axis == "rollback_unhealthy_pending_signal":
+                statuses = ["500", "500"]
+            pause_marker = marker if axis.endswith("pending_signal") else None
+            mock_curl_sequence(Path(env["CURL_BIN"]), statuses, pause_marker=pause_marker)
+            proc = subprocess.Popen(
+                ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, text=True,
+            )
+            deadline = time.time() + 3
+            while time.time() < deadline and pause_marker is not None and not marker.exists():
+                time.sleep(0.01)
+            if pause_marker is not None:
+                proc.send_signal(signal.SIGTERM)
+            stdout, stderr = proc.communicate(timeout=5)
+            result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
 
 
 def run(env):
