@@ -197,6 +197,26 @@ release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollba
 `5xx` 说明服务活着但返回了坏结果。回滚前保留的这组信号，是 on-call 判断「刚才那次回滚是不是误判」
 的关键信息。
 
+### 探针预算与冷启动调参
+
+当前默认探针预算为：
+
+| 参数 | 默认值 |
+|---|---:|
+| `HEALTHCHECK_WARMUP` | `5` 秒 |
+| `HEALTHCHECK_RETRIES` | `5` 次 |
+| `HEALTHCHECK_INTERVAL` | `3` 秒 |
+| `HEALTHCHECK_TIMEOUT` | `5` 秒 |
+
+最坏耗时约为 `HEALTHCHECK_WARMUP + HEALTHCHECK_RETRIES × (HEALTHCHECK_TIMEOUT + HEALTHCHECK_INTERVAL)`，
+即 `5 + 5×(5+3) = 45` 秒；最好是 warmup 结束后首探立即通过，也就是 5 秒后判定成功。服务方应把
+这组值当作一次部署和回滚共同使用的预算：回滚后的旧版本也必须在同一预算内通过，才可以返回 `rc=1`。
+
+Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务，应在 caller 中显式调大预算，尤其是
+warmup、retries 或 timeout；否则服务可能只是尚未完成启动，就被判定为不健康并触发**误回滚**。
+误回滚会在生产中连续做两次容器替换，可用性抖动是不回滚时的两倍。默认值本次刻意不改，因为静默
+调大它会改变 50+ 个存量服务的部署行为；请服务方根据自己的启动时间显式调参。
+
 ### 部署后镜像事实对账（单镜像 lane）
 
 `build-deploy.yml` 的健康探针通过后，还会在同一目标机上无条件对账三段事实：本次
