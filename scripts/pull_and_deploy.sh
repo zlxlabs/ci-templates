@@ -223,7 +223,7 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good="" compose_ps container_logs
+  local prev_good="" compose_ps container_logs rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
 
   deploy_tag "$GIT_SHA"
@@ -248,14 +248,27 @@ do_deploy() {
   printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
     log "rolling back to previous good tag ${prev_good}"
-    deploy_tag "$prev_good"
-    # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
-    log "rollback to ${prev_good} complete"
+    rollback_rc=0
+    deploy_tag "$prev_good" || rollback_rc=$?
+    if [ "$rollback_rc" -ne 0 ]; then
+      log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
+      event exit
+      return 4
+    fi
+    if health_probe; then
+      # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
+      log "rollback to ${prev_good} complete; old version passed the same-budget health probe"
+      event exit
+      return 1
+    fi
+    log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
+    event exit
+    return 4
   else
     log "no previous good tag to roll back to"
+    event exit
+    return 4
   fi
-  event exit
-  return 1
 }
 
 # --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----

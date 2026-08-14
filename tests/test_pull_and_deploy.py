@@ -95,6 +95,22 @@ exit 0
 """
 
 
+def _mock_docker_rollback_pull_failure(log_path: Path) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  count_file="{log_path}.pull-count"
+  count=$(cat "$count_file" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$count_file"
+  [ "$count" -ge 2 ] && exit 23
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 ]]; then
+  exit 1
+fi
+exit 0
+"""
+
+
 def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
               compose_sleep: float = 0.0) -> dict:
     docker_log = tmp_path / "docker.log"
@@ -355,6 +371,8 @@ def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert "[deploy][evidence] probe-attempts: 000(curl=28),503(curl=0)" in result.stdout
+    assert "[deploy][evidence] probe-attempts: 200(curl=0)" in result.stdout
+    assert "old version passed the same-budget health probe" in result.stdout
 
 
 def test_rollback_evidence_is_captured_before_redeploy(tmp_path):
@@ -394,6 +412,33 @@ def test_rollback_evidence_is_captured_before_redeploy(tmp_path):
 
     docker_log = Path(env["DOCKER_LOG"]).read_text()
     assert "compose logs --tail 100 --no-color" in docker_log
+
+
+def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_rollback_pull_failure(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert good.read_text().strip() == "old1111"
+    assert "rollback to old1111 failed" in result.stdout
 
 
 def test_concurrent_same_host_deploys_serialize(tmp_path):
