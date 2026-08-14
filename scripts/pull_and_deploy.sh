@@ -190,12 +190,23 @@ health_probe() {
   [ -z "$HEALTHCHECK_URL" ] && { log "no HEALTHCHECK_URL, skipping probe"; return 0; }
   log "warmup ${HEALTHCHECK_WARMUP}s before probing ${HEALTHCHECK_URL}"
   sleep "$HEALTHCHECK_WARMUP"
-  local attempt=1
+  local attempt=1 probe_attempts=""
   while [ "$attempt" -le "$HEALTHCHECK_RETRIES" ]; do
-    local code
-    code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' \
-             --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL" || true)"
+    local code curl_rc
+    if code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' \
+             --max-time "$HEALTHCHECK_TIMEOUT" "$HEALTHCHECK_URL")"; then
+      curl_rc=0
+    else
+      curl_rc=$?
+    fi
+    [ -n "$code" ] || code="000"
+    if [ -n "$probe_attempts" ]; then
+      probe_attempts+=",${code}(curl=${curl_rc})"
+    else
+      probe_attempts="${code}(curl=${curl_rc})"
+    fi
     if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ]; then
+      echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
       log "health probe OK (attempt ${attempt}, status ${code})"
       return 0
     fi
@@ -203,6 +214,7 @@ health_probe() {
     attempt=$((attempt + 1))
     [ "$attempt" -le "$HEALTHCHECK_RETRIES" ] && sleep "$HEALTHCHECK_INTERVAL"
   done
+  echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
   return 1
 }
 

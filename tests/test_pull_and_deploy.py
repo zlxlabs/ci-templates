@@ -316,6 +316,34 @@ def test_single_image_outcome_matrix(tmp_path, case):
         assert f":{rollback_tag}" in docker_log
 
 
+def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+
+    curl_log = tmp_path / "curl-attempts.log"
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            curl_log,
+            [("000", 28), ("503", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "[deploy][evidence] probe-attempts: 000(curl=28),503(curl=0)" in result.stdout
+
+
 def test_concurrent_same_host_deploys_serialize(tmp_path):
     """Two deploys sharing HOST_LOCK must not run their critical sections at once."""
     mock_dir = tmp_path / "bin"
