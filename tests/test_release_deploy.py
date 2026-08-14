@@ -154,7 +154,9 @@ exit 0
     [
         ("healthy", 0),
         ("no_previous_good", 4),
+        ("no_previous_good_pending_signal", 4),
         ("image_set_changed", 4),
+        ("image_set_changed_pending_signal", 4),
         ("rollback_compose_failed", 4),
         ("rollback_healthy", 1),
         ("rollback_unhealthy", 4),
@@ -167,14 +169,19 @@ def test_release_outcome_axis_table(tmp_path, axis, expected_rc):
     env, log = base(tmp_path)
     if axis == "healthy":
         result = run(env)
-    elif axis == "no_previous_good":
-        mock_curl(Path(env["CURL_BIN"]), "500")
-        result = run(env)
+    elif axis in {"no_previous_good", "no_previous_good_pending_signal"}:
+        if axis.endswith("pending_signal"):
+            marker = tmp_path / "probe.started"
+            mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
+            result = run_with_signal_on_marker(env, marker)
+        else:
+            mock_curl(Path(env["CURL_BIN"]), "500")
+            result = run(env)
     else:
         assert run(env).returncode == 0
         env["D3_RELEASE_TAG"] = "def567890123"
 
-        if axis == "image_set_changed":
+        if axis in {"image_set_changed", "image_set_changed_pending_signal"}:
             changed_manifest = tmp_path / "release2.manifest"
             changed_manifest.write_text(
                 "D3_RELEASE_MANIFEST=1\n"
@@ -185,8 +192,13 @@ def test_release_outcome_axis_table(tmp_path, axis, expected_rc):
             )
             env["RELEASE_MANIFEST"] = str(changed_manifest)
             mock_rollback_docker(Path(env["DOCKER_BIN"]), log, image_names=("frontend", "backend2"))
-            mock_curl(Path(env["CURL_BIN"]), "500")
-            result = run(env)
+            if axis.endswith("pending_signal"):
+                marker = tmp_path / "probe.started"
+                mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
+                result = run_with_signal_on_marker(env, marker)
+            else:
+                mock_curl(Path(env["CURL_BIN"]), "500")
+                result = run(env)
         elif axis in {"rollback_compose_failed", "rollback_healthy", "rollback_unhealthy"}:
             rollback_rc = 1 if axis == "rollback_compose_failed" else 0
             mock_rollback_docker(Path(env["DOCKER_BIN"]), log, rollback_rc=rollback_rc)
@@ -237,17 +249,10 @@ exit 0
                 statuses = ["500", "500"]
             pause_marker = marker if axis.endswith("pending_signal") else None
             mock_curl_sequence(Path(env["CURL_BIN"]), statuses, pause_marker=pause_marker)
-            proc = subprocess.Popen(
-                ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE, text=True,
-            )
-            deadline = time.time() + 3
-            while time.time() < deadline and pause_marker is not None and not marker.exists():
-                time.sleep(0.01)
             if pause_marker is not None:
-                proc.send_signal(signal.SIGTERM)
-            stdout, stderr = proc.communicate(timeout=5)
-            result = subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
+                result = run_with_signal_on_marker(env, marker)
+            else:
+                result = run(env)
 
     assert result.returncode == expected_rc, result.stdout + result.stderr
 
@@ -293,6 +298,19 @@ def test_rollback_evidence_is_emitted_before_rollback_deploy(tmp_path):
 
 def run(env):
     return subprocess.run(["bash", str(SCRIPT)], env=env, capture_output=True, text=True)
+
+
+def run_with_signal_on_marker(env, marker):
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    deadline = time.time() + 3
+    while time.time() < deadline and not marker.exists():
+        time.sleep(0.01)
+    proc.send_signal(signal.SIGTERM)
+    stdout, stderr = proc.communicate(timeout=5)
+    return subprocess.CompletedProcess(proc.args, proc.returncode, stdout, stderr)
 
 
 def fail_mv_target(path: Path, suffix: str):
