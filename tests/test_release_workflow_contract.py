@@ -396,4 +396,11 @@ def test_release_rc4_output_and_notification_routing_contract():
     assert "immediate host intervention required" in urgent["run"]
     assert "生产可能不可用，必须立即上机" in urgent["run"]
     assert '"msg_type":"text"' in urgent["run"]
-    assert "<at id=all></at>" in urgent["run"]
+    # 纯 text 消息的 @全员语法是 <at user_id="all">，卡片 lark_md 的那一套在这里不产生
+    # @ 效果，只会显示成字面文本。断言只盯真正发出去的 payload 行——run 块里的说明性
+    # 注释会同时提到两种语法，对整块做 not-in 会误伤。
+    payload_line = next(
+        line for line in urgent["run"].splitlines() if "json.dumps" in line
+    )
+    assert '<at user_id="all">' in payload_line
+    assert "<at id=all>" not in payload_line
