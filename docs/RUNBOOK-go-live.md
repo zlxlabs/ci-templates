@@ -32,6 +32,8 @@ grep -rn "zj1123581321" --include="*.yml" --include="*.md" --include="*.py" .
 
 **回滚点**：纯文本改动，`git revert` 对应 commit 即可，不影响任何已在跑的部署。
 
+caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `paths-ignore`（可选）」](../README.md#触发条件与-paths-ignore可选)。
+
 ## 阶段 1：canary 试跑 —— 验证流水线本身没坏
 
 **动作**：

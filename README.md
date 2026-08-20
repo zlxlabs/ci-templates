@@ -75,6 +75,10 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 把 `examples/caller-workflow.yml` 放进服务仓 `.github/workflows/deploy.yml`：
 
 ```yaml
+on:
+  push:
+    branches: [main]
+
 jobs:
   ship:
     uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
@@ -92,6 +96,32 @@ jobs:
       TS_AUTHKEY: ${{ secrets.TS_AUTHKEY }}             # runner 临时入 tailnet 连内网目标机
       CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # 仓库已公开，当前版本此 secret 保留但未使用，传任意占位值即可
 ```
+
+### 触发条件与 `paths-ignore`（可选）
+
+默认情况下，`main` 上的每次 push 都会触发部署，包括只改文档或账本的提交。是否配置
+`paths-ignore` 取决于服务的取舍：文档改动频繁、每次重建对可用性有感知的服务，配置它通常
+更划算；发版稀疏、优先追求「main HEAD == 线上运行 SHA」恒等的服务，保持现状更简单可靠。
+
+配置后，线上 `GIT_SHA` 会落后于 `main HEAD`。排查「线上跑的是哪个 commit」时要多一步
+推断；对账本身不受影响（下次部署的 expected SHA 仍是当时的 HEAD），但「看一眼 main
+就知道线上是什么」的便利没了。需要时可在 caller 的 `on.push` 下采用这个保守模板：
+
+```yaml
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '**/*.md'
+      - 'docs/**'
+      - 'retro/**'
+```
+
+配 `paths-ignore` 时还要注意：
+
+1. GitHub 的语义是「本次 push 的所有改动文件都匹配 ignore 才跳过」；混合了代码与文档的提交仍会正常部署。这点容易被误解成「带了文档就不部署」。
+2. **不要 ignore `.github/workflows/**`**，否则调整部署参数后不会立即生效，会产生「我改了 host 怎么没变」的困惑。
+3. 模式不要写宽（如 `**`），否则会静默跳过代码部署；失败方向是「以为部署了其实没有」，比多部署几次危险得多，只列举确定无副作用的路径。
 
 > `host` 自 D3 激活起是 **Tailscale 可达地址**（IP/MagicDNS），不再是 `~/.ssh/config` 别名 ——
 > GitHub runner 上没有用户的 ssh config，临时入 tailnet 后只能按 IP 连。别名 `host-1` 仍用于 registry 与人读。
