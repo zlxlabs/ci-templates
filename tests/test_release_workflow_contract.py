@@ -368,6 +368,37 @@ def test_release_busy_lock_and_compose_identity_contract():
     assert '--data-binary @- "$webhook"' in text
 
 
+def test_release_healthcheck_inputs_and_quoted_env_contract():
+    raw, trigger = load()
+    inputs = trigger["workflow_call"]["inputs"]
+    expected_defaults = {
+        "healthcheck_retries": "5",
+        "healthcheck_interval": "3",
+        "healthcheck_warmup": "5",
+    }
+    for name, default in expected_defaults.items():
+        assert name in inputs
+        assert inputs[name]["type"] == "string"
+        assert inputs[name]["required"] is False
+        assert inputs[name]["default"] == default
+
+    text = WORKFLOW.read_text()
+    remote_start = text.index("printf -v remote_cmd")
+    remote_end = text.index('ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"', remote_start)
+    remote_cmd = text[remote_start:remote_end]
+    assert (
+        "HEALTHCHECK_RETRIES=%q HEALTHCHECK_INTERVAL=%q HEALTHCHECK_WARMUP=%q"
+        in remote_cmd
+    )
+    for env_name, input_name in (
+        ("HEALTHCHECK_RETRIES", "healthcheck_retries"),
+        ("HEALTHCHECK_INTERVAL", "healthcheck_interval"),
+        ("HEALTHCHECK_WARMUP", "healthcheck_warmup"),
+    ):
+        assert f"{env_name}: ${{{{ inputs.{input_name} }}}}" in text
+        assert f'"${env_name}"' in remote_cmd
+
+
 def test_release_rc4_output_and_notification_routing_contract():
     raw, _ = load()
     steps = raw["jobs"]["release"]["steps"]

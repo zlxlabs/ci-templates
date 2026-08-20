@@ -122,7 +122,8 @@ opt-in 用法，在 caller 的 `with:` 块加一个 input（不加则行为与�
   ~3 秒——同网段链路真出问题大概率是"整个不可达",给它套 ACR 的 150 秒预算纯属
   浪费),不通就无缝回退到未改动的 ACR 拉取预算(`PULL_RETRIES`,默认 6 次、线性
   退避、累计 150 秒)。本地拉到的字节会 retag 成规范 `ACR_IMAGE:tag` 名字——
-  `last_good_tag` / 回滚逻辑只认这个名字,不关心字节来自哪个 registry。
+  `last_good_tag` / 回滚逻辑只认这个名字,不关心字节来自哪个 registry。release lane 的
+  ACR 拉取也已对齐到同一 `PULL_RETRIES` 默认 6 次、线性退避、累计 150 秒预算。
 - 其它部署目标机尚未验证 tailnet 可达性 / 域名解析,**逐仓手动 opt-in**,不要
   批量打开。
 
@@ -216,23 +217,28 @@ release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollba
 
 ### 探针预算与冷启动调参
 
-**两条 lane 的默认值不同**，因为单镜像 lane 的探针参数是 `build-deploy.yml` 的 workflow
-input（caller 不传就吃 input 的默认值），而 release lane 没有对应 input，直接吃脚本默认值：
+**两条 lane 的默认值不同**，但现在都通过 workflow input 暴露前三项探针参数；caller 不传时，
+单镜像 lane 吃 `build-deploy.yml` 的 input 默认值，release lane 吃与脚本默认值一致的 input 默认值。
 
-| 参数 | 单镜像 lane（workflow input） | release lane（脚本默认） |
+| 参数 | 单镜像 lane（workflow input） | release lane（workflow input） |
 |---|---:|---:|
 | warmup | `10` 秒 | `5` 秒 |
 | retries | `5` 次 | `5` 次 |
 | interval | `3` 秒 | `3` 秒 |
 | timeout（每次 curl） | `5` 秒 | `5` 秒 |
 
+两条 lane 的 `warmup` input 默认值刻意不同：单镜像是 `10` 秒，release 是 `5` 秒；不要将前者
+复制到 release lane。
+
 最坏耗时不是 `warmup + retries×(timeout+interval)`——**最后一次尝试之后不再 sleep**，
-所以 interval 只乘 `retries-1`：
+所以 interval 只乘 `retries-1`。caller 覆盖 `healthcheck_warmup` / `healthcheck_retries` /
+`healthcheck_interval` 后，公式中的对应值也随之变化；`healthcheck_timeout` 仍没有 input，保持
+脚本默认的 `5` 秒：
 
 ```
 单次探针最坏 = warmup + retries×timeout + (retries-1)×interval
-单镜像 lane  = 10 + 5×5 + 4×3 = 47 秒
-release lane = 5  + N×(5×5 + 4×3) = 5 + 37N 秒   # N = probes_json 里的探针条数
+单镜像 lane（默认） = 10 + 5×5 + 4×3 = 47 秒
+release lane（默认） = 5 + N×(5×5 + 4×3) = 5 + 37N 秒   # N = probes_json 里的探针条数
              = 79 秒（N=2，即 README 上文推荐的 frontend + backend 两条）
 ```
 
@@ -250,9 +256,11 @@ Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务
 
 - **单镜像 lane**：caller 可传 `healthcheck_warmup` / `healthcheck_retries` /
   `healthcheck_interval` 三项。**`healthcheck_timeout` 没有对应 input**，改不了
-  （硬编码走脚本默认 5 秒）；照着写会在 `workflow_call` 处报 `Unexpected input`。
-- **release lane**：探针预算**完全不可由 caller 调整**，`HEALTHCHECK_*` 一个都不经 SSH 传递，
-  全部走脚本默认值。这条 lane 上的慢启动服务目前只能靠自身启动更快，或先给本仓加 input。
+  （走脚本默认 5 秒）；照着写会在 `workflow_call` 处报 `Unexpected input`。
+- **release lane**：caller 同样可传 `healthcheck_warmup` / `healthcheck_retries` /
+  `healthcheck_interval` 三项，值会经 SSH 传给 `release_deploy.sh`；三个 input 默认分别为
+  `5` / `5` / `3`，与脚本原有默认值一致。**`healthcheck_timeout` 没有对应 input**，仍走脚本
+  默认 5 秒；照着写会在 `workflow_call` 处报 `Unexpected input`。
 误回滚会在生产中连续做两次容器替换，可用性抖动是不回滚时的两倍。默认值本次刻意不改，因为静默
 调大它会改变 50+ 个存量服务的部署行为；请服务方根据自己的启动时间显式调参。
 
