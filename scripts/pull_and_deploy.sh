@@ -49,6 +49,8 @@ HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"   # seconds between probes
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"       # seconds before first probe
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"     # per-probe curl timeout
 EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"           # per-evidence-command timeout
+ONESHOT_SERVICES="${ONESHOT_SERVICES:-}"
+ROLLBACK_MODE=0
 
 # optional test/observability hooks
 DEPLOY_EVENT_LOG="${DEPLOY_EVENT_LOG:-}"
@@ -177,13 +179,77 @@ pull_image() {
   return 1
 }
 
+compose_list_services() {
+  local config_rc=0 services=""
+  services="$(
+    cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose config --services 2>&1
+  )" || config_rc=$?
+  if [ "$config_rc" -ne 0 ]; then
+    log "compose config --services failed; compose up will not run" >&2
+    return 1
+  fi
+  printf '%s\n' "$services"
+  return 0
+}
+
+validate_oneshot_services() {
+  local svc all_services="" invalid=""
+  [ -z "$ONESHOT_SERVICES" ] && return 0
+  all_services="$(compose_list_services)" || return 1
+  for svc in $ONESHOT_SERVICES; do
+    if ! printf '%s\n' "$all_services" | grep -qx "$svc"; then
+      invalid="${invalid:+$invalid }$svc"
+    fi
+  done
+  if [ -n "$invalid" ]; then
+    log "oneshot_services references unknown compose service(s): $invalid" >&2
+    return 1
+  fi
+  return 0
+}
+
+rollback_compose_services() {
+  local svc all_services="" keep=""
+  all_services="$(compose_list_services)" || return 1
+  for svc in $all_services; do
+    case " $ONESHOT_SERVICES " in
+      *" $svc "*) ;;
+      *) keep="${keep:+$keep }$svc" ;;
+    esac
+  done
+  if [ -z "$keep" ]; then
+    log "rollback refused: oneshot_services covers every compose service; nothing would remain to run" >&2
+    return 1
+  fi
+  printf '%s\n' $keep
+  return 0
+}
+
+oneshot_schema_hint() {
+  [ -z "$ONESHOT_SERVICES" ] && return 0
+  log "hint: this release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required"
+}
+
 # --- deploy a specific tag: pull (if remote) + retag + compose up ------------
 deploy_tag() {
   local tag="$1"
   log "deploying ${ACR_IMAGE}:${tag}"
   pull_image "${ACR_IMAGE}:${tag}" || return $?
   "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest" || return $?
-  ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
+  if [ "$ROLLBACK_MODE" -eq 0 ]; then
+    validate_oneshot_services || return $?
+  fi
+  if [ "$ROLLBACK_MODE" -eq 1 ] && [ -n "$ONESHOT_SERVICES" ]; then
+    local svc_list="" list_rc=0
+    svc_list="$(rollback_compose_services)" || list_rc=$?
+    if [ "$list_rc" -ne 0 ]; then
+      return 1
+    fi
+    # shellcheck disable=SC2086
+    ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d $svc_list )
+  else
+    ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
+  fi
 }
 
 # --- health probe: returns 0 if the service answers as expected --------------
@@ -263,7 +329,9 @@ do_deploy() {
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
     log "rolling back to previous good tag ${prev_good}"
     rollback_rc=0
+    ROLLBACK_MODE=1
     deploy_tag "$prev_good" || rollback_rc=$?
+    ROLLBACK_MODE=0
     if [ "$rollback_rc" -ne 0 ]; then
       log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
       event exit
@@ -276,6 +344,7 @@ do_deploy() {
       return 1
     fi
     log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
+    oneshot_schema_hint
     event exit
     return 4
   else

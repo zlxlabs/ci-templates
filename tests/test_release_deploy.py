@@ -1447,3 +1447,203 @@ def test_rollback_proceeds_when_image_set_unchanged(tmp_path):
     lines = log.read_text().splitlines()
     assert sum(line.endswith(" up -d") for line in lines) == 2
     assert (Path(env["STATE_DIR"]) / "last_good_sha").read_text().strip() == "abc123456789"
+
+
+COMPOSE_ONESHOT_SERVICES = ("app", "migrate")
+
+
+def _compose_up_lines(log_text: str) -> list[str]:
+    return [line for line in log_text.splitlines() if " up -d" in line]
+
+
+def _assert_compose_up_has_no_service_args(line: str) -> None:
+    assert line.rstrip().endswith(" up -d"), line
+
+
+def _assert_compose_up_services(line: str, *, include: tuple[str, ...], exclude: tuple[str, ...]) -> None:
+    parts = line.split()
+    idx = parts.index("-d")
+    services = parts[idx + 1 :]
+    for name in include:
+        assert name in services, (line, services)
+    for name in exclude:
+        assert name not in services, (line, services)
+
+
+def _mock_oneshot_release_docker(
+    path: Path,
+    log: Path,
+    *,
+    services: tuple[str, ...] = COMPOSE_ONESHOT_SERVICES,
+    image_names: tuple[str, ...] = ("frontend", "backend"),
+    rollback_rc: int = 0,
+):
+    count_file = log.parent / "compose-up.count"
+    rendered = "".join(f"{name}:%s\\n" for name in image_names)
+    rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
+    service_lines = "\\n".join(services)
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf '{service_lines}\\n'
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf '{rendered}' {rendered_args}
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
+  n=$(cat "{count_file}" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  echo "$n" > "{count_file}"
+  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
+    exit {rollback_rc}
+  fi
+fi
+exit 0
+''',
+    )
+
+
+def _oneshot_base(tmp_path, *, oneshot_services: str = "migrate"):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "compose.yml").write_text(
+        "services:\n  app:\n    image: frontend\n  migrate:\n    image: frontend\n"
+    )
+    _mock_oneshot_release_docker(Path(env["DOCKER_BIN"]), log)
+    if oneshot_services:
+        env["ONESHOT_SERVICES"] = oneshot_services
+    return env, log
+
+
+@pytest.mark.parametrize(
+    ("case", "oneshot_services", "phase"),
+    [
+        ("empty_forward", "", "forward"),
+        ("empty_rollback", "", "rollback"),
+        ("valid_forward", "migrate", "forward"),
+        ("valid_rollback", "migrate", "rollback"),
+        ("invalid_forward", "nosuch", "forward"),
+        ("invalid_rollback_unreachable", "nosuch", "forward"),
+        ("all_oneshot_rollback", "app migrate", "rollback"),
+    ],
+)
+def test_oneshot_services_axis1(tmp_path, case, oneshot_services, phase):
+    env, log = _oneshot_base(tmp_path, oneshot_services=oneshot_services)
+    if phase == "rollback":
+        assert run(env).returncode == 0
+        env["D3_RELEASE_TAG"] = "def567890123"
+        log.write_text("")
+        mock_curl(Path(env["CURL_BIN"]), "500")
+        result = run(env)
+    else:
+        result = run(env)
+
+    out = result.stdout + result.stderr
+    up_lines = _compose_up_lines(log.read_text())
+
+    if case == "empty_forward":
+        assert result.returncode == 0, out
+        assert len(up_lines) == 1
+        _assert_compose_up_has_no_service_args(up_lines[0])
+    elif case == "empty_rollback":
+        assert result.returncode != 0, out
+        assert len(up_lines) == 2
+        for line in up_lines:
+            _assert_compose_up_has_no_service_args(line)
+    elif case == "valid_forward":
+        assert result.returncode == 0, out
+        assert len(up_lines) == 1
+        _assert_compose_up_has_no_service_args(up_lines[0])
+    elif case == "valid_rollback":
+        assert result.returncode != 0, out
+        assert len(up_lines) == 2
+        _assert_compose_up_has_no_service_args(up_lines[0])
+        _assert_compose_up_services(
+            up_lines[1], include=("app",), exclude=("migrate",),
+        )
+    elif case in {"invalid_forward", "invalid_rollback_unreachable"}:
+        assert result.returncode != 0, out
+        assert "nosuch" in out.lower()
+        assert not up_lines
+    elif case == "all_oneshot_rollback":
+        assert result.returncode != 0, out
+        assert "nothing would remain" in out.lower() or "no services" in out.lower()
+        assert len(up_lines) == 1
+
+
+@pytest.mark.parametrize(
+    "trigger",
+    [
+        "probe_failure",
+        "promote_failure",
+        "pending_signal",
+    ],
+)
+def test_oneshot_services_release_rollback_trigger_excludes_migrate(tmp_path, trigger):
+    env, log = _oneshot_base(tmp_path, oneshot_services="migrate")
+    assert run(env).returncode == 0
+
+    env["D3_RELEASE_TAG"] = "def567890123"
+    log.write_text("")
+
+    if trigger == "probe_failure":
+        mock_curl(Path(env["CURL_BIN"]), "500")
+        result = run(env)
+    elif trigger == "promote_failure":
+        mock_curl(Path(env["CURL_BIN"]), "200")
+        fail_mv_target(Path(env["DOCKER_BIN"]).parent / "mv", "last_good_release")
+        env["PATH"] = f'{Path(env["DOCKER_BIN"]).parent}:{os.environ["PATH"]}'
+        result = run(env)
+    else:
+        marker = tmp_path / "probe.started"
+        mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
+        result = run_with_signal_on_marker(env, marker)
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    up_lines = _compose_up_lines(log.read_text())
+    assert len(up_lines) >= 2, up_lines
+    _assert_compose_up_services(up_lines[-1], include=("app",), exclude=("migrate",))
+
+
+def test_oneshot_services_image_set_guard_still_blocks_before_rollback(tmp_path):
+    env, log = _oneshot_base(tmp_path, oneshot_services="migrate")
+    assert run(env).returncode == 0
+    env["D3_RELEASE_TAG"] = "def567890123"
+    changed_manifest = tmp_path / "release2.manifest"
+    changed_manifest.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\tfrontend\tfrontend\n"
+        "image\tbackend2\tbackend2\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(changed_manifest)
+    log.write_text("")
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf 'app\\nmigrate\\n'
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend2:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    mock_curl(Path(env["CURL_BIN"]), "500")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert "image set changed" in out
+    up_lines = _compose_up_lines(log.read_text())
+    assert len(up_lines) == 1
+    _assert_compose_up_has_no_service_args(up_lines[0])

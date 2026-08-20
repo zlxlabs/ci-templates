@@ -507,3 +507,26 @@ def test_orphaned_remote_script_cleaned_up_when_retries_exhausted():
         "cleanup must happen inside the exhausted-retries branch, before its "
         "final exit 1"
     )
+
+
+def test_oneshot_services_input_declared_with_empty_default():
+    _, trigger = _load()
+    spec = trigger["workflow_call"]["inputs"]["oneshot_services"]
+    assert spec["type"] == "string"
+    assert spec["required"] is False
+    assert spec["default"] == ""
+
+
+def test_oneshot_services_env_is_passed_through_to_deploy_step():
+    text = WORKFLOW.read_text()
+    assert "ONESHOT_SERVICES: ${{ inputs.oneshot_services }}" in text
+    assert "ONESHOT_SERVICES='${ONESHOT_SERVICES}'" in text
+
+
+def test_oneshot_services_rc4_error_includes_schema_hint_when_declared():
+    text = WORKFLOW.read_text()
+    start = text.index('if [ "$rc" -eq 4 ]; then')
+    end = text.index('if [ "$rc" -ne 255 ]; then', start)
+    branch = text[start:end]
+    assert 'if [ -n "$ONESHOT_SERVICES" ]; then' in branch
+    assert "manual verification required" in branch

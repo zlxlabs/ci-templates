@@ -103,6 +103,7 @@ HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
 EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
+ONESHOT_SERVICES="${ONESHOT_SERVICES:-}"
 
 GOOD_SHA_FILE="$STATE_DIR/last_good_sha"
 GOOD_MANIFEST_FILE="$STATE_DIR/last_good_manifest"
@@ -244,6 +245,64 @@ pull_and_retag() {
   return 0
 }
 
+compose_list_services() {
+  local tag="$1" compose_args=(compose) config_rc=0 services=""
+  if [[ -f "$DEPLOY_DIR/.env" ]]; then
+    compose_args+=(--env-file "$DEPLOY_DIR/.env")
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    compose_args+=(--env-file "$ENV_FILE")
+  fi
+  services="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}" config --services 2>&1)" || config_rc=$?
+  if (( config_rc != 0 )); then
+    log "compose config --services failed; compose up will not run" >&2
+    return 1
+  fi
+  printf '%s\n' "$services"
+  return 0
+}
+
+validate_oneshot_services() {
+  local tag="$1" svc all_services=() invalid=()
+  [[ -z "$ONESHOT_SERVICES" ]] && return 0
+  readarray -t all_services < <(compose_list_services "$tag") || return 1
+  declare -A _known=()
+  for svc in "${all_services[@]}"; do
+    [[ -n "$svc" ]] && _known["$svc"]=1
+  done
+  for svc in $ONESHOT_SERVICES; do
+    [[ -n "${_known[$svc]+x}" ]] || invalid+=("$svc")
+  done
+  if [[ "${#invalid[@]}" -gt 0 ]]; then
+    log "oneshot_services references unknown compose service(s): ${invalid[*]}" >&2
+    return 1
+  fi
+  return 0
+}
+
+rollback_compose_services() {
+  local tag="$1" svc all_services=() keep=()
+  readarray -t all_services < <(compose_list_services "$tag") || return 1
+  declare -A _skip=()
+  for svc in $ONESHOT_SERVICES; do
+    _skip["$svc"]=1
+  done
+  for svc in "${all_services[@]}"; do
+    [[ -n "$svc" && -z "${_skip[$svc]+x}" ]] && keep+=("$svc")
+  done
+  if [[ "${#keep[@]}" -eq 0 ]]; then
+    log "rollback refused: oneshot_services covers every compose service; nothing would remain to run" >&2
+    return 1
+  fi
+  printf '%s\n' "${keep[@]}"
+  return 0
+}
+
+oneshot_schema_hint() {
+  [[ -n "$ONESHOT_SERVICES" ]] || return 0
+  log "hint: this release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required" >&2
+}
+
 compose_release() {
   local tag="$1" env_tmp="${STAGING_PREFIX}.env"
   check_pending || return 130
@@ -308,7 +367,20 @@ compose_release() {
   # that is unrecoverable: the cancelled release's containers get switched
   # in, are never promoted, and there is nothing to roll back to.
   check_pending || return 130
-  compose_args+=(up -d)
+  if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
+    validate_oneshot_services "$tag" || return 1
+  fi
+  if [[ "$ROLLBACK_MODE" -eq 1 && -n "$ONESHOT_SERVICES" ]]; then
+    local rollback_services=() _svc_list="" _list_rc=0
+    _svc_list="$(rollback_compose_services "$tag")" || _list_rc=$?
+    if (( _list_rc != 0 )); then
+      return 1
+    fi
+    readarray -t rollback_services <<< "$_svc_list"
+    compose_args+=(up -d "${rollback_services[@]}")
+  else
+    compose_args+=(up -d)
+  fi
   local compose_rc=0
   # 200 is outside Docker/Compose's documented 0-125 process exit range, so
   # reserve it as a private sentinel for a failed cd before docker is called.
@@ -534,11 +606,13 @@ do_release() {
           log "rollback to ${previous_sha} healthy"
         else
           log "rollback compose succeeded but probes still fail" >&2
+          oneshot_schema_hint
           rollback_rc=4
         fi
       else
         rollback_rc=4
         log "rollback failed; last_good remains ${previous_sha}" >&2
+        oneshot_schema_hint
       fi
     fi
   else

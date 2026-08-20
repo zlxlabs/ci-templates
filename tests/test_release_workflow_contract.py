@@ -507,3 +507,21 @@ def test_release_failure_card_has_remote_rc_split_and_identity_fields():
     assert "本次未上线，生产仍是上一版本" not in ordinary["run"], (
         "拿不到远端 rc 时不得单方面断言「未上线」——SSH 传输耗尽也走这一支"
     )
+
+
+def test_oneshot_services_input_declared_with_empty_default():
+    _, trigger = load()
+    spec = trigger["workflow_call"]["inputs"]["oneshot_services"]
+    assert spec["type"] == "string"
+    assert spec["required"] is False
+    assert spec["default"] == ""
+
+
+def test_oneshot_services_remote_cmd_is_quoted_and_passed_through():
+    text = WORKFLOW.read_text()
+    assert "ONESHOT_SERVICES: ${{ inputs.oneshot_services }}" in text
+    remote_start = text.index("printf -v remote_cmd")
+    remote_end = text.index('ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"', remote_start)
+    remote_cmd = text[remote_start:remote_end]
+    assert "ONESHOT_SERVICES=%q" in remote_cmd
+    assert '"$ONESHOT_SERVICES"' in remote_cmd

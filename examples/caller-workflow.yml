@@ -18,6 +18,8 @@ jobs:
       ci_templates_ref: v1                              # fetch deploy scripts from @v1 too
       # 可选·部署门禁:服务忙时本次延期不替换(见 docs/design/d3-busy-lock-gate.md)
       # busy_lock_file: /srv/automation/web-api/.deploy-state/busy.lock
+      # 可选·compose 一次性/迁移服务:只在回滚跳过,forward 仍全量 up(见 README oneshot_services)
+      # oneshot_services: migrate
     secrets:                                            # explicit — no `inherit`
       ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
       ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
