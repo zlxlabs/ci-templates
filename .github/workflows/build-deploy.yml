@@ -80,6 +80,11 @@ on:
         required: false
         default: "600"
         type: string
+      oneshot_services:
+        description: "Space-separated compose service names treated as one-shot/migration services; skipped on rollback only"
+        required: false
+        default: ""
+        type: string
       ci_templates_ref:
         description: "Ref of ci-templates to fetch the deploy scripts from"
         required: false
@@ -236,6 +241,7 @@ jobs:
           HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
           BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
           BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
+          ONESHOT_SERVICES: ${{ inputs.oneshot_services }}
         run: |
           # P1-B (codex review round 5): ssh_user starting with '-' makes the
           # assembled "${SSH_USER}@${DEPLOY_HOST}:path" argument itself start
@@ -293,6 +299,7 @@ jobs:
                HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
                BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
                BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
+               ONESHOT_SERVICES='${ONESHOT_SERVICES}' \
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
           }
 
@@ -322,7 +329,11 @@ jobs:
             fi
             if [ "$rc" -eq 4 ]; then
               echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
-              echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required"
+              schema_hint=""
+              if [ -n "$ONESHOT_SERVICES" ]; then
+                schema_hint=" This release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required."
+              fi
+              echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required${schema_hint}"
               exit 4
             fi
             if [ "$rc" -ne 255 ]; then
