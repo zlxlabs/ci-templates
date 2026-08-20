@@ -82,6 +82,12 @@ def base(tmp_path, *, status="200", compose_rc=0, fail_pull=False, fail_tag=Fals
     return env, log
 
 
+def test_pull_retry_default_matches_acr_budget():
+    text = SCRIPT.read_text()
+    assert 'PULL_RETRIES="${PULL_RETRIES:-6}"' in text
+    assert 'PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"' in text
+
+
 def mock_curl_sequence(path: Path, statuses, *, pause_marker=None):
     count_file = path.parent / "curl.count"
     values = " ".join(statuses)
