@@ -38,7 +38,8 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 
 **动作**：
 
-1. 找 canary 仓（唯一钉 `@main` 的服务，见 `examples/canary-workflow.yml`），
+1. 找 canary 仓（唯一钉 `@main` 的服务，见 `examples/canary-workflow.yml`）——常驻
+   canary 仓是 `zlxlabs/url-parse-api`，部署主机 n305。
    推一个低风险变更（哪怕只是加一行注释）触发一次真实 build + deploy。
 2. 等 GitHub Actions 跑完，确认 build → push ACR → SSH 部署 → 健康探针全绿。
 3. 临时把该服务 caller 的 `healthcheck_expect_status` 改成一个明显错误的值
