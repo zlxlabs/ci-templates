@@ -423,10 +423,12 @@ jobs:
           # One-shot/migration services exit after compose up; they must not
           # participate in the running-container sample, and declared images
           # referenced only by those services skip the running check entirely.
-          readarray -t all_services < <(cd "$DEPLOY_DIR" && docker compose config --services) || {
+          all_services_output=""
+          if ! all_services_output="$(cd "$DEPLOY_DIR" && docker compose config --services)"; then
             echo "::error::release image reconcile could not list compose services"
             exit 1
-          }
+          fi
+          readarray -t all_services <<< "$all_services_output"
 
           non_oneshot_services=()
           for svc in "${all_services[@]}"; do
@@ -434,10 +436,14 @@ jobs:
           done
 
           service_images_output=""
-          if ! service_images_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" docker compose config --format '{{range $k, $v := .Services}}{{$k}}={{$v.Image}}{{"\n"}}{{end}}' 2>&1)"; then
-            echo "::error::release image reconcile could not render compose service images"
-            exit 1
-          fi
+          for svc in "${non_oneshot_services[@]}"; do
+            image_ref=""
+            if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" docker compose config --images "$svc_broken")"; then
+              echo "::error::release image reconcile could not render compose image for service ${svc}"
+              exit 1
+            fi
+            service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
+          done
 
           running_ids_detail=""
           compose_rc=0

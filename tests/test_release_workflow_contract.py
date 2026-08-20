@@ -584,6 +584,15 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     )
     assert 'docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"' in run
     assert 'docker compose config --services' in run
+    assert 'docker compose config --images "$svc"' in run
+    assert "config --format '{{" not in run, (
+        "release reconcile must not use unsupported docker compose Go-template --format"
+    )
+    assert "could not render compose image for service" in run
+    assert 'readarray -t all_services <<< "$all_services_output"' in run
+    assert "readarray -t all_services < <(" not in run, (
+        "readarray must not swallow compose config --services failures via process substitution"
+    )
     assert 'docker compose ps -q --status running' in run
     assert 'docker inspect "$container_id" --format' in run
     assert "for image_name in" in run
