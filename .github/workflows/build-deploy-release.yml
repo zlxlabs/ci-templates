@@ -69,7 +69,7 @@ on:
         default: "5"
         type: string
       oneshot_services:
-        description: "Space-separated compose service names treated as one-shot/migration services; skipped on rollback only"
+        description: "Space-separated compose service names treated as one-shot/migration services. Affects BOTH rollback (these services are not restarted with the previous image) AND post-deploy image reconciliation (these services are excluded from the running-container sample, so a declared image referenced only by them skips the running check). Listing a long-running service here silently relaxes the reconcile assertion for its image; declaring every compose service makes reconciliation refuse outright."
         required: false
         default: ""
         type: string
