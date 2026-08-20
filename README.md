@@ -340,6 +340,18 @@ compose **声明**里每个 declared image 都解析为 `<name>:<tag>`）不同�
 --status running` 只查非 one-shot 服务）；某个 declared image **仅**被 one-shot 服务引用时，
 不要求有 running 容器，避免 migrate 容器已退出导致假红。
 
+两条边界值得单独记住：
+
+- **`oneshot_services` 覆盖全部 compose 服务时，对账 fail-loud 拒绝**，不会「全部 skip 然后
+  报绿」——那样对账就成了一道恒返回通过的闸，恰好放过它要防的东西。这与回滚路径已有的
+  `rollback refused: oneshot_services covers every compose service` 是同一条约束的两侧。
+  注意探针可以打 compose 之外的网关（`normalize_release.py` 不要求 probe URL 对应 compose
+  服务），所以「全部服务都是 one-shot 而部署仍然成功」是真实可达的形态，不是理论情形。
+- **这个 input 同时决定回滚范围与对账 skip 范围，无法分开表达。** 把一个长期运行的服务误写
+  进 `oneshot_services`，后果是回滚时不切换它、且对账不再要求它有 running 容器（会打
+  `::notice::` 说明该镜像未被任何非 one-shot 服务引用）。声明前请确认那确实是跑完即退出的
+  一次性服务。
+
 任一需要 running 检查的 declared image 对不上，workflow 判红并打印该镜像的 expected /
 running 全景；错误信息同时说明 `last_good_release` **已经**被推进到本次 SHA（promote 发生在
 远端脚本内、早于本 step），且本 step 红**不会**触发自动回滚——需要人工上机确认。SSH 对账
