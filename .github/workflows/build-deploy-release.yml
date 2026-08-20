@@ -438,7 +438,7 @@ jobs:
           service_images_output=""
           for svc in "${non_oneshot_services[@]}"; do
             image_ref=""
-            if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" docker compose config --images "$svc_broken")"; then
+            if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" docker compose config --images "$svc")"; then
               echo "::error::release image reconcile could not render compose image for service ${svc}"
               exit 1
             fi
