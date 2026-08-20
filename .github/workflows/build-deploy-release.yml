@@ -420,6 +420,9 @@ jobs:
             [[ -n "$svc" ]] && oneshot_svc["$svc"]=1
           done
 
+          # One-shot/migration services exit after compose up; they must not
+          # participate in the running-container sample, and declared images
+          # referenced only by those services skip the running check entirely.
           readarray -t all_services < <(cd "$DEPLOY_DIR" && docker compose config --services) || {
             echo "::error::release image reconcile could not list compose services"
             exit 1
@@ -524,6 +527,9 @@ jobs:
               continue
             fi
 
+            # Fail loud with the post-promote state: remote release_deploy.sh
+            # already advanced last_good_release after probes passed; this step
+            # only observes and never triggers rollback.
             if [[ "$saw_running_for_image" -eq 0 ]]; then
               echo "::error::release image reconcile no running container uses ${image_name}:${D3_RELEASE_TAG} (expected_id=${expected_id}, running_ids=${running_ids_detail}); last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
               reconcile_rc=1
