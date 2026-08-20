@@ -53,6 +53,21 @@ on:
         required: false
         default: "600"
         type: string
+      healthcheck_retries:
+        description: "Health probe retry count"
+        required: false
+        default: "5"
+        type: string
+      healthcheck_interval:
+        description: "Seconds between health probe retries"
+        required: false
+        default: "3"
+        type: string
+      healthcheck_warmup:
+        description: "Seconds to wait before the first health probe"
+        required: false
+        default: "5"
+        type: string
       ci_templates_ref:
         description: "Ref of ci-templates to fetch the release scripts from"
         required: false
@@ -185,6 +200,9 @@ jobs:
           HOST_LOCK: /var/lock/fleet-deploy.lock
           BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
           BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
+          HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
+          HEALTHCHECK_INTERVAL: ${{ inputs.healthcheck_interval }}
+          HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
         run: |
           set -euo pipefail
           # P1-B (codex review round 5): ssh_user starting with '-' makes the
@@ -251,9 +269,11 @@ jobs:
               }
             # printf %q makes every input one shell word; no JSON or raw input
             # is ever concatenated into the remote command.
-            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
+            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q HEALTHCHECK_RETRIES=%q HEALTHCHECK_INTERVAL=%q HEALTHCHECK_WARMUP=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
               "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
-              "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" "$remote_manifest" "$remote_script" "$remote_script"
+              "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" \
+              "$HEALTHCHECK_RETRIES" "$HEALTHCHECK_INTERVAL" "$HEALTHCHECK_WARMUP" \
+              "$remote_manifest" "$remote_script" "$remote_script"
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
             local ssh_rc=$?
             # P2-B-2 (codex review round 7, fixing a bug in round 5/e1688ba):
