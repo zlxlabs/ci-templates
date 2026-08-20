@@ -435,6 +435,11 @@ jobs:
             [[ -n "$svc" && -z "${oneshot_svc[$svc]+x}" ]] && non_oneshot_services+=("$svc")
           done
 
+          if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then
+            echo "::error::release image reconcile refused: oneshot_services covers every compose service; no long-running service is available for reconciliation; cannot prove this SHA is running in production; last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
+            exit 1
+          fi
+
           service_images_output=""
           for svc in "${non_oneshot_services[@]}"; do
             image_ref=""
@@ -449,9 +454,7 @@ jobs:
           compose_rc=0
           compose_output=""
           if [[ "${#non_oneshot_services[@]}" -gt 0 ]]; then
-            if ! compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running "${non_oneshot_services[@]}")"; then
-              compose_rc=$?
-            fi
+            compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
           fi
           if [[ "$compose_rc" -eq 0 ]]; then
             while IFS= read -r container_id; do
@@ -524,7 +527,7 @@ jobs:
             fi
 
             if [[ ${#svc_using_image[@]} -eq 0 ]]; then
-              echo "::notice::release image reconcile skipped running check for ${image_name} (only referenced by oneshot service(s))"
+              echo "::notice::release image reconcile skipped running check for ${image_name} (not referenced by any non-oneshot service)"
               continue
             fi
 

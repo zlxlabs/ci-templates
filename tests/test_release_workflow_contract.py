@@ -593,6 +593,17 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     assert "readarray -t all_services < <(" not in run, (
         "readarray must not swallow compose config --services failures via process substitution"
     )
+    assert (
+        'compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status '
+        'running "${non_oneshot_services[@]}")" || compose_rc=$?'
+    ) in run
+    assert (
+        'if ! compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status '
+        'running "${non_oneshot_services[@]}")"; then'
+    ) not in run, (
+        "compose ps failures must capture the command status before shell ! "
+        "can invert it"
+    )
     assert 'docker compose ps -q --status running' in run
     assert 'docker inspect "$container_id" --format' in run
     assert "for image_name in" in run
@@ -610,6 +621,20 @@ def test_release_image_reconciliation_per_image_mismatch_and_missing_running_bra
     assert "last_good_release has already been promoted to this SHA" in reconcile
     assert "this step does not trigger automatic rollback" in reconcile
     assert "manual host verification required" in reconcile
+
+
+def test_release_image_reconciliation_keeps_compose_failure_evidence_path():
+    reconcile = _reconcile_step(load()[0])["run"]
+    capture = (
+        'compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status '
+        'running "${non_oneshot_services[@]}")" || compose_rc=$?'
+    )
+    idx_capture = reconcile.index(capture)
+    idx_status_branch = reconcile.index('if [[ "$compose_rc" -eq 0 ]]; then', idx_capture)
+    idx_failure_evidence = reconcile.index(
+        'running_ids_detail="<compose ps failed>"', idx_status_branch
+    )
+    assert idx_capture < idx_status_branch < idx_failure_evidence
 
 
 def test_release_image_reconciliation_excludes_oneshot_services_when_listing_running():
@@ -630,3 +655,27 @@ def test_release_image_reconciliation_requires_all_declared_images_not_any_match
         "release lane must not use single-image 'any running container matches' semantics"
     )
     assert "reconcile_rc=0" in reconcile or "reconcile_rc" in reconcile
+
+
+def test_release_image_reconciliation_rejects_all_oneshot_compose_services():
+    reconcile = _reconcile_step(load()[0])["run"]
+    reject = 'if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then'
+    assert reject in reconcile, (
+        "reconciliation must fail before per-image checks when every compose "
+        "service is declared one-shot"
+    )
+    idx_services = reconcile.index("non_oneshot_services=()")
+    idx_reject = reconcile.index(reject)
+    idx_per_image = reconcile.index("service_images_output=")
+    assert idx_services < idx_reject < idx_per_image, (
+        "the all-one-shot guard must run after filtering services and before "
+        "the per-image loop"
+    )
+    assert "oneshot_services covers every compose service" in reconcile
+    assert "no long-running service" in reconcile
+    assert "cannot prove this SHA is running in production" in reconcile
+    assert "last_good_release has already been promoted to this SHA" in reconcile
+    assert "this step does not trigger automatic rollback" in reconcile
+    assert "manual host verification required" in reconcile
+    assert "not referenced by any non-oneshot service" in reconcile
+    assert "only referenced by oneshot service(s)" not in reconcile
