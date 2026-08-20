@@ -75,6 +75,10 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 把 `examples/caller-workflow.yml` 放进服务仓 `.github/workflows/deploy.yml`：
 
 ```yaml
+on:
+  push:
+    branches: [main]
+
 jobs:
   ship:
     uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
