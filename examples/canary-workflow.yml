@@ -15,6 +15,8 @@ jobs:
       deploy_dir: /srv/automation/canary-svc
       healthcheck_url: http://localhost:9999/healthz
       ci_templates_ref: main      # fetch deploy scripts from main too
+      # 可选·compose 一次性/迁移服务:只在回滚跳过,forward 仍全量 up(见 README oneshot_services)
+      # oneshot_services: migrate
     secrets:
       ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
       ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}

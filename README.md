@@ -56,6 +56,15 @@ services:
 启用后远端按服务忙锁再主机锁的顺序进入整组切换；忙时返回 rc=3，caller 只发黄色延后卡，
 不会 SSH 重试或提升 last-good。
 
+`oneshot_services` 是可选 compose 一次性/迁移服务声明（默认 `""` = 完全保持现状，50+
+存量 caller 零回归）。值为**空格分隔**的 compose 服务名（不是 ACR 镜像名）。**forward
+路径行为不变**：仍是无服务参数的 `compose up -d`，migrate 照常跑。**只在回滚路径**
+把 compose up 收窄为「全部服务 − 声明集合」，防止旧镜像重跑已执行过的 migration（issue
+#24 事故根因：库已被新版本向前迁移后，旧 migration 镜像不认识当前 revision，回滚本身
+失败、生产停摆）。服务名有效性在 forward 路径、碰生产前的 `compose up` 之前校验——写错
+则 fail-loud 点名，不会拖到回滚时才炸。若声明集合覆盖了 compose 中的全部服务，回滚会
+拒绝执行（避免空服务列表退化成全量 up）。
+
 构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本分两个阶段运行：先在锁外拉取并校验这次发布的
 不可变 SHA 镜像并 retag 为 `<image_name>:<sha>`，完成本地 staging；随后才按忙锁 → host `flock`
 顺序进入临界区，在双锁内仅写入统一的 `D3_RELEASE_TAG` compose 环境文件，运行
@@ -187,6 +196,15 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 
 机制细节、锁文件挂载约定、退出码表、验收矩阵见
 [`docs/design/d3-busy-lock-gate.md`](docs/design/d3-busy-lock-gate.md)。
+
+带 migration/一次性 compose 服务的 caller 可在 `with:` 块加一行（两条 lane 均支持；不加则
+行为与现状逐字节一致）：
+
+```yaml
+    with:
+      # ...其余 input 照常...
+      # oneshot_services: migrate   # 空格分隔；只在回滚跳过这些服务，forward 仍全量 up
+```
 
 ### 部署退出码与处置
 
