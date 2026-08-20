@@ -1595,11 +1595,9 @@ def test_oneshot_services_release_rollback_trigger_excludes_migrate(tmp_path, tr
         result = run(env)
     elif trigger == "promote_failure":
         mock_curl(Path(env["CURL_BIN"]), "200")
-        state_dir = Path(env["STATE_DIR"])
-        good_release = state_dir / "last_good_release"
-        good_release.chmod(0o444)
+        fail_mv_target(Path(env["DOCKER_BIN"]).parent / "mv", "last_good_release")
+        env["PATH"] = f'{Path(env["DOCKER_BIN"]).parent}:{os.environ["PATH"]}'
         result = run(env)
-        good_release.chmod(0o644)
     else:
         marker = tmp_path / "probe.started"
         mock_curl_sequence(Path(env["CURL_BIN"]), ["500"], pause_marker=marker)
