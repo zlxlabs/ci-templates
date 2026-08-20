@@ -1187,3 +1187,160 @@ def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
     log = docker_log_path.read_text() if docker_log_path.exists() else ""
     assert "compose up" not in log
     assert "BUSY_LOCK_TIMEOUT" in (res.stdout + res.stderr)
+
+
+COMPOSE_ONESHOT_SERVICES = ("app", "migrate")
+
+
+def _mock_docker_oneshot(log_path: Path) -> str:
+    service_lines = "\\n".join(COMPOSE_ONESHOT_SERVICES)
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "compose" ] && [[ " $* " == *" config --services "* ]]; then
+  printf '{service_lines}\\n'
+  exit 0
+fi
+exit 0
+"""
+
+
+def _compose_up_lines(log_text: str) -> list[str]:
+    return [line for line in log_text.splitlines() if " up -d" in line]
+
+
+def _assert_compose_up_has_no_service_args(line: str) -> None:
+    assert line.rstrip().endswith(" up -d"), line
+
+
+def _assert_compose_up_services(line: str, *, include: tuple[str, ...], exclude: tuple[str, ...]) -> None:
+    parts = line.split()
+    idx = parts.index("-d")
+    services = parts[idx + 1 :]
+    for name in include:
+        assert name in services, (line, services)
+    for name in exclude:
+        assert name not in services, (line, services)
+
+
+def _oneshot_env(tmp_path: Path, *, oneshot_services: str = "migrate") -> dict:
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    docker_log = tmp_path / "docker.log"
+    docker = mock_dir / "docker"
+    curl = mock_dir / "curl"
+    _write_exec(docker, _mock_docker_oneshot(docker_log))
+    _write_exec(curl, _mock_curl("200"))
+
+    deploy_dir = tmp_path / "app"
+    deploy_dir.mkdir(exist_ok=True)
+    (deploy_dir / "docker-compose.yml").write_text(
+        "services:\n  app:\n    image: demo\n  migrate:\n    image: demo\n"
+    )
+
+    env = dict(os.environ)
+    env.update(
+        IMAGE_NAME="demo",
+        ACR_IMAGE="registry.example.com/ns/demo",
+        GIT_SHA="abc1234",
+        DEPLOY_DIR=str(deploy_dir),
+        STATE_DIR=str(tmp_path / "state"),
+        HOST_LOCK=str(tmp_path / "host.lock"),
+        HEALTHCHECK_URL="http://localhost/health",
+        HEALTHCHECK_EXPECT_STATUS="200",
+        HEALTHCHECK_RETRIES="2",
+        HEALTHCHECK_INTERVAL="0",
+        HEALTHCHECK_WARMUP="0",
+        HEALTHCHECK_TIMEOUT="1",
+        DOCKER_BIN=str(docker),
+        CURL_BIN=str(curl),
+        DOCKER_LOG=str(docker_log),
+    )
+    if oneshot_services:
+        env["ONESHOT_SERVICES"] = oneshot_services
+    return env
+
+
+def _run_oneshot_rollback(env: dict, tmp_path: Path, *, unhealthy_sequence=None) -> subprocess.CompletedProcess:
+    assert _run(env).returncode == 0
+    env = dict(env)
+    env["GIT_SHA"] = "def5678"
+    Path(env["DOCKER_LOG"]).write_text("")
+    mock_dir = Path(env["DOCKER_BIN"]).parent
+    sequence = unhealthy_sequence or [("500", 0), ("500", 0), ("200", 0)]
+    _write_exec(mock_dir / "curl", _mock_curl_sequence(tmp_path / "curl-seq.log", sequence))
+    env["CURL_BIN"] = str(mock_dir / "curl")
+    return _run(env)
+
+
+@pytest.mark.parametrize(
+    ("case", "oneshot_services", "phase"),
+    [
+        ("empty_forward", "", "forward"),
+        ("empty_rollback", "", "rollback"),
+        ("valid_forward", "migrate", "forward"),
+        ("valid_rollback", "migrate", "rollback"),
+        ("invalid_forward", "nosuch", "forward"),
+        ("invalid_rollback_unreachable", "nosuch", "forward"),
+        ("all_oneshot_rollback", "app migrate", "rollback"),
+    ],
+)
+def test_oneshot_services_axis1(tmp_path, case, oneshot_services, phase):
+    env = _oneshot_env(tmp_path, oneshot_services=oneshot_services)
+    if phase == "rollback":
+        result = _run_oneshot_rollback(env, tmp_path)
+    else:
+        result = _run(env)
+
+    out = result.stdout + result.stderr
+    up_lines = _compose_up_lines(Path(env["DOCKER_LOG"]).read_text())
+
+    if case == "empty_forward":
+        assert result.returncode == 0, out
+        assert len(up_lines) == 1
+        _assert_compose_up_has_no_service_args(up_lines[0])
+    elif case == "empty_rollback":
+        assert result.returncode == 1, out
+        assert len(up_lines) == 2
+        for line in up_lines:
+            _assert_compose_up_has_no_service_args(line)
+    elif case == "valid_forward":
+        assert result.returncode == 0, out
+        assert len(up_lines) == 1
+        _assert_compose_up_has_no_service_args(up_lines[0])
+    elif case == "valid_rollback":
+        assert result.returncode == 1, out
+        assert len(up_lines) == 2
+        _assert_compose_up_has_no_service_args(up_lines[0])
+        _assert_compose_up_services(
+            up_lines[1], include=("app",), exclude=("migrate",),
+        )
+    elif case in {"invalid_forward", "invalid_rollback_unreachable"}:
+        assert result.returncode != 0, out
+        assert "nosuch" in out.lower()
+        assert not up_lines
+    elif case == "all_oneshot_rollback":
+        assert result.returncode != 0, out
+        assert "nothing would remain" in out.lower() or "no services" in out.lower()
+        assert len(up_lines) == 1
+
+
+def test_oneshot_services_probe_failure_rollback_excludes_migrate(tmp_path):
+    env = _oneshot_env(tmp_path, oneshot_services="migrate")
+    result = _run_oneshot_rollback(env, tmp_path)
+    up_lines = _compose_up_lines(Path(env["DOCKER_LOG"]).read_text())
+    assert result.returncode == 1, result.stdout + result.stderr
+    _assert_compose_up_services(up_lines[-1], include=("app",), exclude=("migrate",))
+
+
+def test_oneshot_services_no_last_good_still_rejects_pseudo_rollback(tmp_path):
+    env = _oneshot_env(tmp_path, oneshot_services="migrate")
+    mock_dir = Path(env["DOCKER_BIN"]).parent
+    _write_exec(mock_dir / "curl", _mock_curl("500"))
+    env["CURL_BIN"] = str(mock_dir / "curl")
+    result = _run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 4, out
+    assert "no previous good tag" in out.lower()
+    up_lines = _compose_up_lines(Path(env["DOCKER_LOG"]).read_text())
+    assert len(up_lines) == 1
+    _assert_compose_up_has_no_service_args(up_lines[0])
