@@ -156,3 +156,4 @@ def test_release_example_documents_immutable_compose_tag_requirement():
     # 写清楚,否则用户照抄后 compose 不会真的按 SHA 切换镜像。
     text = (EXAMPLES / "release-caller-workflow.yml").read_text()
     assert "D3_RELEASE_TAG" in text
+    assert "对账 step" in text or "reconcile" in text.lower()

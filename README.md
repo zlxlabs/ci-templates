@@ -322,6 +322,30 @@ image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过�
 对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
 延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
 
+### 部署后镜像事实对账（release lane）
+
+`build-deploy-release.yml` 在原子发布探针通过、远端脚本已 promote `last_good_release`
+之后，还会在同一目标机上做**两段** per-image 对账：manifest 里每个 declared image 的
+`<image_name>:<D3_RELEASE_TAG>` 可 inspect 出 expected image ID，且至少一个**非 one-shot**
+compose 服务的 running 容器通过 `docker inspect` 使用该 ID。release lane **刻意不使用**
+`<image_name>:latest` 中间段——该 lane 全程只用不可变 SHA tag（见
+`release_deploy.sh` 头部注释），对账也是 expected vs running 两段，不是单镜像 lane 的三段。
+
+与远端 `compose config --images` **身份门禁**（`release_deploy.sh` 在 `compose up` 前校验
+compose **声明**里每个 declared image 都解析为 `<name>:<tag>`）不同：对账 step 校验的是
+**实际在跑的容器**用了哪些 image ID。身份门禁防「compose 文件还指着旧 tag 就 up」；
+对账防「探针 200 但某个 long-running 容器仍是旧镜像」——两者防的不是同一件事。
+
+`oneshot_services` 声明的一次性/迁移服务在取 running 容器时被排除（`compose ps -q
+--status running` 只查非 one-shot 服务）；某个 declared image **仅**被 one-shot 服务引用时，
+不要求有 running 容器，避免 migrate 容器已退出导致假红。
+
+任一需要 running 检查的 declared image 对不上，workflow 判红并打印该镜像的 expected /
+running 全景；错误信息同时说明 `last_good_release` **已经**被推进到本次 SHA（promote 发生在
+远端脚本内、早于本 step），且本 step 红**不会**触发自动回滚——需要人工上机确认。SSH 对账
+连接只对传输层 `rc=255` 做有限重试。`busy_deferred`（rc=3）、`rc=1`/`rc=4` 部署失败和
+传输耗尽不会执行对账。
+
 部署失败通知读取调用方 repo variables:
 - `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
 - `FEISHU_CI_TITLE_PREFIX`: 机器人关键词标题前缀；未配置时默认 `[zlxlabs·CI]`。
@@ -347,6 +371,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账 | `build-deploy.yml` 镜像对账 step |
+| **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
 
 ## registry.yaml 字段清单（D4/D5/D7 共用）
