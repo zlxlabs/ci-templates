@@ -525,3 +525,99 @@ def test_oneshot_services_remote_cmd_is_quoted_and_passed_through():
     remote_cmd = text[remote_start:remote_end]
     assert "ONESHOT_SERVICES=%q" in remote_cmd
     assert '"$ONESHOT_SERVICES"' in remote_cmd
+
+
+def _reconcile_step(raw):
+    return next(
+        step for step in raw["jobs"]["release"]["steps"]
+        if step.get("name", "").startswith("Reconcile deployed release images")
+    )
+
+
+def test_release_normalize_step_exports_image_names_for_reconcile():
+    raw, _ = load()
+    normalize = next(
+        step for step in raw["jobs"]["release"]["steps"]
+        if step.get("name") == "Validate and normalize release declaration"
+    )
+    assert normalize.get("id") == "normalize"
+    run = normalize["run"]
+    assert 'awk -F\'\\t\' \'$1=="image"{print $2}\'' in run
+    assert 'image_names=' in run
+    assert '"$GITHUB_OUTPUT"' in run
+
+
+def test_release_post_deploy_image_reconciliation_is_success_only_and_skips_busy_deferred():
+    raw, _ = load()
+    steps = raw["jobs"]["release"]["steps"]
+    deploy_index = next(i for i, step in enumerate(steps) if step.get("id") == "deploy")
+    reconcile_index = next(
+        i for i, step in enumerate(steps)
+        if step.get("name", "").startswith("Reconcile deployed release images")
+    )
+    reconcile = steps[reconcile_index]
+    assert reconcile_index == deploy_index + 1, (
+        "release image reconciliation must run immediately after the deploy step"
+    )
+    assert reconcile["if"] == (
+        "success() && steps.deploy.outputs.busy_deferred != 'true'"
+    ), (
+        "release reconciliation must skip deferred/busy paths and any deploy failure "
+        "(success() excludes rc=1/rc=4/transport-exhausted failures)"
+    )
+
+
+def test_release_image_reconciliation_uses_per_image_two_stage_contract():
+    raw, _ = load()
+    reconcile = _reconcile_step(raw)
+    run = reconcile["run"]
+    assert 'printf -v RECONCILE_COMMAND' in run
+    assert 'bash -s' in run
+    assert 'D3_RELEASE_TAG=%q' in run
+    assert 'IMAGE_NAMES=%q' in run
+    assert 'ONESHOT_SERVICES=%q' in run
+    assert 'DEPLOY_DIR=%q' in run
+    assert 'ACR_REGISTRY=%q' in run
+    assert 'ACR_NAMESPACE=%q' in run
+    assert "${IMAGE_NAME}:latest" not in run, (
+        "release lane must not introduce a mutable latest tag reconciliation stage"
+    )
+    assert 'docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"' in run
+    assert 'docker compose config --services' in run
+    assert 'docker compose ps -q --status running' in run
+    assert 'docker inspect "$container_id" --format' in run
+    assert "for image_name in" in run
+    assert "oneshot_only" in run or "non_oneshot" in run or "oneshot_svc" in run
+    assert "running_match" in run or "matched_running" in run
+    assert "::notice::" in run
+    assert "release image reconcile values:" in run
+    assert "expected_id=" in run and "running_ids=" in run
+
+
+def test_release_image_reconciliation_per_image_mismatch_and_missing_running_branches():
+    reconcile = _reconcile_step(load()[0])["run"]
+    assert "::error::release image reconcile mismatch" in reconcile
+    assert "::error::release image reconcile no running container" in reconcile
+    assert "last_good_release has already been promoted to this SHA" in reconcile
+    assert "this step does not trigger automatic rollback" in reconcile
+    assert "manual host verification required" in reconcile
+
+
+def test_release_image_reconciliation_excludes_oneshot_services_when_listing_running():
+    reconcile = _reconcile_step(load()[0])["run"]
+    assert "ONESHOT_SERVICES" in reconcile
+    assert "oneshot" in reconcile.lower()
+    idx_oneshot = reconcile.lower().index("oneshot")
+    idx_compose_ps = reconcile.index("docker compose ps -q --status running")
+    assert idx_oneshot < idx_compose_ps, (
+        "one-shot services must be filtered before docker compose ps selects running containers"
+    )
+
+
+def test_release_image_reconciliation_requires_all_declared_images_not_any_match():
+    reconcile = _reconcile_step(load()[0])["run"]
+    assert "any.*match" not in reconcile.replace(" ", "")
+    assert "running_match=1" not in reconcile, (
+        "release lane must not use single-image 'any running container matches' semantics"
+    )
+    assert "reconcile_rc=0" in reconcile or "reconcile_rc" in reconcile
