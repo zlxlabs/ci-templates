@@ -66,7 +66,9 @@
 
 ## 2026-07-28 · Codex review(buildx 层缓存 R2) · P2 · buildx 失败降级会导致完整构建两次
 
-**现象**：`buildx build` 因 Dockerfile 自身错误（而非缓存问题）失败时，会再跑一次 classic build 才最终失败。对 url-parse-api 这种单次构建 80+ 分钟的仓，用户要等两倍时间才看到错误。
+**现象**：`buildx build` 因 Dockerfile 自身错误（而非缓存问题）失败时，会再跑一次 classic build 才最终失败。用户要等两倍构建时间才看到错误。
+
+**2026-08-21 更正**：本条原文写的是「对 url-parse-api 这种单次构建 80+ 分钟的仓」。该数字是 buildx 层缓存落地**之前**的观测值，现已过期，实测差一个量级——url-parse-api 的 `Build & push` step：只改 workflow pin 时 71s（run 32279595829），改动 README 使 `COPY` 后续层失效时 6m28s（run 32440279413）。本条的接受理由不依赖该绝对值（成本是「翻倍」这个倍数关系，不是具体分钟数），因此结论不变。
 
 **接受理由**：这是不变式 2「缓存故障不得转化为构建失败」的直接代价。区分「buildx 基础设施故障」与「构建本身失败」需要解析错误输出或分两步执行，属于新机制。`--cache-to` 已有 `ignore-error=true`、`--cache-from` 本身是 best-effort，因此 buildx 失败**基本等价于**构建本身失败，降级的真实价值只剩「builder 容器 OOM/崩溃」这一类。
 
