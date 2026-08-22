@@ -2,6 +2,18 @@
 
 给在本仓工作的 AI agent 的项目级约定。人类读 `README.md`（仓库结构、契约、发布流程都在那里，本文不重复）。
 
+## 与 gate-hub 的关系
+
+本仓是 `zlxlabs/gate-hub`（控制仓）的**附属仓库**：同一 owner、同一批 agent 维护，
+与 `zlxlabs/gate` 一起构成一套门禁与部署基础设施。agent-config `core.md`
+「跨仓写权边界：他仓问题只去对方仓提 issue 挂证据，不跨仓改代码」**在这三个仓之间不适用**
+——从 gate-hub 那边发现本仓的缺口，可以直接来改码开 PR，不必先挂 issue 等人接。
+完整的豁免范围与仍然成立的约束见 gate-hub 的 `AGENTS.md`「附属仓库」节。
+
+豁免的只有「不许跨仓改码」这一条。本仓的 `risk-tier` 仍由下面这一节自行声明、不从
+gate-hub 继承；「改动纪律」一节的爆炸半径要求对来自 gate-hub 的改动同样成立，
+不因为是附属仓关系就放宽。
+
 ## 风险等级：`internal`
 
 本仓按 **`internal`** 档评审。词汇与 CI gate 的 `GATE_TIER` 一致，但注意本仓的 pre-merge 门禁
