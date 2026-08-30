@@ -349,6 +349,8 @@ jobs:
               echo "deploy_rc=${rc}" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deploy_rc output"
               if [[ "$rc" -eq 4 ]]; then
                 echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
+              elif [[ "$rc" -eq 5 ]]; then
+                echo "reconcile_failed=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write reconcile_failed output"
               elif [[ "$rc" -eq 3 ]]; then
                 if [[ "$had_transport_failure" -eq 1 ]]; then
                   # Design decision (2026-07-24 subtractive refactor: dropped the
@@ -365,7 +367,11 @@ jobs:
                 fi
                 echo "busy_deferred=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write busy_deferred output"
               fi
-              echo "::error::release deploy failed (rc=${rc}); no transport retry"
+              if [[ "$rc" -eq 5 ]]; then
+                echo "::error::release image reconcile assertion failed (rc=5); deployment may have succeeded, but production image identity is not proven"
+              else
+                echo "::error::release deploy failed (rc=${rc}); no transport retry"
+              fi
               exit "$rc"
             fi
             had_transport_failure=1
@@ -379,201 +385,13 @@ jobs:
           done
 
       - name: Reconcile deployed release images (expected tag vs running containers)
-        # Green must prove every declared long-running image is what production
-        # runs, not only that release probes returned 200. success() excludes
-        # rc=3 busy_deferred and rc=1/rc=4/transport-exhausted deploy failures.
-        if: success() && steps.deploy.outputs.busy_deferred != 'true'
-        env:
-          ACR_REGISTRY: ${{ inputs.acr_registry }}
-          ACR_NAMESPACE: ${{ inputs.acr_namespace }}
-          D3_RELEASE_TAG: ${{ steps.sha.outputs.git_sha }}
-          IMAGE_NAMES: ${{ steps.normalize.outputs.image_names }}
-          DEPLOY_HOST: ${{ inputs.host }}
-          SSH_USER: ${{ inputs.ssh_user }}
-          DEPLOY_DIR: ${{ inputs.deploy_dir }}
-          ONESHOT_SERVICES: ${{ inputs.oneshot_services }}
+        # Thin shell: remote reconcile already ran under HOST_LOCK (rc=5).
+        # busy_deferred/deploy failures never write reconcile_failed, so skip.
+        if: failure() && steps.deploy.outputs.reconcile_failed == 'true'
         run: |
           set -euo pipefail
-
-          [[ "$SSH_USER" =~ ^[a-z_][a-z0-9_-]{0,31}$ ]] || { echo "::error::invalid ssh_user"; exit 1; }
-          [[ "$DEPLOY_HOST" =~ ^[A-Za-z0-9._-]+$ ]] || { echo "::error::invalid host"; exit 1; }
-
-          SSH_OPTS="-i $HOME/.ssh/id_deploy \
-            -o ServerAliveInterval=15 -o ServerAliveCountMax=4 -o ConnectTimeout=20"
-
-          printf -v RECONCILE_COMMAND \
-            'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q IMAGE_NAMES=%q DEPLOY_DIR=%q ONESHOT_SERVICES=%q bash -s' \
-            "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$IMAGE_NAMES" "$DEPLOY_DIR" "$ONESHOT_SERVICES"
-
-          reconcile_once() {
-            ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "$RECONCILE_COMMAND" <<'REMOTE'
-          set -u -o pipefail
-
-          read -ra DECLARED_IMAGES <<< "$IMAGE_NAMES"
-          if [[ "${#DECLARED_IMAGES[@]}" -eq 0 || -z "${DECLARED_IMAGES[0]}" ]]; then
-            echo "::error::release image reconcile has no declared images"
-            exit 1
-          fi
-
-          declare -A oneshot_svc=()
-          for svc in $ONESHOT_SERVICES; do
-            [[ -n "$svc" ]] && oneshot_svc["$svc"]=1
-          done
-
-          # One-shot/migration services exit after compose up; they must not
-          # participate in the running-container sample, and declared images
-          # referenced only by those services skip the running check entirely.
-          all_services_output=""
-          if ! all_services_output="$(cd "$DEPLOY_DIR" && docker compose config --services)"; then
-            echo "::error::release image reconcile could not list compose services"
-            exit 1
-          fi
-          readarray -t all_services <<< "$all_services_output"
-
-          non_oneshot_services=()
-          for svc in "${all_services[@]}"; do
-            [[ -n "$svc" && -z "${oneshot_svc[$svc]+x}" ]] && non_oneshot_services+=("$svc")
-          done
-
-          if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then
-            echo "::error::release image reconcile refused: oneshot_services covers every compose service; no long-running service is available for reconciliation; cannot prove this SHA is running in production; last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
-            exit 1
-          fi
-
-          service_images_output=""
-          for svc in "${non_oneshot_services[@]}"; do
-            image_ref=""
-            if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" docker compose config --images "$svc")"; then
-              echo "::error::release image reconcile could not render compose image for service ${svc}"
-              exit 1
-            fi
-            service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
-          done
-
-          running_ids_detail=""
-          compose_rc=0
-          compose_output=""
-          if [[ "${#non_oneshot_services[@]}" -gt 0 ]]; then
-            compose_output="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
-          fi
-          if [[ "$compose_rc" -eq 0 ]]; then
-            while IFS= read -r container_id; do
-              [[ -n "$container_id" ]] || continue
-              cid_image_id="<inspect failed>"
-              if cid_image_id="$(docker inspect "$container_id" --format '{{.Image}}')"; then
-                running_ids_detail="${running_ids_detail}${container_id}=${cid_image_id}"$'\n'
-              else
-                running_ids_detail="${running_ids_detail}${container_id}=<inspect failed>"$'\n'
-              fi
-            done <<< "$compose_output"
-          else
-            running_ids_detail="<compose ps failed>"$'\n'
-          fi
-          [[ -n "$running_ids_detail" ]] || running_ids_detail="<none>"$'\n'
-
-          reconcile_rc=0
-          for image_name in "${DECLARED_IMAGES[@]}"; do
-            expected_id="<unavailable>"
-            expected_rc=0
-            if expected_id="$(docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}" --format '{{.Id}}')"; then
-              [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
-            else
-              expected_rc=$?
-              expected_id="<inspect failed>"
-            fi
-
-            svc_using_image=()
-            while IFS='=' read -r svc image_ref; do
-              [[ -n "$svc" && -n "$image_ref" ]] || continue
-              [[ -n "${oneshot_svc[$svc]+x}" ]] && continue
-              if [[ "$image_ref" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
-                svc_using_image+=("$svc")
-              fi
-            done <<< "$service_images_output"
-
-            matched_running=0
-            saw_running_for_image=0
-            mismatch_details=""
-            for svc in "${svc_using_image[@]}"; do
-              container_id=""
-              if ! container_id="$(cd "$DEPLOY_DIR" && docker compose ps -q --status running "$svc")"; then
-                reconcile_rc=1
-                mismatch_details="${mismatch_details}${svc}=<compose ps failed>; "
-                continue
-              fi
-              [[ -n "$container_id" ]] || continue
-              saw_running_for_image=1
-              cid_image_id="<inspect failed>"
-              if cid_image_id="$(docker inspect "$container_id" --format '{{.Image}}')"; then
-                if [[ "$cid_image_id" == "$expected_id" ]]; then
-                  matched_running=1
-                else
-                  mismatch_details="${mismatch_details}${svc}=${container_id}:${cid_image_id}; "
-                fi
-              else
-                mismatch_details="${mismatch_details}${svc}=${container_id}:<inspect failed>; "
-              fi
-            done
-
-            echo "release image reconcile values:"
-            printf '  image=%s\n' "$image_name"
-            printf '  expected_id=%s\n' "$expected_id"
-            printf '  running_ids=%s' "$running_ids_detail"
-
-            if [[ "$expected_rc" -ne 0 ]]; then
-              echo "::error::release image reconcile expected tag image is unavailable: ${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG} (expected_id=${expected_id}); last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
-              reconcile_rc=1
-              continue
-            fi
-
-            if [[ ${#svc_using_image[@]} -eq 0 ]]; then
-              echo "::notice::release image reconcile skipped running check for ${image_name} (not referenced by any non-oneshot service)"
-              continue
-            fi
-
-            if [[ "$matched_running" -eq 1 ]]; then
-              echo "::notice::release image reconcile passed for ${image_name}: expected_id=${expected_id}"
-              continue
-            fi
-
-            # Fail loud with the post-promote state: remote release_deploy.sh
-            # already advanced last_good_release after probes passed; this step
-            # only observes and never triggers rollback.
-            if [[ "$saw_running_for_image" -eq 0 ]]; then
-              echo "::error::release image reconcile no running container uses ${image_name}:${D3_RELEASE_TAG} (expected_id=${expected_id}, running_ids=${running_ids_detail}); last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
-              reconcile_rc=1
-              continue
-            fi
-
-            echo "::error::release image reconcile mismatch for ${image_name}: expected_id=${expected_id}, running=${mismatch_details}running_ids=${running_ids_detail}; last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required"
-            reconcile_rc=1
-          done
-
-          if [[ "$reconcile_rc" -ne 0 ]]; then
-            exit 1
-          fi
-          echo "::notice::release image reconcile passed for all declared images requiring running containers"
-          REMOTE
-          }
-
-          attempt=1; max_attempts=3
-          while true; do
-            rc=0; reconcile_once || rc=$?
-            if [ "$rc" -eq 0 ]; then
-              break
-            fi
-            if [ "$rc" -ne 255 ]; then
-              echo "::error::release image reconcile assertion failed (rc=${rc}); deployment may have succeeded, but production image identity is not proven"
-              exit "$rc"
-            fi
-            if [ "$attempt" -ge "$max_attempts" ]; then
-              echo "::error::release image reconcile SSH transport failed after ${max_attempts} attempts (rc=255); deployment result is unverified"
-              exit 1
-            fi
-            echo "::warning::release image reconcile SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"
-            attempt=$((attempt + 1))
-            sleep 10
-          done
+          echo "::error::release image reconcile assertion failed (rc=5); deployment may have succeeded, but production image identity is not proven"
+          exit 1
 
       - name: Feishu release busy defer card (yellow, fail-open)
         if: failure() && steps.deploy.outputs.busy_deferred == 'true'
@@ -706,6 +524,8 @@ jobs:
               guidance = "远端收到信号(rc=130)，立即确认远端状态。"
           elif remote_rc == "1":
               guidance = "远端已回滚且旧版本健康(rc=1)，生产停在已验证的 last_good，不需要紧急上机。"
+          elif remote_rc == "5":
+              guidance = "部署已成功但对账失败(rc=5)，last_good 已推进到本 SHA，对账不触发自动回滚，需上机核验生产镜像。"
           elif remote_rc:
               guidance = f"远端返回 rc={remote_rc}，请打开 Run 查看部署日志并按实际阶段处置。"
           else:
