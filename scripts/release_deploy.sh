@@ -263,9 +263,15 @@ compose_list_services() {
 }
 
 validate_oneshot_services() {
-  local tag="$1" svc all_services=() invalid=()
+  local tag="$1" svc all_services=() invalid=() all_services_output=""
   [[ -z "$ONESHOT_SERVICES" ]] && return 0
-  readarray -t all_services < <(compose_list_services "$tag") || return 1
+  # Command substitution (not process substitution) so compose_list_services
+  # failures surface as this function's exit status. readarray's exit status
+  # does not reflect a failing producer in `< <(...)`.
+  if ! all_services_output="$(compose_list_services "$tag")"; then
+    return 1
+  fi
+  readarray -t all_services <<< "$all_services_output"
   declare -A _known=()
   for svc in "${all_services[@]}"; do
     [[ -n "$svc" ]] && _known["$svc"]=1
@@ -281,8 +287,14 @@ validate_oneshot_services() {
 }
 
 rollback_compose_services() {
-  local tag="$1" svc all_services=() keep=()
-  readarray -t all_services < <(compose_list_services "$tag") || return 1
+  local tag="$1" svc all_services=() keep=() all_services_output=""
+  # Same capture pattern as validate_oneshot_services: process substitution
+  # would swallow compose_list_services' non-zero status and leave an empty
+  # array, which then mis-reports as "oneshot_services covers every service".
+  if ! all_services_output="$(compose_list_services "$tag")"; then
+    return 1
+  fi
+  readarray -t all_services <<< "$all_services_output"
   declare -A _skip=()
   for svc in $ONESHOT_SERVICES; do
     _skip["$svc"]=1
