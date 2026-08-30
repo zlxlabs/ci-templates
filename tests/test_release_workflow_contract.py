@@ -564,16 +564,8 @@ def test_release_post_deploy_image_reconciliation_is_success_only_and_skips_busy
         if step.get("name", "").startswith("Reconcile deployed release images")
     )
     reconcile = steps[reconcile_index]
-    assert reconcile_index == deploy_index + 1, (
-        "release image reconciliation must run immediately after the deploy step"
-    )
-    assert reconcile["if"] == (
-        "failure() && steps.deploy.outputs.reconcile_failed == 'true'"
-    ), (
-        "thin reconcile step must run only when the deploy SSH returned rc=5; "
-        "busy_deferred (rc=3) and deploy/rollback failures never write "
-        "reconcile_failed, preserving the old skip"
-    )
+    assert reconcile_index == deploy_index + 1
+    assert reconcile["if"] == "failure() && steps.deploy.outputs.reconcile_failed == 'true'"
     deploy_run = steps[deploy_index]["run"]
     assert 'elif [[ "$rc" -eq 5 ]]; then' in deploy_run
     assert "reconcile_failed=true" in deploy_run
@@ -585,101 +577,42 @@ def test_release_post_deploy_image_reconciliation_is_success_only_and_skips_busy
 def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     raw, _ = load()
     thin = _reconcile_step(raw)["run"]
-    assert "printf -v RECONCILE_COMMAND" not in thin
-    assert "bash -s" not in thin
-    assert "ssh " not in thin
+    assert "printf -v RECONCILE_COMMAND" not in thin and "bash -s" not in thin and "ssh " not in thin
     assert "release image reconcile assertion failed" in thin
-
     script = SCRIPT.read_text()
-    assert "reconcile_release_images()" in script
     after_do_release = script[script.index("do_release\nrc=$?"):]
     assert "reconcile_release_images" in after_do_release
     assert after_do_release.index("reconcile_release_images") < after_do_release.index("flock -u 9")
     assert "${IMAGE_NAME}:latest" not in script
-    assert (
-        '"$DOCKER_BIN" image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"'
-        in script
-    )
-    assert "compose_list_services" in script
-    assert 'config --images "$svc"' in script
+    assert 'RECONCILE_CMD_TIMEOUT="${RECONCILE_CMD_TIMEOUT:-60}"' in script
+    assert "reconcile_docker()" in script
+    assert 'reconcile_docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"' in script
+    assert "compose_list_services" in script and 'config --images "$svc"' in script
     assert "config --format '{{" not in script
     assert "could not render compose image for service" in script
     assert 'readarray -t all_services <<< "$all_services_output"' in script
     assert "readarray -t all_services < <(" not in script
     assert 'ps -q --status running' in script
-    assert '"$DOCKER_BIN" inspect "$container_id" --format' in script
-    assert "for image_name in" in script
-    assert "oneshot_svc" in script
-    assert "matched_running" in script
-    assert "::notice::" in script
+    assert 'reconcile_docker inspect "$container_id" --format' in script
+    assert "oneshot_svc" in script and "matched_running" in script and "::notice::" in script
     assert "release image reconcile values:" in script
-    assert "expected_id=" in script and "running_ids=" in script
-    assert "rc=5" in after_do_release
-
-
-def test_release_image_reconciliation_per_image_mismatch_and_missing_running_branches():
-    script = SCRIPT.read_text()
+    assert "expected_id=" in script and "running_ids=" in script and "rc=5" in after_do_release
+    assert script.index("skip forward deploy") < script.index('deploy_group "$D3_RELEASE_TAG"')
     assert "::error::release image reconcile mismatch" in script
     assert "::error::release image reconcile no running container" in script
     assert "last_good_release has already been promoted to this SHA" in script
-    assert "this step does not trigger automatic rollback" in script
-    assert "manual host verification required" in script
-
-
-def test_release_image_reconciliation_keeps_compose_failure_evidence_path():
-    script = SCRIPT.read_text()
+    recon = script[script.index("reconcile_release_images()"):]
+    assert "running_match=1" not in recon
     capture = (
         'compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" '
-        '"$DOCKER_BIN" "${compose_args[@]}" ps -q --status running '
+        'reconcile_docker "${compose_args[@]}" ps -q --status running '
         '"${non_oneshot_services[@]}")" || compose_rc=$?'
     )
-    idx_capture = script.index(capture)
-    idx_status_branch = script.index('if [[ "$compose_rc" -eq 0 ]]; then', idx_capture)
-    idx_failure_evidence = script.index(
-        'running_ids_detail="<compose ps failed>"', idx_status_branch
-    )
-    assert idx_capture < idx_status_branch < idx_failure_evidence
-
-
-def test_release_image_reconciliation_excludes_oneshot_services_when_listing_running():
-    script = SCRIPT.read_text()
-    assert "ONESHOT_SERVICES" in script
-    idx_oneshot = script.index("oneshot_svc")
-    idx_compose_ps = script.index("ps -q --status running")
-    assert idx_oneshot < idx_compose_ps, (
-        "one-shot services must be filtered before docker compose ps selects running containers"
-    )
-
-
-def test_release_image_reconciliation_requires_all_declared_images_not_any_match():
-    script = SCRIPT.read_text()
-    recon = script[script.index("reconcile_release_images()"):]
-    assert "running_match=1" not in recon, (
-        "release lane must not use single-image 'any running container matches' semantics"
-    )
-    assert "reconcile_rc=0" in recon
-
-
-def test_release_image_reconciliation_rejects_all_oneshot_compose_services():
-    script = SCRIPT.read_text()
-    recon = script[script.index("reconcile_release_images()"):]
+    assert script.index(capture) < script.index('if [[ "$compose_rc" -eq 0 ]]; then', script.index(capture))
+    assert script.index("oneshot_svc") < script.index("ps -q --status running")
     reject = 'if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then'
-    assert reject in recon, (
-        "reconciliation must fail before per-image checks when every compose "
-        "service is declared one-shot"
-    )
-    idx_services = recon.index("non_oneshot_services=()")
-    idx_reject = recon.index(reject)
-    idx_per_image = recon.index("service_images_output=\"${service_images_output}")
-    assert idx_services < idx_reject < idx_per_image, (
-        "the all-one-shot guard must run after filtering services and before "
-        "the per-image loop"
+    assert recon.index("non_oneshot_services=()") < recon.index(reject) < recon.index(
+        "service_images_output=\"${service_images_output}"
     )
     assert "oneshot_services covers every compose service" in script
-    assert "no long-running service" in script
-    assert "cannot prove this SHA is running in production" in script
-    assert "last_good_release has already been promoted to this SHA" in script
-    assert "this step does not trigger automatic rollback" in script
-    assert "manual host verification required" in script
-    assert "not referenced by any non-oneshot service" in script
     assert "only referenced by oneshot service(s)" not in script

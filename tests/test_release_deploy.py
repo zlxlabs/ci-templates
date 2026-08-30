@@ -1717,18 +1717,12 @@ exit 0
 
 def test_readarray_does_not_swallow_compose_list_services_exit_status():
     text = SCRIPT.read_text()
-    assert 'readarray -t all_services <<< "$all_services_output"' in text
     assert text.count('readarray -t all_services <<< "$all_services_output"') == 3
-    assert "readarray -t all_services < <(" not in text, (
-        "readarray must not swallow compose_list_services failures via process substitution"
-    )
-    assert 'if ! all_services_output="$(compose_list_services "$tag")"; then' in text
+    assert "readarray -t all_services < <(" not in text
     assert text.count('if ! all_services_output="$(compose_list_services "$tag")"; then') == 2
 
 
 def _mock_identity_ok_compose_services_fail(path: Path, log: Path, *, services_fail_from=1):
-    """Identity gate (config --images) succeeds; config --services fails from
-    the Nth call onward (1-based)."""
     count_file = log.parent / "compose-services.count"
     write_exec(
         path,
@@ -1756,9 +1750,7 @@ exit 0
 
 def test_validate_oneshot_services_compose_config_failure_is_attributed(tmp_path):
     env, log = _oneshot_base(tmp_path, oneshot_services="migrate")
-    _mock_identity_ok_compose_services_fail(
-        Path(env["DOCKER_BIN"]), log, services_fail_from=1,
-    )
+    _mock_identity_ok_compose_services_fail(Path(env["DOCKER_BIN"]), log, services_fail_from=1)
     result = run(env)
     out = result.stdout + result.stderr
     assert result.returncode != 0, out
@@ -1774,9 +1766,7 @@ def test_rollback_compose_services_compose_config_failure_is_attributed(tmp_path
     env["D3_RELEASE_TAG"] = "def567890123"
     log.write_text("")
     (log.parent / "compose-services.count").unlink(missing_ok=True)
-    _mock_identity_ok_compose_services_fail(
-        Path(env["DOCKER_BIN"]), log, services_fail_from=2,
-    )
+    _mock_identity_ok_compose_services_fail(Path(env["DOCKER_BIN"]), log, services_fail_from=2)
     mock_curl(Path(env["CURL_BIN"]), "500")
     result = run(env)
     out = result.stdout + result.stderr
@@ -1825,24 +1815,34 @@ def test_reconcile_mismatch_returns_rc5_and_keeps_last_good(tmp_path):
 
 def test_reconcile_compose_config_failure_returns_rc5(tmp_path):
     env, log = base(tmp_path)
-    write_exec(
-        Path(env["DOCKER_BIN"]),
-        f'''#!/bin/bash
-echo "$@" >> "{log}"
-if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
-  echo "compose: invalid compose file" >&2
-  exit 1
-fi
-if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
-  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
-  exit 0
-fi
-exit 0
-''',
-    )
+    _mock_identity_ok_compose_services_fail(Path(env["DOCKER_BIN"]), log, services_fail_from=1)
     result = run(env)
     out = result.stdout + result.stderr
     assert result.returncode == 5, out
     assert "compose config --services failed" in out
     assert "release image reconcile could not list compose services" in out
+    assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_promoted_sha_reentry_skips_forward_compose_and_oneshot(tmp_path):
+    env, log = _oneshot_base(tmp_path, oneshot_services="migrate")
+    assert run(env).returncode == 0
+    assert _compose_up_lines(log.read_text())
+    log.write_text("")
+    second = run(env)
+    out = second.stdout + second.stderr
+    assert second.returncode == 0, out
+    assert "skip forward deploy" in out and "reconcile starting" in out
+    assert not _compose_up_lines(log.read_text()) and " up -d" not in log.read_text()
+
+
+def test_reconcile_docker_timeout_returns_rc5_and_keeps_last_good(tmp_path):
+    env, log = base(tmp_path)
+    env["RECONCILE_CMD_TIMEOUT"] = "1"
+    docker = Path(env["DOCKER_BIN"])
+    write_exec(docker, '#!/bin/bash\nif [ "$1" = inspect ]; then sleep 8; fi\n' + docker.read_text().split("\n", 1)[1])
+    result = run(env, timeout=20)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "timed out after 1s holding host lock" in out
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()

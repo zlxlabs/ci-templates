@@ -101,6 +101,7 @@ HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"
 EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"
+RECONCILE_CMD_TIMEOUT="${RECONCILE_CMD_TIMEOUT:-60}"
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
 ONESHOT_SERVICES="${ONESHOT_SERVICES:-}"
@@ -128,7 +129,7 @@ MUTATED=0
   echo "[release] retry counts must be positive integers" >&2
   exit 2
 }
-[[ "$PULL_RETRY_DELAY" =~ ^[0-9]+$ && "$HEALTHCHECK_INTERVAL" =~ ^[0-9]+$ && "$HEALTHCHECK_WARMUP" =~ ^[0-9]+$ && "$HEALTHCHECK_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
+[[ "$PULL_RETRY_DELAY" =~ ^[0-9]+$ && "$HEALTHCHECK_INTERVAL" =~ ^[0-9]+$ && "$HEALTHCHECK_WARMUP" =~ ^[0-9]+$ && "$HEALTHCHECK_TIMEOUT" =~ ^[1-9][0-9]*$ && "$RECONCILE_CMD_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || {
   echo "[release] timing values must be non-negative/positive integers" >&2
   exit 2
 }
@@ -245,6 +246,17 @@ pull_and_retag() {
   return 0
 }
 
+# Lock-held docker bound. 124 = timeout → rc=5.
+reconcile_docker() {
+  timeout --kill-after=1s "${RECONCILE_CMD_TIMEOUT}s" "$DOCKER_BIN" "$@"
+  local rc=$?
+  if (( rc == 124 || rc == 137 )); then
+    echo "::error::release image reconcile timed out after ${RECONCILE_CMD_TIMEOUT}s holding host lock" >&2
+    return 124
+  fi
+  return "$rc"
+}
+
 compose_list_services() {
   local tag="$1" compose_args=(compose) config_rc=0 services=""
   if [[ -f "$DEPLOY_DIR/.env" ]]; then
@@ -253,7 +265,8 @@ compose_list_services() {
   if [[ -f "$ENV_FILE" ]]; then
     compose_args+=(--env-file "$ENV_FILE")
   fi
-  services="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}" config --services 2>&1)" || config_rc=$?
+  services="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" reconcile_docker "${compose_args[@]}" config --services 2>&1)" || config_rc=$?
+  (( config_rc == 124 )) && return 1
   if (( config_rc != 0 )); then
     log "compose config --services failed; compose up will not run" >&2
     return 1
@@ -347,23 +360,24 @@ reconcile_release_images() {
 
   for svc in "${non_oneshot_services[@]}"; do
     image_ref=""
-    if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" config --images "$svc")"; then
+    if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" config --images "$svc")"; then
       echo "::error::release image reconcile could not render compose image for service ${svc}" >&2
       return 1
     fi
     service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
   done
 
-  compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
+  compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
+  (( compose_rc == 124 )) && return 1
   if [[ "$compose_rc" -eq 0 ]]; then
     while IFS= read -r container_id; do
       [[ -n "$container_id" ]] || continue
-      cid_image_id="<inspect failed>"
-      if cid_image_id="$("$DOCKER_BIN" inspect "$container_id" --format '{{.Image}}')"; then
-        running_ids_detail="${running_ids_detail}${container_id}=${cid_image_id}"$'\n'
-      else
+      cid_image_id="$(reconcile_docker inspect "$container_id" --format '{{.Image}}')" || {
+        (( $? == 124 )) && return 1
         running_ids_detail="${running_ids_detail}${container_id}=<inspect failed>"$'\n'
-      fi
+        continue
+      }
+      running_ids_detail="${running_ids_detail}${container_id}=${cid_image_id}"$'\n'
     done <<< "$compose_output"
   else
     running_ids_detail="<compose ps failed>"$'\n'
@@ -371,13 +385,14 @@ reconcile_release_images() {
   [[ -n "$running_ids_detail" ]] || running_ids_detail="<none>"$'\n'
 
   for image_name in "${IMAGE_NAMES[@]}"; do
-    expected_id="<unavailable>"
     expected_rc=0
-    if expected_id="$("$DOCKER_BIN" image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}" --format '{{.Id}}')"; then
-      [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
-    else
+    expected_id="$(reconcile_docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}" --format '{{.Id}}')" || {
       expected_rc=$?
+      (( expected_rc == 124 )) && return 1
       expected_id="<inspect failed>"
+    }
+    if [[ "$expected_rc" -eq 0 ]]; then
+      [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
     fi
 
     svc_using_image=()
@@ -393,23 +408,23 @@ reconcile_release_images() {
     saw_running_for_image=0
     mismatch_details=""
     for svc in "${svc_using_image[@]}"; do
-      container_id=""
-      if ! container_id="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" ps -q --status running "$svc")"; then
+      container_id="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -q --status running "$svc")" || {
+        (( $? == 124 )) && return 1
         reconcile_rc=1
         mismatch_details="${mismatch_details}${svc}=<compose ps failed>; "
         continue
-      fi
+      }
       [[ -n "$container_id" ]] || continue
       saw_running_for_image=1
-      cid_image_id="<inspect failed>"
-      if cid_image_id="$("$DOCKER_BIN" inspect "$container_id" --format '{{.Image}}')"; then
-        if [[ "$cid_image_id" == "$expected_id" ]]; then
-          matched_running=1
-        else
-          mismatch_details="${mismatch_details}${svc}=${container_id}:${cid_image_id}; "
-        fi
-      else
+      cid_image_id="$(reconcile_docker inspect "$container_id" --format '{{.Image}}')" || {
+        (( $? == 124 )) && return 1
         mismatch_details="${mismatch_details}${svc}=${container_id}:<inspect failed>; "
+        continue
+      }
+      if [[ "$cid_image_id" == "$expected_id" ]]; then
+        matched_running=1
+      else
+        mismatch_details="${mismatch_details}${svc}=${container_id}:${cid_image_id}; "
       fi
     done
 
@@ -649,6 +664,11 @@ do_release() {
     previous_sha="$(<"$GOOD_SHA_FILE")"
     previous_manifest="$GOOD_MANIFEST_FILE"
     [[ "$previous_sha" =~ ^[0-9a-f]{12}$ ]] || previous_sha=""
+  fi
+
+  if [[ "$previous_sha" == "$D3_RELEASE_TAG" ]]; then
+    log "this SHA already in last_good_release; skip forward deploy; reconcile only"
+    return 0
   fi
 
   deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" "$CURRENT_STAGED" || current_rc=$?
