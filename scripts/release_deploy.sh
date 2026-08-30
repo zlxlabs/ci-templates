@@ -265,9 +265,6 @@ compose_list_services() {
 validate_oneshot_services() {
   local tag="$1" svc all_services=() invalid=() all_services_output=""
   [[ -z "$ONESHOT_SERVICES" ]] && return 0
-  # Command substitution (not process substitution) so compose_list_services
-  # failures surface as this function's exit status. readarray's exit status
-  # does not reflect a failing producer in `< <(...)`.
   if ! all_services_output="$(compose_list_services "$tag")"; then
     return 1
   fi
@@ -288,9 +285,6 @@ validate_oneshot_services() {
 
 rollback_compose_services() {
   local tag="$1" svc all_services=() keep=() all_services_output=""
-  # Same capture pattern as validate_oneshot_services: process substitution
-  # would swallow compose_list_services' non-zero status and leave an empty
-  # array, which then mis-reports as "oneshot_services covers every service".
   if ! all_services_output="$(compose_list_services "$tag")"; then
     return 1
   fi
@@ -310,10 +304,7 @@ rollback_compose_services() {
   return 0
 }
 
-# Post-promote image identity check. Must run in the same process that still
-# holds fd9 (HOST_LOCK): a second SSH after flock -u 9 is the cross-repo
-# mix-up window (issue #30). Caller maps a non-zero return to rc=5 so
-# workflow can distinguish reconcile failure from deploy/rollback failure.
+# Post-promote identity check; caller maps non-zero to rc=5. Must hold fd9.
 reconcile_release_images() {
   local svc image_name image_ref container_id cid_image_id expected_id expected_rc=0
   local all_services=() all_services_output="" non_oneshot_services=()

@@ -385,13 +385,8 @@ jobs:
           done
 
       - name: Reconcile deployed release images (expected tag vs running containers)
-        # Reconcile now runs inside the deploy SSH while HOST_LOCK is still held
-        # (release_deploy.sh, after do_release, before flock -u 9). This step is
-        # a thin shell: it re-fails the job with the existing "reconcile
-        # assertion failed" annotation when the remote script returned rc=5.
-        # busy_deferred (rc=3) and deploy/rollback failures never write
-        # reconcile_failed, so this step does not run — same skip as the old
-        # success() && busy_deferred != 'true' condition.
+        # Thin shell: remote reconcile already ran under HOST_LOCK (rc=5).
+        # busy_deferred/deploy failures never write reconcile_failed, so skip.
         if: failure() && steps.deploy.outputs.reconcile_failed == 'true'
         run: |
           set -euo pipefail

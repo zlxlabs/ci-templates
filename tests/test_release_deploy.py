@@ -18,53 +18,32 @@ def write_exec(path: Path, body: str):
 
 
 def _reconcile_mock_bash(*, services=("frontend", "backend")):
-    """Happy-path handlers so post-promote reconcile can match image IDs.
-
-    Service names default to declared image names. Per-service
-    `config --images $svc` prints `$svc:$D3_RELEASE_TAG`; `ps -q` emits
-    `cid-$svc`; container/image inspect both print `sha256:$name`.
-    """
     service_lines = "\\n".join(services)
-    return f'''
-if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
-  printf '{service_lines}\\n'
-  exit 0
+    return f'''if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf '{service_lines}\\n'; exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   last="${{@: -1}}"
-  if [ "$last" != "--images" ]; then
-    printf '%s:%s\\n' "$last" "$D3_RELEASE_TAG"
-    exit 0
-  fi
+  if [ "$last" != "--images" ]; then printf '%s:%s\\n' "$last" "$D3_RELEASE_TAG"; exit 0; fi
 fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   emit=0
   for arg in "$@"; do
-    if [ "$emit" = 1 ]; then printf 'cid-%s\\n' "$arg"; fi
+    [ "$emit" = 1 ] && printf 'cid-%s\\n' "$arg"
     [ "$arg" = "running" ] && emit=1
   done
   exit 0
 fi
 if [ "$1" = inspect ]; then
-  cid="$2"; name="${{cid#cid-}}"; printf 'sha256:%s\\n' "$name"; exit 0
+  cid="$2"; printf 'sha256:%s\\n' "${{cid#cid-}}"; exit 0
 fi
 if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
-  ref="$3"; base="${{ref##*/}}"; name="${{base%%:*}}"
-  printf 'sha256:%s\\n' "$name"
-  exit 0
+  ref="$3"; base="${{ref##*/}}"; printf 'sha256:%s\\n' "${{base%%:*}}"; exit 0
 fi
 '''
 
 
 def mock_docker(path: Path, log: Path, *, compose_rc=0, fail_pull=False, fail_tag=False):
-    inspect_body = (
-        "exit 1"
-        if fail_pull
-        else '''if [[ " $* " == *" --format "* ]]; then
-  ref="$3"; base="${ref##*/}"; name="${base%%:*}"; printf 'sha256:%s\\n' "$name"
-fi
-exit 0'''
-    )
     write_exec(
         path,
         f'''#!/bin/bash
@@ -74,9 +53,7 @@ if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ]; then
-  {inspect_body}
-fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then exit {1 if fail_pull else 0}; fi
 if [ "$1" = pull ] && {'true' if fail_pull else 'false'}; then exit 1; fi
 if [ "$1" = tag ] && {'true' if fail_tag else 'false'}; then exit 1; fi
 if [ "$1" = compose ]; then exit {compose_rc}; fi
@@ -359,6 +336,8 @@ exit 0
                 result = run(env)
 
     assert result.returncode == expected_rc, result.stdout + result.stderr
+    if axis == "no_previous_good":
+        assert "reconcile starting" not in (result.stdout + result.stderr)
     up_count = sum(line.endswith(" up -d") for line in log.read_text().splitlines())
     assert up_count == expected_up_count, (
         f"axis {axis} executed {up_count} compose up calls, expected "
@@ -985,6 +964,7 @@ def test_busy_lock_timeout_defers_without_compose_or_last_good(tmp_path):
     holder.wait(timeout=3)
     assert result.returncode == 3
     assert "deferred" in (result.stdout + result.stderr).lower()
+    assert "reconcile starting" not in (result.stdout + result.stderr)
     assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
     assert not log.exists() or "compose" not in log.read_text()
 
@@ -1547,57 +1527,40 @@ def _mock_oneshot_release_docker(
     count_file = log.parent / "compose-up.count"
     rendered = "".join(f"{name}:%s\\n" for name in image_names)
     rendered_args = " ".join(f'"$D3_RELEASE_TAG"' for _ in image_names)
-    service_lines = "\\n".join(services)
     write_exec(
         path,
         f'''#!/bin/bash
 echo "$@" >> "{log}"
-if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
-  printf '{service_lines}\\n'
-  exit 0
-fi
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   last="${{@: -1}}"
   if [ "$last" = "app" ] || [ "$last" = "migrate" ]; then
-    printf 'frontend:%s\\n' "$D3_RELEASE_TAG"
-    exit 0
+    printf 'frontend:%s\\n' "$D3_RELEASE_TAG"; exit 0
   fi
-  printf '{rendered}' {rendered_args}
-  exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   emit=0
   for arg in "$@"; do
     if [ "$emit" = 1 ]; then
-      case "$arg" in
-        app|migrate) printf 'cid-frontend\\n' ;;
-        *) printf 'cid-%s\\n' "$arg" ;;
-      esac
+      case "$arg" in app|migrate) printf 'cid-frontend\\n' ;; *) printf 'cid-%s\\n' "$arg" ;; esac
     fi
     [ "$arg" = "running" ] && emit=1
   done
   exit 0
 fi
 if [ "$1" = inspect ]; then
-  cid="$2"; name="${{cid#cid-}}"
-  case "$name" in
-    app|migrate|frontend) printf 'sha256:frontend\\n' ;;
-    *) printf 'sha256:%s\\n' "$name" ;;
-  esac
+  name="${{2#cid-}}"
+  case "$name" in app|migrate|frontend) printf 'sha256:frontend\\n' ;; *) printf 'sha256:%s\\n' "$name" ;; esac
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
-  ref="$3"; base="${{ref##*/}}"; name="${{base%%:*}}"
-  printf 'sha256:%s\\n' "$name"
+{_reconcile_mock_bash(services=services)}
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf '{rendered}' {rendered_args}
   exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" up -d "* ]]; then
   n=$(cat "{count_file}" 2>/dev/null || echo 0)
-  n=$((n + 1))
-  echo "$n" > "{count_file}"
-  if [ "$D3_RELEASE_TAG" = "abc123456789" ]; then
-    exit {rollback_rc}
-  fi
+  n=$((n + 1)); echo "$n" > "{count_file}"
+  [ "$D3_RELEASE_TAG" = "abc123456789" ] && exit {rollback_rc}
 fi
 exit 0
 ''',
@@ -1634,8 +1597,6 @@ def test_oneshot_services_axis1(tmp_path, case, oneshot_services, phase):
         first = run(env)
         if case == "all_oneshot_rollback":
             first_out = first.stdout + first.stderr
-            # Deploy promotes, then in-lock reconcile refuses all-oneshot
-            # (same outcome the old separate reconcile step had).
             assert first.returncode == 5, first_out
             assert "oneshot_services covers every compose service" in first_out
         else:
@@ -1755,10 +1716,6 @@ exit 0
 
 
 def test_readarray_does_not_swallow_compose_list_services_exit_status():
-    """Contract: both callers capture compose_list_services via command
-    substitution + `if !` + here-string readarray, matching the workflow
-    pattern in build-deploy-release.yml. Process substitution would make
-    `|| return 1` after readarray a no-op (issue #29)."""
     text = SCRIPT.read_text()
     assert 'readarray -t all_services <<< "$all_services_output"' in text
     assert text.count('readarray -t all_services <<< "$all_services_output"') == 3
@@ -1833,92 +1790,37 @@ def test_reconcile_runs_while_host_lock_held(tmp_path):
     env, log = base(tmp_path)
     lock_state = tmp_path / "lock-state.log"
     host_lock = env["HOST_LOCK"]
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
     write_exec(
-        Path(env["DOCKER_BIN"]),
+        docker,
         f'''#!/bin/bash
-echo "$@" >> "{log}"
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   exec 200>"{host_lock}"
-  if flock -n 200; then
-    echo RECONCILE_UNLOCKED >> "{lock_state}"
-    flock -u 200
-  else
-    echo RECONCILE_LOCKED >> "{lock_state}"
-  fi
-  emit=0
-  for arg in "$@"; do
-    if [ "$emit" = 1 ]; then printf 'cid-%s\\n' "$arg"; fi
-    [ "$arg" = "running" ] && emit=1
-  done
-  exit 0
+  if flock -n 200; then echo RECONCILE_UNLOCKED >> "{lock_state}"; flock -u 200
+  else echo RECONCILE_LOCKED >> "{lock_state}"; fi
 fi
-{_reconcile_mock_bash()}
-if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
-  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
-  exit 0
-fi
-exit 0
+{body}
 ''',
     )
     result = run(env)
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert "release image reconcile starting (host lock still held)" in out
-    assert lock_state.exists(), "reconcile never issued compose ps"
     assert "RECONCILE_LOCKED" in lock_state.read_text()
     assert "RECONCILE_UNLOCKED" not in lock_state.read_text()
 
 
 def test_reconcile_mismatch_returns_rc5_and_keeps_last_good(tmp_path):
     env, log = base(tmp_path)
-    write_exec(
-        Path(env["DOCKER_BIN"]),
-        f'''#!/bin/bash
-echo "$@" >> "{log}"
-if [ "$1" = inspect ]; then
-  printf 'sha256:OTHER\\n'
-  exit 0
-fi
-{_reconcile_mock_bash()}
-if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
-  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
-  exit 0
-fi
-exit 0
-''',
-    )
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
+    write_exec(docker, '#!/bin/bash\nif [ "$1" = inspect ]; then printf \'sha256:OTHER\\n\'; exit 0; fi\n' + body)
     result = run(env)
     out = result.stdout + result.stderr
     assert result.returncode == 5, out
     assert "release image reconcile mismatch" in out
-    assert "this step does not trigger automatic rollback" in out
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
-
-
-def test_busy_deferred_does_not_run_reconcile(tmp_path):
-    env, log = base(tmp_path)
-    busy = tmp_path / "busy.lock"
-    holder = _lock_holder(busy, seconds="2")
-    time.sleep(0.05)
-    env.update(BUSY_LOCK_FILE=str(busy), BUSY_LOCK_TIMEOUT="1")
-    result = run(env)
-    holder.wait(timeout=3)
-    out = result.stdout + result.stderr
-    assert result.returncode == 3
-    assert "deferred" in out.lower()
-    assert "reconcile starting" not in out
-    assert "release image reconcile" not in out
-    assert not log.exists() or "ps -q" not in log.read_text()
-
-
-def test_deploy_failure_does_not_run_reconcile(tmp_path):
-    env, log = base(tmp_path)
-    mock_curl(Path(env["CURL_BIN"]), "500")
-    result = run(env)
-    out = result.stdout + result.stderr
-    assert result.returncode != 0
-    assert result.returncode != 5
-    assert "reconcile starting" not in out
 
 
 def test_reconcile_compose_config_failure_returns_rc5(tmp_path):

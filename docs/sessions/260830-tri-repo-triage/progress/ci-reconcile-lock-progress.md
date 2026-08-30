@@ -21,4 +21,12 @@
 - **关键决策与已否决方案**：保留同名对账 step（不整段删除），以满足锁定决策 2 的 Checks 可区分性与 `reconcile_index == deploy_index + 1`。否决「deploy 对 rc=5 改写为 exit 0 再让薄壳单独变红」——那会让 deploy step 假绿。
 - **下一步唯一动作**：约束 2 红验（把对账挪到 flock -u 9 之后，确认顺序断言变红）并跑全量 pytest。
 
+## 2026-08-30 · 红验与全量
+
+- **当前阶段**：implementing · 收尾
+- **本段结论**：约束 2 红验两测均 AssertionError；全量 250 passed，registry 校验绿。
+- **关键决策与已否决方案**：轴表「成功×busy_deferred」实为拿锁前 exit 3；实现按不跑对账。
+- **下一步唯一动作**：无
+
+
 

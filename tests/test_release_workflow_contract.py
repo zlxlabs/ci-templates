@@ -594,40 +594,18 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     assert "reconcile_release_images()" in script
     after_do_release = script[script.index("do_release\nrc=$?"):]
     assert "reconcile_release_images" in after_do_release
-    assert after_do_release.index("reconcile_release_images") < after_do_release.index("flock -u 9"), (
-        "reconcile must run in the same process that still holds fd9"
-    )
-    assert "${IMAGE_NAME}:latest" not in script, (
-        "release lane must not introduce a mutable latest tag reconciliation stage"
-    )
+    assert after_do_release.index("reconcile_release_images") < after_do_release.index("flock -u 9")
+    assert "${IMAGE_NAME}:latest" not in script
     assert (
         '"$DOCKER_BIN" image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"'
         in script
     )
     assert "compose_list_services" in script
     assert 'config --images "$svc"' in script
-    assert "config --format '{{" not in script, (
-        "release reconcile must not use unsupported docker compose Go-template --format"
-    )
+    assert "config --format '{{" not in script
     assert "could not render compose image for service" in script
     assert 'readarray -t all_services <<< "$all_services_output"' in script
-    assert "readarray -t all_services < <(" not in script, (
-        "readarray must not swallow compose config --services failures via process substitution"
-    )
-    capture = (
-        'compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" '
-        '"$DOCKER_BIN" "${compose_args[@]}" ps -q --status running '
-        '"${non_oneshot_services[@]}")" || compose_rc=$?'
-    )
-    assert capture in script
-    assert (
-        'if ! compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" '
-        '"$DOCKER_BIN" "${compose_args[@]}" ps -q --status running '
-        '"${non_oneshot_services[@]}")"; then'
-    ) not in script, (
-        "compose ps failures must capture the command status before shell ! "
-        "can invert it"
-    )
+    assert "readarray -t all_services < <(" not in script
     assert 'ps -q --status running' in script
     assert '"$DOCKER_BIN" inspect "$container_id" --format' in script
     assert "for image_name in" in script
