@@ -310,6 +310,156 @@ rollback_compose_services() {
   return 0
 }
 
+# Post-promote image identity check. Must run in the same process that still
+# holds fd9 (HOST_LOCK): a second SSH after flock -u 9 is the cross-repo
+# mix-up window (issue #30). Caller maps a non-zero return to rc=5 so
+# workflow can distinguish reconcile failure from deploy/rollback failure.
+reconcile_release_images() {
+  local svc image_name image_ref container_id cid_image_id expected_id expected_rc=0
+  local all_services=() all_services_output="" non_oneshot_services=()
+  local service_images_output="" running_ids_detail="" compose_rc=0 compose_output=""
+  local reconcile_rc=0 matched_running=0 saw_running_for_image=0 mismatch_details=""
+  local compose_args=(compose)
+  local -A oneshot_svc=()
+  local svc_using_image=()
+
+  if [[ "${#IMAGE_NAMES[@]}" -eq 0 ]]; then
+    echo "::error::release image reconcile has no declared images" >&2
+    return 1
+  fi
+
+  for svc in $ONESHOT_SERVICES; do
+    [[ -n "$svc" ]] && oneshot_svc["$svc"]=1
+  done
+
+  if ! all_services_output="$(compose_list_services "$D3_RELEASE_TAG")"; then
+    echo "::error::release image reconcile could not list compose services" >&2
+    return 1
+  fi
+  readarray -t all_services <<< "$all_services_output"
+
+  for svc in "${all_services[@]}"; do
+    [[ -n "$svc" && -z "${oneshot_svc[$svc]+x}" ]] && non_oneshot_services+=("$svc")
+  done
+
+  if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then
+    echo "::error::release image reconcile refused: oneshot_services covers every compose service; no long-running service is available for reconciliation; cannot prove this SHA is running in production; last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required" >&2
+    return 1
+  fi
+
+  if [[ -f "$DEPLOY_DIR/.env" ]]; then
+    compose_args+=(--env-file "$DEPLOY_DIR/.env")
+  fi
+  if [[ -f "$ENV_FILE" ]]; then
+    compose_args+=(--env-file "$ENV_FILE")
+  fi
+
+  for svc in "${non_oneshot_services[@]}"; do
+    image_ref=""
+    if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" config --images "$svc")"; then
+      echo "::error::release image reconcile could not render compose image for service ${svc}" >&2
+      return 1
+    fi
+    service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
+  done
+
+  compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
+  if [[ "$compose_rc" -eq 0 ]]; then
+    while IFS= read -r container_id; do
+      [[ -n "$container_id" ]] || continue
+      cid_image_id="<inspect failed>"
+      if cid_image_id="$("$DOCKER_BIN" inspect "$container_id" --format '{{.Image}}')"; then
+        running_ids_detail="${running_ids_detail}${container_id}=${cid_image_id}"$'\n'
+      else
+        running_ids_detail="${running_ids_detail}${container_id}=<inspect failed>"$'\n'
+      fi
+    done <<< "$compose_output"
+  else
+    running_ids_detail="<compose ps failed>"$'\n'
+  fi
+  [[ -n "$running_ids_detail" ]] || running_ids_detail="<none>"$'\n'
+
+  for image_name in "${IMAGE_NAMES[@]}"; do
+    expected_id="<unavailable>"
+    expected_rc=0
+    if expected_id="$("$DOCKER_BIN" image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}" --format '{{.Id}}')"; then
+      [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
+    else
+      expected_rc=$?
+      expected_id="<inspect failed>"
+    fi
+
+    svc_using_image=()
+    while IFS='=' read -r svc image_ref; do
+      [[ -n "$svc" && -n "$image_ref" ]] || continue
+      [[ -n "${oneshot_svc[$svc]+x}" ]] && continue
+      if [[ "$image_ref" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
+        svc_using_image+=("$svc")
+      fi
+    done <<< "$service_images_output"
+
+    matched_running=0
+    saw_running_for_image=0
+    mismatch_details=""
+    for svc in "${svc_using_image[@]}"; do
+      container_id=""
+      if ! container_id="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" "$DOCKER_BIN" "${compose_args[@]}" ps -q --status running "$svc")"; then
+        reconcile_rc=1
+        mismatch_details="${mismatch_details}${svc}=<compose ps failed>; "
+        continue
+      fi
+      [[ -n "$container_id" ]] || continue
+      saw_running_for_image=1
+      cid_image_id="<inspect failed>"
+      if cid_image_id="$("$DOCKER_BIN" inspect "$container_id" --format '{{.Image}}')"; then
+        if [[ "$cid_image_id" == "$expected_id" ]]; then
+          matched_running=1
+        else
+          mismatch_details="${mismatch_details}${svc}=${container_id}:${cid_image_id}; "
+        fi
+      else
+        mismatch_details="${mismatch_details}${svc}=${container_id}:<inspect failed>; "
+      fi
+    done
+
+    echo "release image reconcile values:"
+    printf '  image=%s\n' "$image_name"
+    printf '  expected_id=%s\n' "$expected_id"
+    printf '  running_ids=%s' "$running_ids_detail"
+
+    if [[ "$expected_rc" -ne 0 ]]; then
+      echo "::error::release image reconcile expected tag image is unavailable: ${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG} (expected_id=${expected_id}); last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required" >&2
+      reconcile_rc=1
+      continue
+    fi
+
+    if [[ ${#svc_using_image[@]} -eq 0 ]]; then
+      echo "::notice::release image reconcile skipped running check for ${image_name} (not referenced by any non-oneshot service)"
+      continue
+    fi
+
+    if [[ "$matched_running" -eq 1 ]]; then
+      echo "::notice::release image reconcile passed for ${image_name}: expected_id=${expected_id}"
+      continue
+    fi
+
+    if [[ "$saw_running_for_image" -eq 0 ]]; then
+      echo "::error::release image reconcile no running container uses ${image_name}:${D3_RELEASE_TAG} (expected_id=${expected_id}, running_ids=${running_ids_detail}); last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required" >&2
+      reconcile_rc=1
+      continue
+    fi
+
+    echo "::error::release image reconcile mismatch for ${image_name}: expected_id=${expected_id}, running=${mismatch_details}running_ids=${running_ids_detail}; last_good_release has already been promoted to this SHA; this step does not trigger automatic rollback — manual host verification required" >&2
+    reconcile_rc=1
+  done
+
+  if [[ "$reconcile_rc" -ne 0 ]]; then
+    return 1
+  fi
+  echo "::notice::release image reconcile passed for all declared images requiring running containers"
+  return 0
+}
+
 oneshot_schema_hint() {
   [[ -n "$ONESHOT_SERVICES" ]] || return 0
   log "hint: this release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required" >&2
@@ -711,6 +861,13 @@ fi
 LOCK_HELD=1
 do_release
 rc=$?
+if (( rc == 0 )); then
+  log "release image reconcile starting (host lock still held)"
+  if ! reconcile_release_images; then
+    echo "::error::release image reconcile assertion failed; deployment may have succeeded, but production image identity is not proven" >&2
+    rc=5
+  fi
+fi
 flock -u 9 2>/dev/null || true
 LOCK_HELD=""
 if [[ -n "$BUSY_LOCK_FILE" ]]; then
