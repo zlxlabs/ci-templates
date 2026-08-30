@@ -14,3 +14,11 @@
 - **关键决策与已否决方案**：选「do_release 之后的独立函数」而非塞进 do_release 收尾——do_release 的返回值语义（含回滚 rc）保持不动，对账失败不会被并进部署失败。否决「对账 step 自行重新拿锁」（卡面已否决）。全-oneshot 第一次部署现为 rc=5（promote 已完成、对账拒绝），与旧独立对账 step 失败同结果，只是退出码从「部署 0 + 对账 step 1」收敛到脚本 rc=5。
 - **下一步唯一动作**：改造 `build-deploy-release.yml`：部署 step 识别 rc=5 写 `reconcile_failed=true`，对账 step 瘦成转发失败通知的薄壳。
 
+## 2026-08-30 · workflow 薄壳 + 契约更新
+
+- **当前阶段**：implementing · workflow 侧改造
+- **本段结论**：deploy step 对 rc=5 写 `reconcile_failed=true` 并打对账失败 annotation；对账 step 改为 `failure() && reconcile_failed` 的薄壳（无第二条 SSH）。失败通知卡增加 rc=5 文案。busy_deferred 仍不写 reconcile_failed，薄壳不跑。
+- **关键决策与已否决方案**：保留同名对账 step（不整段删除），以满足锁定决策 2 的 Checks 可区分性与 `reconcile_index == deploy_index + 1`。否决「deploy 对 rc=5 改写为 exit 0 再让薄壳单独变红」——那会让 deploy step 假绿。
+- **下一步唯一动作**：约束 2 红验（把对账挪到 flock -u 9 之后，确认顺序断言变红）并跑全量 pytest。
+
+
