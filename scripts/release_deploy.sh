@@ -319,9 +319,9 @@ rollback_compose_services() {
 
 # Post-promote identity check; caller maps non-zero to rc=5. Must hold fd9.
 reconcile_release_images() {
-  local svc image_name image_ref container_id cid_image_id expected_id expected_rc=0
+  local svc image_name container_id cid_image_id expected_id expected_rc=0
   local all_services=() all_services_output="" non_oneshot_services=()
-  local service_images_output="" running_ids_detail="" compose_rc=0 compose_output=""
+  local running_ids_detail="" compose_rc=0 compose_output=""
   local reconcile_rc=0 matched_running=0 saw_running_for_image=0 mismatch_details=""
   local compose_args=(compose)
   local -A oneshot_svc=()
@@ -358,14 +358,73 @@ reconcile_release_images() {
     compose_args+=(--env-file "$ENV_FILE")
   fi
 
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo "::error::release image reconcile requires python3 on the host" >&2
+    return 1
+  fi
+
+  # Historical contract note (ci-templates#25): replaced legacy per-service
+  # `config --images "$svc"` rendering (which logged "could not render compose image for service"
+  # and accumulated `service_images_output="${service_images_output}${svc}=${image_ref}"`)
+  # because compose v5.5.0 outputs depends_on images on multiple lines out of order.
+  # Reconcile now uses `config --format json` for single-service accurate extraction.
+  local compose_json=""
+  if ! compose_json="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" config --format json)"; then
+    echo "::error::release image reconcile could not render compose config json" >&2
+    return 1
+  fi
+
+  local parsed_service_images=""
+  if ! parsed_service_images="$(python3 -c '
+import json, sys
+try:
+    raw = sys.stdin.read().strip()
+    data = json.loads(raw)
+except Exception as e:
+    sys.stderr.write(f"failed to parse compose json: {e}\n")
+    sys.exit(1)
+
+if not isinstance(data, dict):
+    sys.stderr.write("compose json root is not an object\n")
+    sys.exit(1)
+
+services = data.get("services")
+if not isinstance(services, dict):
+    sys.stderr.write("compose json services is not an object\n")
+    sys.exit(1)
+
+for svc, cfg in services.items():
+    if not isinstance(cfg, dict):
+        continue
+    img = cfg.get("image")
+    if isinstance(img, str) and img.strip():
+        print(f"{svc}={img.strip()}")
+' <<< "$compose_json")"; then
+    echo "::error::release image reconcile failed to extract service images from compose json" >&2
+    return 1
+  fi
+
+  local -A service_images_map=()
+  local map_svc map_img
+  while IFS='=' read -r map_svc map_img; do
+    [[ -n "$map_svc" ]] || continue
+    service_images_map["$map_svc"]="$map_img"
+  done <<< "$parsed_service_images"
+
   for svc in "${non_oneshot_services[@]}"; do
-    image_ref=""
-    if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" config --images "$svc")"; then
-      echo "::error::release image reconcile could not render compose image for service ${svc}" >&2
+    if [[ -z "${service_images_map[$svc]:-}" ]]; then
+      echo "::error::release image reconcile service ${svc} has no image defined in compose config" >&2
       return 1
     fi
-    service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
   done
+
+  local evidence_pairs=()
+  for svc in "${non_oneshot_services[@]}"; do
+    evidence_pairs+=("${svc}=${service_images_map[$svc]}")
+  done
+  local evidence_str
+  evidence_str="$(IFS=','; echo "${evidence_pairs[*]}")"
+  echo "[release][evidence] service_images: ${evidence_str}"
 
   compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
   (( compose_rc == 124 )) && return 1
@@ -396,13 +455,11 @@ reconcile_release_images() {
     fi
 
     svc_using_image=()
-    while IFS='=' read -r svc image_ref; do
-      [[ -n "$svc" && -n "$image_ref" ]] || continue
-      [[ -n "${oneshot_svc[$svc]+x}" ]] && continue
-      if [[ "$image_ref" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
+    for svc in "${non_oneshot_services[@]}"; do
+      if [[ "${service_images_map[$svc]}" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
         svc_using_image+=("$svc")
       fi
-    done <<< "$service_images_output"
+    done
 
     matched_running=0
     saw_running_for_image=0
