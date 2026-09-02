@@ -358,7 +358,9 @@ reconcile_release_images() {
     compose_args+=(--env-file "$ENV_FILE")
   fi
 
-  # ci-templates#25: per-service mapping must not rely on config --images (multi-line depends_on output).
+  # ci-templates#25: per-service mapping must not rely on config --images "$svc"
+  # (multi-line depends_on output; do not restore service_images_output="${service_images_output}${svc}=${image_ref}"
+  # or the "could not render compose image for service" path).
   local service_ps_output="" ps_rc=0
   service_ps_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -a --format '{{.Service}}\t{{.Image}}')" || ps_rc=$?
   (( ps_rc == 124 )) && return 1
