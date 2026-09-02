@@ -280,11 +280,16 @@ health_probe() {
     else
       probe_attempts="${code}(curl=${curl_rc})"
     fi
-    if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ]; then
+    if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ] && [ "$curl_rc" -eq 0 ]; then
       log "health probe OK (attempt ${attempt}, status ${code})"
+      echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
       return 0
     fi
-    log "health probe attempt ${attempt}/${HEALTHCHECK_RETRIES} got '${code}', want ${HEALTHCHECK_EXPECT_STATUS}"
+    if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ]; then
+      log "health probe attempt ${attempt}/${HEALTHCHECK_RETRIES} got '${code}' but curl rc=${curl_rc} (transport incomplete)"
+    else
+      log "health probe attempt ${attempt}/${HEALTHCHECK_RETRIES} got '${code}', want ${HEALTHCHECK_EXPECT_STATUS}"
+    fi
     attempt=$((attempt + 1))
     [ "$attempt" -le "$HEALTHCHECK_RETRIES" ] && sleep "$HEALTHCHECK_INTERVAL"
   done

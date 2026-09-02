@@ -384,6 +384,20 @@ def test_probe_evidence_records_http_and_curl_exit_sequence(tmp_path):
     assert "[deploy][evidence] probe-attempts url=http://localhost/frontend 000(curl=28),000(curl=7)" in out
 
 
+def test_http_200_with_curl_timeout_is_probe_failure(tmp_path):
+    env, _ = base(tmp_path)
+    env["HEALTHCHECK_RETRIES"] = "1"
+    mock_curl_status_exit_sequence(
+        Path(env["CURL_BIN"]), [("200", 28), ("200", 0)],
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode != 0, out
+    assert "got '200' but curl rc=28 (transport incomplete)" in out
+    assert "[deploy][evidence] probe-attempts url=http://localhost/frontend 200(curl=28)" in out
+
+
 def test_rollback_evidence_is_emitted_before_rollback_deploy(tmp_path):
     env, log = base(tmp_path)
     assert run(env).returncode == 0
