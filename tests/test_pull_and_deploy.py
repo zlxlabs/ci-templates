@@ -22,6 +22,27 @@ import pytest
 REPO_ROOT = Path(__file__).resolve().parent.parent
 SCRIPT = REPO_ROOT / "scripts" / "pull_and_deploy.sh"
 
+RECONCILE_IMAGE_ID = "sha256:deadbeef"
+
+
+def _reconcile_ok_bash(*, image_id=RECONCILE_IMAGE_ID, service="app", container="cid-app"):
+    """Identity probes used after a healthy deploy. --format distinguishes
+    reconcile inspect from pull_image's existence check."""
+    return f'''
+if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf '{service}\\n'; exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
+  printf '{container}\\n'; exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  printf '{image_id}\\n'; exit 0
+fi
+if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  printf '{image_id}\\n'; exit 0
+fi
+'''
+
 
 def _write_exec(path: Path, body: str):
     path.write_text(body)
@@ -31,6 +52,7 @@ def _write_exec(path: Path, body: str):
 def _mock_docker(log_path: Path, compose_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
+{_reconcile_ok_bash()}
 if [ "$1" = "compose" ]; then
   sleep {compose_sleep}
 fi
@@ -73,6 +95,7 @@ def _mock_docker_matrix(log_path: Path, fail_compose_on: int | None = None) -> s
         fail_clause = f";\n  [ \"$count\" -eq {fail_compose_on} ] && exit 23"
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
+{_reconcile_ok_bash()}
 if [ "$1" = "compose" ]; then
   count_file="{log_path}.compose-count"
   count=$(cat "$count_file" 2>/dev/null || echo 0)
@@ -553,6 +576,7 @@ def _mock_docker_flaky_pull(log_path: Path, fail_pulls: int, image_local: bool) 
     """docker mock: first `fail_pulls` pull calls fail; `image inspect` mirrors local presence."""
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
+{_reconcile_ok_bash()}
 if [ "$1" = "pull" ]; then
   count_file="{log_path}.pullcount"
   n=$(cat "$count_file" 2>/dev/null || echo 0)
@@ -749,9 +773,9 @@ if [ "$1" = "compose" ]; then
   else
     echo "sh_probe=closed" >> "{log_path}"
   fi
-  exit 0
 fi
 echo "$@" >> "{log_path}"
+{_reconcile_ok_bash()}
 exit 0
 """
 
@@ -875,6 +899,7 @@ if [ "$1" = "pull" ]; then
   fi
   exit 1
 fi
+{_reconcile_ok_bash()}
 exit 0
 """
 
@@ -1151,6 +1176,7 @@ if [ "$1" = "tag" ]; then
   [ "$2" = "{local_ref}" ] && exit 1
   exit 0
 fi
+{_reconcile_ok_bash()}
 exit 0
 """,
     )
@@ -1198,6 +1224,18 @@ def _mock_docker_oneshot(log_path: Path) -> str:
 echo "$@" >> "{log_path}"
 if [ "$1" = "compose" ] && [[ " $* " == *" config --services "* ]]; then
   printf '{service_lines}\\n'
+  exit 0
+fi
+if [ "$1" = "compose" ] && [[ " $* " == *" ps -q --status running"* ]]; then
+  printf 'cid-app\\n'
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  printf '{RECONCILE_IMAGE_ID}\\n'
+  exit 0
+fi
+if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  printf '{RECONCILE_IMAGE_ID}\\n'
   exit 0
 fi
 exit 0
@@ -1260,10 +1298,14 @@ def _oneshot_env(tmp_path: Path, *, oneshot_services: str = "migrate") -> dict:
     return env
 
 
-def _run_oneshot_rollback(env: dict, tmp_path: Path, *, unhealthy_sequence=None) -> subprocess.CompletedProcess:
+def _run_oneshot_rollback(
+    env: dict, tmp_path: Path, *, unhealthy_sequence=None, oneshot_on_rollback=None
+) -> subprocess.CompletedProcess:
     assert _run(env).returncode == 0
     env = dict(env)
     env["GIT_SHA"] = "def5678"
+    if oneshot_on_rollback is not None:
+        env["ONESHOT_SERVICES"] = oneshot_on_rollback
     Path(env["DOCKER_LOG"]).write_text("")
     mock_dir = Path(env["DOCKER_BIN"]).parent
     sequence = unhealthy_sequence or [("500", 0), ("500", 0), ("200", 0)]
@@ -1285,10 +1327,18 @@ def _run_oneshot_rollback(env: dict, tmp_path: Path, *, unhealthy_sequence=None)
     ],
 )
 def test_oneshot_services_axis1(tmp_path, case, oneshot_services, phase):
-    env = _oneshot_env(tmp_path, oneshot_services=oneshot_services)
-    if phase == "rollback":
+    if case == "all_oneshot_rollback":
+        # Seed last_good with a deploy that still has a long-running service.
+        # All-oneshot would now fail reconcile (rc=5) before rollback can run.
+        env = _oneshot_env(tmp_path, oneshot_services="migrate")
+        result = _run_oneshot_rollback(
+            env, tmp_path, oneshot_on_rollback="app migrate"
+        )
+    elif phase == "rollback":
+        env = _oneshot_env(tmp_path, oneshot_services=oneshot_services)
         result = _run_oneshot_rollback(env, tmp_path)
     else:
+        env = _oneshot_env(tmp_path, oneshot_services=oneshot_services)
         result = _run(env)
 
     out = result.stdout + result.stderr
@@ -1344,3 +1394,67 @@ def test_oneshot_services_no_last_good_still_rejects_pseudo_rollback(tmp_path):
     up_lines = _compose_up_lines(Path(env["DOCKER_LOG"]).read_text())
     assert len(up_lines) == 1
     _assert_compose_up_has_no_service_args(up_lines[0])
+
+
+def test_reconcile_passed_on_healthy_deploy(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    res = _run(env)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "image reconcile values:" in out
+    assert "expected_id=" in out and "latest_id=" in out and "running_ids=" in out
+    assert "image reconcile passed" in out
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert "ps -q --status running app" in log
+    assert "ps -q --status running\n" not in log
+
+
+def test_reconcile_mismatch_returns_rc5(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
+    _write_exec(
+        docker,
+        "#!/bin/bash\n"
+        "if [ \"$1\" = inspect ]; then printf 'sha256:OTHER\\n'; exit 0; fi\n"
+        + body,
+    )
+    res = _run(env)
+    out = res.stdout + res.stderr
+    assert res.returncode == 5, out
+    assert "image reconcile values:" in out
+    assert "expected_id=" in out and "latest_id=" in out and "running_ids=" in out
+    assert "running container mismatch" in out
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    assert good.exists() and good.read_text().strip() == "abc1234"
+
+
+def test_reconcile_runs_while_host_lock_held(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_state = tmp_path / "lock-state.log"
+    host_lock = env["HOST_LOCK"]
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
+    _write_exec(
+        docker,
+        f'''#!/bin/bash
+if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
+  exec 200>"{host_lock}"
+  if flock -n 200; then echo RECONCILE_UNLOCKED >> "{lock_state}"; flock -u 200
+  else echo RECONCILE_LOCKED >> "{lock_state}"; fi
+fi
+{body}
+''',
+    )
+    res = _run(env)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "image reconcile starting (host lock still held)" in out
+    assert "RECONCILE_LOCKED" in lock_state.read_text()
+    assert "RECONCILE_UNLOCKED" not in lock_state.read_text()
