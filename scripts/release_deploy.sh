@@ -319,9 +319,9 @@ rollback_compose_services() {
 
 # Post-promote identity check; caller maps non-zero to rc=5. Must hold fd9.
 reconcile_release_images() {
-  local svc image_name image_ref container_id cid_image_id expected_id expected_rc=0
+  local svc image_name container_id cid_image_id expected_id expected_rc=0
   local all_services=() all_services_output="" non_oneshot_services=()
-  local service_images_output="" running_ids_detail="" compose_rc=0 compose_output=""
+  local running_ids_detail="" compose_rc=0 compose_output=""
   local reconcile_rc=0 matched_running=0 saw_running_for_image=0 mismatch_details=""
   local compose_args=(compose)
   local -A oneshot_svc=()
@@ -358,14 +358,36 @@ reconcile_release_images() {
     compose_args+=(--env-file "$ENV_FILE")
   fi
 
+  # ci-templates#25: mapping comes from compose ps -a; config --images is multi-line under depends_on.
+  local service_ps_output="" ps_rc=0
+  service_ps_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -a --format '{{.Service}}\t{{.Image}}')" || ps_rc=$?
+  (( ps_rc == 124 )) && return 1
+  if (( ps_rc != 0 )); then
+    echo "::error::release image reconcile could not list compose service images" >&2
+    return 1
+  fi
+
+  local -A service_images_map=()
+  local map_svc map_img
+  while IFS=$'\t' read -r map_svc map_img; do
+    [[ -n "$map_svc" && -n "$map_img" ]] || continue
+    service_images_map["$map_svc"]="$map_img"
+  done <<< "$service_ps_output"
+
   for svc in "${non_oneshot_services[@]}"; do
-    image_ref=""
-    if ! image_ref="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" config --images "$svc")"; then
-      echo "::error::release image reconcile could not render compose image for service ${svc}" >&2
+    if [[ -z "${service_images_map[$svc]:-}" ]]; then
+      echo "::error::release image reconcile service ${svc} has no image defined in compose config" >&2
       return 1
     fi
-    service_images_output="${service_images_output}${svc}=${image_ref}"$'\n'
   done
+
+  local evidence_pairs=()
+  for svc in "${non_oneshot_services[@]}"; do
+    evidence_pairs+=("${svc}=${service_images_map[$svc]}")
+  done
+  local evidence_str
+  evidence_str="$(IFS=','; echo "${evidence_pairs[*]}")"
+  echo "[release][evidence] service_images: ${evidence_str}"
 
   compose_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}")" || compose_rc=$?
   (( compose_rc == 124 )) && return 1
@@ -396,13 +418,11 @@ reconcile_release_images() {
     fi
 
     svc_using_image=()
-    while IFS='=' read -r svc image_ref; do
-      [[ -n "$svc" && -n "$image_ref" ]] || continue
-      [[ -n "${oneshot_svc[$svc]+x}" ]] && continue
-      if [[ "$image_ref" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
+    for svc in "${non_oneshot_services[@]}"; do
+      if [[ "${service_images_map[$svc]}" == "${image_name}:${D3_RELEASE_TAG}" ]]; then
         svc_using_image+=("$svc")
       fi
-    done <<< "$service_images_output"
+    done
 
     matched_running=0
     saw_running_for_image=0

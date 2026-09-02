@@ -17,10 +17,36 @@ def write_exec(path: Path, body: str):
     path.chmod(path.stat().st_mode | stat.S_IEXEC)
 
 
-def _reconcile_mock_bash(*, services=("frontend", "backend")):
+def _reconcile_mock_bash(*, services=("frontend", "backend"), image_map: dict[str, str | None] | None = None):
     service_lines = "\\n".join(services)
+    ordered = list(services)
+    seen = set(services)
+    if image_map is not None:
+        for svc in image_map:
+            if svc not in seen:
+                ordered.append(svc)
+                seen.add(svc)
+    ps_parts = []
+    ps_args = []
+    for svc in ordered:
+        if image_map is None:
+            img = svc
+        else:
+            img = image_map.get(svc)
+            if img is None:
+                continue
+        if ":" in img:
+            ps_parts.append(f"{svc}\\t{img}\\n")
+        else:
+            ps_parts.append(f"{svc}\\t{img}:%s\\n")
+            ps_args.append('"$D3_RELEASE_TAG"')
+    ps_fmt = "".join(ps_parts)
+    args_str = f" {' '.join(ps_args)}" if ps_args else ""
     return f'''if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
   printf '{service_lines}\\n'; exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  printf '{ps_fmt}'{args_str}; exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   last="${{@: -1}}"
@@ -1235,7 +1261,14 @@ exit 0
 ''',
     )
     env["D3_RELEASE_TAG"] = "def567890123"
-    proc = subprocess.Popen(["bash", str(SCRIPT)], env=env, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+    proc = subprocess.Popen(
+        ["bash", str(SCRIPT)],
+        env=env,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        preexec_fn=lambda: signal.signal(signal.SIGHUP, signal.SIG_DFL),
+    )
     deadline = time.time() + 3
     while time.time() < deadline and "compose" not in log.read_text():
         time.sleep(0.01)
@@ -1552,7 +1585,7 @@ if [ "$1" = inspect ]; then
   case "$name" in app|migrate|frontend) printf 'sha256:frontend\\n' ;; *) printf 'sha256:%s\\n' "$name" ;; esac
   exit 0
 fi
-{_reconcile_mock_bash(services=services)}
+{_reconcile_mock_bash(services=services, image_map={"app": "frontend", "migrate": "frontend"})}
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   printf '{rendered}' {rendered_args}
   exit 0
@@ -1846,3 +1879,184 @@ def test_reconcile_docker_timeout_returns_rc5_and_keeps_last_good(tmp_path):
     assert result.returncode == 5, out
     assert "timed out after 1s holding host lock" in out
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def _mock_multiline_depends_on_docker(path: Path, log: Path, *, mismatch_svc: str | None = None):
+    """Mock docker: identity gate still uses config --images; reconcile maps via ps -a --format."""
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf 'backend\\nfrontend\\nnginx\\nmigrate\\n'; exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  printf 'backend\\ttranscribe-backend:%s\\nfrontend\\ttranscribe-frontend:%s\\nnginx\\tnginx:alpine\\nmigrate\\ttranscribe-backend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  last="${{@: -1}}"
+  case "$last" in
+    frontend)
+      # docker compose v5.5.0 multi-line output with depends_on
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\ntranscribe-frontend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"; exit 0 ;;
+    backend)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    nginx)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\nnginx:alpine\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    migrate)
+      printf 'transcribe-backend:%s\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    *)
+      # Gate identity check (no service specified)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\ntranscribe-frontend:%s\\nnginx:alpine\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"; exit 0 ;;
+  esac
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
+  emit=0
+  for arg in "$@"; do
+    [ "$emit" = 1 ] && printf 'cid-%s\\n' "$arg"
+    [ "$arg" = "running" ] && emit=1
+  done
+  exit 0
+fi
+if [ "$1" = inspect ]; then
+  cid="$2"
+  svc="${{cid#cid-}}"
+  if [ "$svc" = "{mismatch_svc}" ]; then
+    printf 'sha256:WRONG_IMAGE\\n'; exit 0
+  fi
+  case "$svc" in
+    frontend) printf 'sha256:transcribe-frontend\\n'; exit 0 ;;
+    backend|migrate) printf 'sha256:transcribe-backend\\n'; exit 0 ;;
+    nginx) printf 'sha256:nginx\\n'; exit 0 ;;
+    *) printf 'sha256:%s\\n' "$svc"; exit 0 ;;
+  esac
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  ref="$3"; base="${{ref##*/}}"; name="${{base%%:*}}"
+  printf 'sha256:%s\\n' "$name"; exit 0
+fi
+exit 0
+''',
+    )
+
+
+def test_reconcile_multiline_depends_on_images_maps_accurately_and_verifies_running(tmp_path):
+    env, log = base(tmp_path)
+    manifest_path = tmp_path / "three_service.manifest"
+    manifest_path.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\ttranscribe-frontend\ttranscribe-frontend\n"
+        "image\ttranscribe-backend\ttranscribe-backend\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(manifest_path)
+    env["ONESHOT_SERVICES"] = "migrate"
+    _mock_multiline_depends_on_docker(Path(env["DOCKER_BIN"]), log)
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "[release][evidence] service_images:" in out
+    assert "skipped running check for transcribe-frontend" not in out
+    assert "skipped running check for transcribe-backend" not in out
+    assert "passed for transcribe-frontend: expected_id=sha256:transcribe-frontend" in out
+    assert "passed for transcribe-backend: expected_id=sha256:transcribe-backend" in out
+
+
+def test_reconcile_multiline_depends_on_images_mismatch_reports_correct_service(tmp_path):
+    env, log = base(tmp_path)
+    manifest_path = tmp_path / "three_service.manifest"
+    manifest_path.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\ttranscribe-frontend\ttranscribe-frontend\n"
+        "image\ttranscribe-backend\ttranscribe-backend\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(manifest_path)
+    env["ONESHOT_SERVICES"] = "migrate"
+    _mock_multiline_depends_on_docker(Path(env["DOCKER_BIN"]), log, mismatch_svc="frontend")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "release image reconcile mismatch for transcribe-frontend" in out
+    assert "release image reconcile mismatch for transcribe-backend" not in out
+
+
+def test_reconcile_service_missing_image_field_returns_rc5_with_error(tmp_path):
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+{_reconcile_mock_bash(image_map={"frontend": "frontend", "backend": None})}
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert "::error::release image reconcile service backend has no image defined in compose config" in result.stderr
+    assert "reconcile passed" not in result.stdout
+    assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_reconcile_compose_ps_failure_returns_rc5(tmp_path):
+    env, log = base(tmp_path)
+    write_exec(
+        Path(env["DOCKER_BIN"]),
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  echo "compose: failed to list containers" >&2
+  exit 1
+fi
+{_reconcile_mock_bash()}
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  printf 'frontend:%s\\nbackend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+exit 0
+''',
+    )
+    result = run(env)
+    assert result.returncode == 5, result.stdout + result.stderr
+    assert "::error::release image reconcile could not list compose service images" in result.stderr
+    assert "reconcile passed" not in result.stdout
+    assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_reconcile_docker_timeout_during_ps_a_returns_rc5(tmp_path):
+    env, log = base(tmp_path)
+    env["RECONCILE_CMD_TIMEOUT"] = "1"
+    docker = Path(env["DOCKER_BIN"])
+    write_exec(
+        docker,
+        '''#!/bin/bash
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  sleep 8
+fi
+''' + docker.read_text().split("\n", 1)[1],
+    )
+    result = run(env, timeout=20)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "timed out after 1s holding host lock" in out
+    assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_reconcile_evidence_format_and_ordering(tmp_path):
+    env, log = base(tmp_path)
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "[release][evidence] service_images: frontend=frontend:abc123456789,backend=backend:abc123456789" in out
+
+
+
