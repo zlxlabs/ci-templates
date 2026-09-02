@@ -430,6 +430,12 @@ do_deploy() {
   local prev_good="" compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
 
+  if [ "$prev_good" = "$GIT_SHA" ]; then
+    log "this SHA already in last_good_tag; skip forward deploy; reconcile only"
+    event exit
+    return 0
+  fi
+
   deploy_tag "$GIT_SHA"
 
   if health_probe; then
