@@ -19,41 +19,34 @@ def write_exec(path: Path, body: str):
 
 def _reconcile_mock_bash(*, services=("frontend", "backend"), image_map: dict[str, str | None] | None = None):
     service_lines = "\\n".join(services)
-    if image_map is None:
-        fmt_entries = ",".join(f'"{svc}":{{"image":"{svc}:%s"}}' for svc in services)
-        fmt_args = " ".join('"$D3_RELEASE_TAG"' for _ in services)
-    else:
-        fmt_entries_list = []
-        fmt_args_list = []
-        seen = set()
-        for svc in services:
-            seen.add(svc)
+    ordered = list(services)
+    seen = set(services)
+    if image_map is not None:
+        for svc in image_map:
+            if svc not in seen:
+                ordered.append(svc)
+                seen.add(svc)
+    ps_parts = []
+    ps_args = []
+    for svc in ordered:
+        if image_map is None:
+            img = svc
+        else:
             img = image_map.get(svc)
             if img is None:
-                fmt_entries_list.append(f'"{svc}":{{"image":null}}')
-            elif ":" in img:
-                fmt_entries_list.append(f'"{svc}":{{"image":"{img}"}}')
-            else:
-                fmt_entries_list.append(f'"{svc}":{{"image":"{img}:%s"}}')
-                fmt_args_list.append('"$D3_RELEASE_TAG"')
-        for svc, img in image_map.items():
-            if svc not in seen:
-                if img is None:
-                    fmt_entries_list.append(f'"{svc}":{{"image":null}}')
-                elif ":" in img:
-                    fmt_entries_list.append(f'"{svc}":{{"image":"{img}"}}')
-                else:
-                    fmt_entries_list.append(f'"{svc}":{{"image":"{img}:%s"}}')
-                    fmt_args_list.append('"$D3_RELEASE_TAG"')
-        fmt_entries = ",".join(fmt_entries_list)
-        fmt_args = " ".join(fmt_args_list)
-
-    args_str = f" {fmt_args}" if fmt_args else ""
+                continue
+        if ":" in img:
+            ps_parts.append(f"{svc}\\t{img}\\n")
+        else:
+            ps_parts.append(f"{svc}\\t{img}:%s\\n")
+            ps_args.append('"$D3_RELEASE_TAG"')
+    ps_fmt = "".join(ps_parts)
+    args_str = f" {' '.join(ps_args)}" if ps_args else ""
     return f'''if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
   printf '{service_lines}\\n'; exit 0
 fi
-if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *" --format json"* || " $* " == *" --format=json"* ]]; then
-  printf '{{"services":{{{fmt_entries}}}}}\n'{args_str}; exit 0
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  printf '{ps_fmt}'{args_str}; exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
   last="${{@: -1}}"
@@ -1889,7 +1882,7 @@ def test_reconcile_docker_timeout_returns_rc5_and_keeps_last_good(tmp_path):
 
 
 def _mock_multiline_depends_on_docker(path: Path, log: Path, *, mismatch_svc: str | None = None):
-    """Mock docker reproducing compose v5.5.0 multi-line depends_on output for config --images."""
+    """Mock docker: identity gate still uses config --images; reconcile maps via ps -a --format."""
     write_exec(
         path,
         f'''#!/bin/bash
@@ -1897,8 +1890,8 @@ echo "$@" >> "{log}"
 if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
   printf 'backend\\nfrontend\\nnginx\\nmigrate\\n'; exit 0
 fi
-if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *" --format json"* || " $* " == *" --format=json"* ]]; then
-  printf '{{"services":{{"backend":{{"image":"transcribe-backend:%s"}},"frontend":{{"image":"transcribe-frontend:%s"}},"nginx":{{"image":"nginx:alpine"}},"migrate":{{"image":"transcribe-backend:%s"}}}}}}\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  printf 'backend\\ttranscribe-backend:%s\\nfrontend\\ttranscribe-frontend:%s\\nnginx\\tnginx:alpine\\nmigrate\\ttranscribe-backend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
   exit 0
 fi
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
@@ -2014,14 +2007,15 @@ exit 0
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 
-def test_reconcile_compose_json_parse_failure_returns_rc5(tmp_path):
+def test_reconcile_compose_ps_failure_returns_rc5(tmp_path):
     env, log = base(tmp_path)
     write_exec(
         Path(env["DOCKER_BIN"]),
         f'''#!/bin/bash
 echo "$@" >> "{log}"
-if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *" --format json"* || " $* " == *" --format=json"* ]]; then
-  echo "INVALID_JSON_OUTPUT"; exit 0
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
+  echo "compose: failed to list containers" >&2
+  exit 1
 fi
 {_reconcile_mock_bash()}
 if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
@@ -2033,44 +2027,19 @@ exit 0
     )
     result = run(env)
     assert result.returncode == 5, result.stdout + result.stderr
-    assert "::error::release image reconcile failed to extract service images from compose json" in result.stderr
+    assert "::error::release image reconcile could not list compose service images" in result.stderr
     assert "reconcile passed" not in result.stdout
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 
-def test_reconcile_missing_python3_returns_rc5(tmp_path):
-    env, log = base(tmp_path)
-    fake_bin = tmp_path / "nopython_bin"
-    fake_bin.mkdir(exist_ok=True)
-    # Symlink everything in PATH except python3
-    for entry in os.environ.get("PATH", "").split(os.path.pathsep):
-        if not entry or not os.path.isdir(entry):
-            continue
-        for name in os.listdir(entry):
-            if name.startswith("python"):
-                continue
-            src = os.path.join(entry, name)
-            dst = fake_bin / name
-            if not dst.exists() and os.path.isfile(src):
-                try:
-                    dst.symlink_to(src)
-                except OSError:
-                    pass
-    env["PATH"] = str(fake_bin)
-    result = run(env)
-    assert result.returncode == 5, result.stdout + result.stderr
-    assert "::error::release image reconcile requires python3 on the host" in result.stderr
-    assert "reconcile passed" not in result.stdout
-
-
-def test_reconcile_docker_timeout_during_json_config_returns_rc5(tmp_path):
+def test_reconcile_docker_timeout_during_ps_a_returns_rc5(tmp_path):
     env, log = base(tmp_path)
     env["RECONCILE_CMD_TIMEOUT"] = "1"
     docker = Path(env["DOCKER_BIN"])
     write_exec(
         docker,
         '''#!/bin/bash
-if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *" --format json"* || " $* " == *" --format=json"* ]]; then
+if [ "$1" = compose ] && [[ " $* " == *" ps -a "* ]] && [[ " $* " == *" --format "* ]]; then
   sleep 8
 fi
 ''' + docker.read_text().split("\n", 1)[1],
