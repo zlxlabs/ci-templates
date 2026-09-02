@@ -587,9 +587,16 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     assert 'RECONCILE_CMD_TIMEOUT="${RECONCILE_CMD_TIMEOUT:-60}"' in script
     assert "reconcile_docker()" in script
     assert 'reconcile_docker image inspect "${ACR_REGISTRY}/${ACR_NAMESPACE}/${image_name}:${D3_RELEASE_TAG}"' in script
-    assert "compose_list_services" in script and 'config --images "$svc"' in script
-    assert "config --format '{{" not in script
-    assert "could not render compose image for service" in script
+    assert "compose_list_services" in script
+    assert "ps -a --format '{{.Service}}\\t{{.Image}}'" in script
+    assert "IFS=$'\\t' read -r map_svc map_img" in script
+    assert "service_images_map" in script
+    assert "could not list compose service images" in script
+    assert 'config --images "$svc"' not in script
+    header_contract = (
+        "# manifest.  This host-side code intentionally has no jq/Python dependency."
+    )
+    assert "python3" not in script.replace(header_contract, "")
     assert 'readarray -t all_services <<< "$all_services_output"' in script
     assert "readarray -t all_services < <(" not in script
     assert 'ps -q --status running' in script
@@ -612,7 +619,7 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     assert script.index("oneshot_svc") < script.index("ps -q --status running")
     reject = 'if [[ "${#non_oneshot_services[@]}" -eq 0 ]]; then'
     assert recon.index("non_oneshot_services=()") < recon.index(reject) < recon.index(
-        "service_images_output=\"${service_images_output}"
+        "ps -a --format"
     )
     assert "oneshot_services covers every compose service" in script
     assert "only referenced by oneshot service(s)" not in script
