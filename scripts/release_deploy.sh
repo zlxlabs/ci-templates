@@ -595,8 +595,12 @@ probe_release() {
       [[ -z "$attempt_sequence" ]] || attempt_sequence+=","
       attempt_sequence+="${code}(curl=${curl_rc})"
       check_pending || return 130
-      if [[ "$code" == "${PROBE_STATUS[$i]}" ]]; then break; fi
-      log "probe ${PROBE_URLS[$i]} got ${code}, want ${PROBE_STATUS[$i]} (${attempt}/${HEALTHCHECK_RETRIES})"
+      if [[ "$code" == "${PROBE_STATUS[$i]}" && "$curl_rc" -eq 0 ]]; then break; fi
+      if [[ "$code" == "${PROBE_STATUS[$i]}" ]]; then
+        log "probe ${PROBE_URLS[$i]} got '${code}' but curl rc=${curl_rc} (transport incomplete) (${attempt}/${HEALTHCHECK_RETRIES})"
+      else
+        log "probe ${PROBE_URLS[$i]} got ${code}, want ${PROBE_STATUS[$i]} (${attempt}/${HEALTHCHECK_RETRIES})"
+      fi
       if (( attempt == HEALTHCHECK_RETRIES )); then
         echo "[deploy][evidence] probe-attempts url=${PROBE_URLS[$i]} ${attempt_sequence}"
         return 1
