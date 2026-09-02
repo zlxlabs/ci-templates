@@ -234,8 +234,8 @@ lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门�
 两种情形下生产要么停在已验证的 `last_good`、要么根本没被碰过，都不需要紧急上机。
 `rc=1` 与 `rc=4` 的处置严格互斥。
 
-`rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署、
-`last_good` 等于本次 SHA）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
+`rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署；`last_good` 已等于本次 SHA 时走
+skip-forward 只对账，不再是 rc=4 来源）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
 release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollback）、镜像集较上次发布已变化
 而不支持回滚（rollback impossible）、回滚的 `deploy_group` 执行失败、回滚 compose 成功但
 `probe_release` 仍失败。无论来源是哪一项，`rc=4` 都表示生产可能不可用，不能按「未上线、无需处理」理解。
