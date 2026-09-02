@@ -314,13 +314,13 @@ Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务
 
 ### 部署后镜像事实对账（单镜像 lane）
 
-`build-deploy.yml` 的健康探针通过后，还会在同一目标机上无条件对账三段事实：本次
-`${GIT_SHA}` 镜像 tag 可 inspect、`<image_name>:latest` 与它拥有相同 image ID、以及
-`docker compose ps -q --status running` 找到的至少一个运行容器通过 `docker inspect` 使用该
-image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过滤）。
-三段中任一不成立，workflow 判红并打印 expected / latest / running 的实际值；SSH
-对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
-延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
+`build-deploy.yml` 的健康探针通过后，`pull_and_deploy.sh` 仍持有 host flock，在同一
+ssh 会话内对账三段事实：本次 `${GIT_SHA}` 镜像 tag 可 inspect、`<image_name>:latest`
+与它拥有相同 image ID、以及 `docker compose ps -q --status running` **加上非 oneshot
+服务过滤**后找到的至少一个运行容器通过 `docker inspect` 使用该 image ID。
+三段中任一不成立，脚本以 **rc=5** 退出（与 rc=1 已回滚 / rc=3 deferred 区分），
+workflow 判红并打印 expected / latest / running 的实际值；对账失败**不**自动回滚
+（`last_good_tag` 已推进）。`rc=3` 延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
 
 ### 部署后镜像事实对账（release lane）
 
@@ -382,7 +382,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
-| **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账 | `build-deploy.yml` 镜像对账 step |
+| **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账（持 host 锁，失败 rc=5） | `pull_and_deploy.sh` 对账函数 + `build-deploy.yml` 薄壳 |
 | **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
 

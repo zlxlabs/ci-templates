@@ -1458,3 +1458,23 @@ fi
     assert "image reconcile starting (host lock still held)" in out
     assert "RECONCILE_LOCKED" in lock_state.read_text()
     assert "RECONCILE_UNLOCKED" not in lock_state.read_text()
+
+
+def test_reconcile_docker_timeout_returns_rc5(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["RECONCILE_CMD_TIMEOUT"] = "1"
+    docker = Path(env["DOCKER_BIN"])
+    _write_exec(
+        docker,
+        "#!/bin/bash\n"
+        'if [ "$1" = inspect ] || { [ "$1" = image ] && [ "$2" = inspect ]; }; then sleep 8; fi\n'
+        + docker.read_text().split("\n", 1)[1],
+    )
+    result = _run(env, timeout=20)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "timed out after 1s holding host lock" in out
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    assert good.exists() and good.read_text().strip() == "abc1234"
