@@ -1846,3 +1846,109 @@ def test_reconcile_docker_timeout_returns_rc5_and_keeps_last_good(tmp_path):
     assert result.returncode == 5, out
     assert "timed out after 1s holding host lock" in out
     assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def _mock_multiline_depends_on_docker(path: Path, log: Path, *, mismatch_svc: str | None = None):
+    """Mock docker reproducing compose v5.5.0 multi-line depends_on output for config --images."""
+    write_exec(
+        path,
+        f'''#!/bin/bash
+echo "$@" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" config --services "* ]]; then
+  printf 'backend\\nfrontend\\nnginx\\nmigrate\\n'; exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *"json"* ]]; then
+  printf '{{"services":{{"backend":{{"image":"transcribe-backend:%s"}},"frontend":{{"image":"transcribe-frontend:%s"}},"nginx":{{"image":"nginx:alpine"}},"migrate":{{"image":"transcribe-backend:%s"}}}}}}\\\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"
+  exit 0
+fi
+if [ "$1" = compose ] && [[ " $* " == *" config --images "* ]]; then
+  last="${{@: -1}}"
+  case "$last" in
+    frontend)
+      # docker compose v5.5.0 multi-line output with depends_on
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\ntranscribe-frontend:%s\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"; exit 0 ;;
+    backend)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    nginx)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\nnginx:alpine\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    migrate)
+      printf 'transcribe-backend:%s\\n' "$D3_RELEASE_TAG"; exit 0 ;;
+    *)
+      # Gate identity check (no service specified)
+      printf 'postgres:15-alpine\\ntranscribe-backend:%s\\ntranscribe-frontend:%s\\nnginx:alpine\\n' "$D3_RELEASE_TAG" "$D3_RELEASE_TAG"; exit 0 ;;
+  esac
+fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
+  emit=0
+  for arg in "$@"; do
+    [ "$emit" = 1 ] && printf 'cid-%s\\n' "$arg"
+    [ "$arg" = "running" ] && emit=1
+  done
+  exit 0
+fi
+if [ "$1" = inspect ]; then
+  cid="$2"
+  svc="${{cid#cid-}}"
+  if [ "$svc" = "{mismatch_svc}" ]; then
+    printf 'sha256:WRONG_IMAGE\\n'; exit 0
+  fi
+  case "$svc" in
+    frontend) printf 'sha256:transcribe-frontend\\n'; exit 0 ;;
+    backend|migrate) printf 'sha256:transcribe-backend\\n'; exit 0 ;;
+    nginx) printf 'sha256:nginx\\n'; exit 0 ;;
+    *) printf 'sha256:%s\\n' "$svc"; exit 0 ;;
+  esac
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+  ref="$3"; base="${{ref##*/}}"; name="${{base%%:*}}"
+  printf 'sha256:%s\\n' "$name"; exit 0
+fi
+exit 0
+''',
+    )
+
+
+def test_reconcile_multiline_depends_on_images_maps_accurately_and_verifies_running(tmp_path):
+    env, log = base(tmp_path)
+    manifest_path = tmp_path / "three_service.manifest"
+    manifest_path.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\ttranscribe-frontend\ttranscribe-frontend\n"
+        "image\ttranscribe-backend\ttranscribe-backend\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(manifest_path)
+    env["ONESHOT_SERVICES"] = "migrate"
+    _mock_multiline_depends_on_docker(Path(env["DOCKER_BIN"]), log)
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "[release][evidence] service_images:" in out
+    assert "skipped running check for transcribe-frontend" not in out
+    assert "skipped running check for transcribe-backend" not in out
+    assert "passed for transcribe-frontend: expected_id=sha256:transcribe-frontend" in out
+    assert "passed for transcribe-backend: expected_id=sha256:transcribe-backend" in out
+
+
+def test_reconcile_multiline_depends_on_images_mismatch_reports_correct_service(tmp_path):
+    env, log = base(tmp_path)
+    manifest_path = tmp_path / "three_service.manifest"
+    manifest_path.write_text(
+        "D3_RELEASE_MANIFEST=1\n"
+        "image\ttranscribe-frontend\ttranscribe-frontend\n"
+        "image\ttranscribe-backend\ttranscribe-backend\n"
+        "probe\thttp://localhost/frontend\t200\n"
+        "probe\thttp://localhost/api/health\t200\n"
+    )
+    env["RELEASE_MANIFEST"] = str(manifest_path)
+    env["ONESHOT_SERVICES"] = "migrate"
+    _mock_multiline_depends_on_docker(Path(env["DOCKER_BIN"]), log, mismatch_svc="frontend")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "release image reconcile mismatch for transcribe-frontend" in out
+    assert "release image reconcile mismatch for transcribe-backend" not in out
+
