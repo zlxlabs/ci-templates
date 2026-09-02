@@ -30,3 +30,10 @@
 - **本段结论**：`RECONCILE_CMD_TIMEOUT=1` 时 mock `sleep 8` 以 rc=5 返回且输出含 timeout，未挂死；锁序红验把 `reconcile_deployed_image` 挪到 `flock -u 9` 之后，契约测试断言失败 `115 < 16`，已还原。
 - **关键决策与已否决方案**：红验只改调用与 `flock -u 9` 的相对位置一行块，未整文件 checkout。
 - **下一步唯一动作**：全量 pytest + shellcheck，提交后停在干净 card 分支。
+
+## 2026-09-02 修复轮 1（P1-1 skip-forward + P2 文案）
+
+- **当前阶段**：repairing（PR #38 r1：P1-1 / P2-1 / P2-2）
+- **本段结论**：`do_deploy` 在 `prev_good == GIT_SHA` 时跳过 `deploy_tag` + 探针，`return 0` 后主流程仍在锁内跑 `reconcile_deployed_image`。README 退出码表补 `rc=5`，`rc=0` 改为探针+三段对账；飞书红卡首句区分 Deploy 单红与 rc=5 双红。
+- **关键决策与已否决方案**：skip-forward 不跳过对账、不跳过锁；不改 255 重试、不对账改回第二条 ssh。红验把判据改成 `if false`，`test_promoted_sha_reentry_skips_forward_and_reconciles_only` 以 AssertionError 转红后还原该行。
+- **下一步唯一动作**：全量 pytest + shellcheck，停在干净 card 分支交主脑推 PR #38。

@@ -210,6 +210,17 @@ def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
     assert "不需要紧急上机" not in urgent_section
 
 
+def test_red_card_distinguishes_deploy_only_from_rc5_double_red():
+    # rc=5 让 Deploy 与 Reconcile 两 step 同红。若首句仍写「Deploy 步骤红 = 已回滚」，
+    # on-call 会把对账失败当成已回滚。单红与双红必须分行。
+    text = WORKFLOW.read_text()
+    assert "**Deploy 步骤**红且 **没有** Reconcile 红:" in text
+    assert "Deploy 与 Reconcile **同时**红 = 对账失败（rc=5）" in text
+    assert "按 Reconcile 那条处置" in text
+    assert "**不要**按已回滚处置" in text
+    assert "**Deploy 步骤**红:未部署成功" not in text
+
+
 def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers():
     # Aligned with #35: reconcile runs inside pull_and_deploy.sh while HOST_LOCK
     # is held; the workflow step is a thin shell that only re-emits rc=5.
