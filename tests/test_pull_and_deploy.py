@@ -400,6 +400,47 @@ def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
     assert "old version passed the same-budget health probe" in result.stdout
 
 
+def test_http_200_with_curl_timeout_is_unhealthy_and_rolls_back(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["GIT_SHA"] = "new2222"
+    env["HEALTHCHECK_RETRIES"] = "1"
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True)
+    good.write_text("old1111\n")
+
+    curl_log = tmp_path / "curl-attempts.log"
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            curl_log,
+            [("200", 28), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "got '200' but curl rc=28 (transport incomplete)" in result.stdout
+    assert "[deploy][evidence] probe-attempts: 200(curl=28)" in result.stdout
+    assert good.read_text().strip() == "old1111"
+
+
+def test_healthy_probe_emits_probe_attempts_evidence(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+    assert "[deploy][evidence] probe-attempts:" in res.stdout
+    assert "200(curl=0)" in res.stdout
+
+
 def test_rollback_evidence_is_captured_before_redeploy(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
