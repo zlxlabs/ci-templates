@@ -1478,3 +1478,24 @@ def test_reconcile_docker_timeout_returns_rc5(tmp_path):
     assert "timed out after 1s holding host lock" in out
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert good.exists() and good.read_text().strip() == "abc1234"
+
+
+def test_promoted_sha_reentry_skips_forward_and_reconciles_only(tmp_path):
+    """255 重放时 last_good_tag 已是本次 GIT_SHA：跳过 deploy_tag / 探针，只对账。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    (state / "last_good_tag").write_text(env["GIT_SHA"] + "\n")
+
+    res = _run(env)
+    out = res.stdout + res.stderr
+    assert res.returncode == 0, out
+    assert "skip forward deploy" in out
+    assert "image reconcile values:" in out
+
+    log = Path(env["DOCKER_LOG"]).read_text()
+    assert " up -d" not in log
+    assert "compose up" not in log
+    assert not any(line.split()[:1] == ["pull"] for line in log.splitlines())
