@@ -382,7 +382,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
-| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
+| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup；判健康需 HTTP code 匹配且 curl rc=0），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账（持 host 锁，失败 rc=5） | `pull_and_deploy.sh` 对账函数 + `build-deploy.yml` 薄壳 |
 | **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
