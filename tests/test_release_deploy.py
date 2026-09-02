@@ -2063,3 +2063,31 @@ def test_reconcile_missing_python3_returns_rc5(tmp_path):
     assert "reconcile passed" not in result.stdout
 
 
+def test_reconcile_docker_timeout_during_json_config_returns_rc5(tmp_path):
+    env, log = base(tmp_path)
+    env["RECONCILE_CMD_TIMEOUT"] = "1"
+    docker = Path(env["DOCKER_BIN"])
+    write_exec(
+        docker,
+        '''#!/bin/bash
+if [ "$1" = compose ] && [[ " $* " == *" config "* ]] && [[ " $* " == *" --format json"* || " $* " == *" --format=json"* ]]; then
+  sleep 8
+fi
+''' + docker.read_text().split("\n", 1)[1],
+    )
+    result = run(env, timeout=20)
+    out = result.stdout + result.stderr
+    assert result.returncode == 5, out
+    assert "timed out after 1s holding host lock" in out
+    assert (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_reconcile_evidence_format_and_ordering(tmp_path):
+    env, log = base(tmp_path)
+    result = run(env)
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert "[release][evidence] service_images: frontend=frontend:abc123456789,backend=backend:abc123456789" in out
+
+
+
