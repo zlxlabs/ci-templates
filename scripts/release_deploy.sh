@@ -358,58 +358,21 @@ reconcile_release_images() {
     compose_args+=(--env-file "$ENV_FILE")
   fi
 
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo "::error::release image reconcile requires python3 on the host" >&2
-    return 1
-  fi
-
-  # Historical contract note (ci-templates#25): replaced legacy per-service
-  # `config --images "$svc"` rendering (which logged "could not render compose image for service"
-  # and accumulated `service_images_output="${service_images_output}${svc}=${image_ref}"`)
-  # because compose v5.5.0 outputs depends_on images on multiple lines out of order.
-  # Reconcile now uses `config --format json` for single-service accurate extraction.
-  local compose_json=""
-  if ! compose_json="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" config --format json)"; then
-    echo "::error::release image reconcile could not render compose config json" >&2
-    return 1
-  fi
-
-  local parsed_service_images=""
-  if ! parsed_service_images="$(python3 -c '
-import json, sys
-try:
-    raw = sys.stdin.read().strip()
-    data = json.loads(raw)
-except Exception as e:
-    sys.stderr.write(f"failed to parse compose json: {e}\n")
-    sys.exit(1)
-
-if not isinstance(data, dict):
-    sys.stderr.write("compose json root is not an object\n")
-    sys.exit(1)
-
-services = data.get("services")
-if not isinstance(services, dict):
-    sys.stderr.write("compose json services is not an object\n")
-    sys.exit(1)
-
-for svc, cfg in services.items():
-    if not isinstance(cfg, dict):
-        continue
-    img = cfg.get("image")
-    if isinstance(img, str) and img.strip():
-        print(f"{svc}={img.strip()}")
-' <<< "$compose_json")"; then
-    echo "::error::release image reconcile failed to extract service images from compose json" >&2
+  # ci-templates#25: per-service mapping must not rely on config --images (multi-line depends_on output).
+  local service_ps_output="" ps_rc=0
+  service_ps_output="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$D3_RELEASE_TAG" reconcile_docker "${compose_args[@]}" ps -a --format '{{.Service}}\t{{.Image}}')" || ps_rc=$?
+  (( ps_rc == 124 )) && return 1
+  if (( ps_rc != 0 )); then
+    echo "::error::release image reconcile could not list compose service images" >&2
     return 1
   fi
 
   local -A service_images_map=()
   local map_svc map_img
-  while IFS='=' read -r map_svc map_img; do
-    [[ -n "$map_svc" ]] || continue
+  while IFS=$'\t' read -r map_svc map_img; do
+    [[ -n "$map_svc" && -n "$map_img" ]] || continue
     service_images_map["$map_svc"]="$map_img"
-  done <<< "$parsed_service_images"
+  done <<< "$service_ps_output"
 
   for svc in "${non_oneshot_services[@]}"; do
     if [[ -z "${service_images_map[$svc]:-}" ]]; then
