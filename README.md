@@ -212,10 +212,11 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 
 | 退出码 | 语义 | 生产状态 | on-call 处置 |
 |---|---|---|---|
-| `rc=0` | 新版本已上线且通过健康探针 | 新版本，已验证在应答 | 无需动作 |
+| `rc=0` | 新版本已上线、通过健康探针**且通过三段镜像对账** | 新版本，已验证在应答 | 无需动作 |
 | `rc=1` | 新版本探针失败，已回滚，且**回滚后的同预算探针已通过** | `last_good`（单镜像 lane 为 `last_good_tag`，release lane 为 `last_good_release`），已验证在应答 | 不需要紧急上机 |
 | `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | 上一版本，完全未动 | 空闲后点黄卡按钮重跑 |
 | `rc=4` | 新版本不健康，且脚本未能证明生产停在一个健康版本上 | 不确定，可能不可用 | **立即上机** |
+| `rc=5` | 探针已过、`last_good` 已推进、镜像对账失败 | 新版本在跑但身份未证明 | **立即上机核对**，不自动回滚，不要重跑 |
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
 | `rc=255` | SSH 传输层失败 | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
 
@@ -233,8 +234,8 @@ lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门�
 两种情形下生产要么停在已验证的 `last_good`、要么根本没被碰过，都不需要紧急上机。
 `rc=1` 与 `rc=4` 的处置严格互斥。
 
-`rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署、
-`last_good` 等于本次 SHA）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
+`rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署；`last_good` 已等于本次 SHA 时走
+skip-forward 只对账，不再是 rc=4 来源）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
 release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollback）、镜像集较上次发布已变化
 而不支持回滚（rollback impossible）、回滚的 `deploy_group` 执行失败、回滚 compose 成功但
 `probe_release` 仍失败。无论来源是哪一项，`rc=4` 都表示生产可能不可用，不能按「未上线、无需处理」理解。
@@ -314,13 +315,13 @@ Python、Node 等冷启动较慢，或启动时还需连接外部依赖的服务
 
 ### 部署后镜像事实对账（单镜像 lane）
 
-`build-deploy.yml` 的健康探针通过后，还会在同一目标机上无条件对账三段事实：本次
-`${GIT_SHA}` 镜像 tag 可 inspect、`<image_name>:latest` 与它拥有相同 image ID、以及
-`docker compose ps -q --status running` 找到的至少一个运行容器通过 `docker inspect` 使用该
-image ID（显式限定 `running` 而不依赖 `compose ps` 的版本默认过滤）。
-三段中任一不成立，workflow 判红并打印 expected / latest / running 的实际值；SSH
-对账连接只对传输层 `rc=255` 做有限重试，最终不可达也判红，不会降级为绿灯。`rc=3`
-延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
+`build-deploy.yml` 的健康探针通过后，`pull_and_deploy.sh` 仍持有 host flock，在同一
+ssh 会话内对账三段事实：本次 `${GIT_SHA}` 镜像 tag 可 inspect、`<image_name>:latest`
+与它拥有相同 image ID、以及 `docker compose ps -q --status running` **加上非 oneshot
+服务过滤**后找到的至少一个运行容器通过 `docker inspect` 使用该 image ID。
+三段中任一不成立，脚本以 **rc=5** 退出（与 rc=1 已回滚 / rc=3 deferred 区分），
+workflow 判红并打印 expected / latest / running 的实际值；对账失败**不**自动回滚
+（`last_good_tag` 已推进）。`rc=3` 延期、`rc=1` 已回滚和 `rc=4` 的部署不会执行对账。
 
 ### 部署后镜像事实对账（release lane）
 
@@ -382,7 +383,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
-| **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账 | `build-deploy.yml` 镜像对账 step |
+| **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账（持 host 锁，失败 rc=5） | `pull_and_deploy.sh` 对账函数 + `build-deploy.yml` 薄壳 |
 | **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
 

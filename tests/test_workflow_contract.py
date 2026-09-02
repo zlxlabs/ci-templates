@@ -10,6 +10,7 @@ import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-deploy.yml"
+SCRIPT = REPO_ROOT / "scripts" / "pull_and_deploy.sh"
 
 EXPECTED_SECRETS = {
     "ACR_USERNAME", "ACR_PASSWORD", "SSH_DEPLOY_KEY", "KNOWN_HOSTS",
@@ -209,7 +210,20 @@ def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
     assert "不需要紧急上机" not in urgent_section
 
 
+def test_red_card_distinguishes_deploy_only_from_rc5_double_red():
+    # rc=5 让 Deploy 与 Reconcile 两 step 同红。若首句仍写「Deploy 步骤红 = 已回滚」，
+    # on-call 会把对账失败当成已回滚。单红与双红必须分行。
+    text = WORKFLOW.read_text()
+    assert "**Deploy 步骤**红且 **没有** Reconcile 红:" in text
+    assert "Deploy 与 Reconcile **同时**红 = 对账失败（rc=5）" in text
+    assert "按 Reconcile 那条处置" in text
+    assert "**不要**按已回滚处置" in text
+    assert "**Deploy 步骤**红:未部署成功" not in text
+
+
 def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers():
+    # Aligned with #35: reconcile runs inside pull_and_deploy.sh while HOST_LOCK
+    # is held; the workflow step is a thin shell that only re-emits rc=5.
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
     deploy_index = next(i for i, step in enumerate(steps) if step.get("id") == "deploy")
@@ -222,20 +236,48 @@ def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers(
     assert reconcile_index == deploy_index + 1, (
         "image reconciliation must run immediately after the deploy step"
     )
-    assert reconcile["if"] == "success() && steps.deploy.outputs.deferred != 'true'", (
-        "reconciliation must only run after a real deploy success; deferred and "
-        "deploy failures must skip it"
+    assert reconcile["if"] == "failure() && steps.deploy.outputs.reconcile_failed == 'true'", (
+        "thin shell must only run when deploy already mapped rc=5; deferred and "
+        "ordinary deploy failures must skip it"
     )
 
-    run = reconcile["run"]
-    assert 'docker image inspect "${ACR_IMAGE}:${GIT_SHA}"' in run
-    assert 'docker image inspect "${IMAGE_NAME}:latest"' in run
-    assert 'docker compose ps -q --status running' in run
-    assert 'docker inspect "$container_id" --format' in run
-    assert "expected_id" in run and "latest_id" in run and "running_ids" in run
-    assert "::error::" in run
-    assert "SSH transport failed after ${max_attempts} attempts" in run
-    assert "ServerAliveInterval" in run and "ServerAliveCountMax" in run
+    deploy_run = steps[deploy_index]["run"]
+    assert 'if [ "$rc" -eq 5 ]; then' in deploy_run
+    assert "reconcile_failed=true" in deploy_run
+    assert deploy_run.index('if [ "$rc" -eq 5 ]; then') < deploy_run.index(
+        "reconcile_failed=true"
+    )
+    assert deploy_run.index('if [ "$rc" -eq 5 ]; then') < deploy_run.index(
+        '"$rc" -ne 255'
+    )
+
+    thin = reconcile["run"]
+    assert "printf -v RECONCILE_COMMAND" not in thin
+    assert "bash -s" not in thin
+    assert "ssh " not in thin
+    assert "image reconcile assertion failed" in thin
+
+    script = SCRIPT.read_text()
+    after_do_deploy = script[script.index("do_deploy\nrc=$?"):]
+    assert "reconcile_deployed_image" in after_do_deploy
+    assert after_do_deploy.index("reconcile_deployed_image") < after_do_deploy.index(
+        "flock -u 9"
+    )
+    flock_acquire = script.index("\nflock 9\n")
+    flock_release = script.index("flock -u 9", flock_acquire)
+    call_at = script.index("reconcile_deployed_image", flock_acquire)
+    assert flock_acquire < call_at < flock_release
+
+    assert 'RECONCILE_CMD_TIMEOUT="${RECONCILE_CMD_TIMEOUT:-60}"' in script
+    assert "reconcile_docker()" in script
+    assert 'reconcile_docker image inspect "${ACR_IMAGE}:${GIT_SHA}"' in script
+    assert 'reconcile_docker image inspect "${IMAGE_NAME}:latest"' in script
+    assert 'ps -q --status running' in script
+    assert '"${non_oneshot_services[@]}"' in script
+    assert "image reconcile values:" in script
+    assert "expected_id=" in script and "latest_id=" in script and "running_ids=" in script
+    assert "rc=5" in after_do_deploy
+    assert "::notice::image reconcile passed" in script
 
 
 def test_remote_script_path_is_unique_per_run():

@@ -7,10 +7,12 @@
 #   - last-good tracking  : records the last healthy tag for rollback
 #   - health probe gate   : warmup + retries + expected status
 #   - auto rollback       : probe failure -> redeploy previous good tag
-#   - busy-lock gate      : opt-in (BUSY_LOCK_FILE); exit codes: 0=healthy,
-#                           1=probe failed (rolled back), 3=deferred (service
-#                           busy, busy lock not acquired in time, old
-#                           container untouched)
+#   - busy-lock gate      : opt-in (BUSY_LOCK_FILE); exit codes: 0=healthy
+#                           (probe + image reconcile passed), 1=probe failed
+#                           (rolled back), 3=deferred (service busy, busy lock
+#                           not acquired in time, old container untouched),
+#                           5=deploy healthy but image reconcile failed
+#                           (last_good already promoted; no auto-rollback)
 #
 # All inputs come from the environment so the build-deploy.yml job can export
 # them and so tests can inject mocks (DOCKER_BIN / CURL_BIN).
@@ -49,6 +51,7 @@ HEALTHCHECK_INTERVAL="${HEALTHCHECK_INTERVAL:-3}"   # seconds between probes
 HEALTHCHECK_WARMUP="${HEALTHCHECK_WARMUP:-5}"       # seconds before first probe
 HEALTHCHECK_TIMEOUT="${HEALTHCHECK_TIMEOUT:-5}"     # per-probe curl timeout
 EVIDENCE_TIMEOUT="${EVIDENCE_TIMEOUT:-20}"           # per-evidence-command timeout
+RECONCILE_CMD_TIMEOUT="${RECONCILE_CMD_TIMEOUT:-60}" # per docker/compose call during reconcile
 ONESHOT_SERVICES="${ONESHOT_SERVICES:-}"
 ROLLBACK_MODE=0
 
@@ -68,6 +71,11 @@ is_positive_integer() {
 is_non_negative_integer() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
+
+if ! is_positive_integer "$RECONCILE_CMD_TIMEOUT"; then
+  log "RECONCILE_CMD_TIMEOUT must be a positive integer, got: ${RECONCILE_CMD_TIMEOUT}"
+  exit 1
+fi
 
 # --- local registry input validation (opt-in; only runs when LOCAL_IMAGE is set) ---
 # 校验 LOCAL_IMAGE 的 host[:port] 前缀部分(第一个 "/" 之前),拒绝协议前缀
@@ -284,6 +292,136 @@ health_probe() {
   return 1
 }
 
+# Lock-held docker bound. 124 = timeout → caller maps to rc=5.
+reconcile_docker() {
+  timeout --kill-after=1s "${RECONCILE_CMD_TIMEOUT}s" "$DOCKER_BIN" "$@"
+  local rc=$?
+  if (( rc == 124 || rc == 137 )); then
+    echo "::error::image reconcile timed out after ${RECONCILE_CMD_TIMEOUT}s holding host lock" >&2
+    return 124
+  fi
+  return "$rc"
+}
+
+# Post-promote identity check; caller maps non-zero to rc=5. Must hold fd9.
+reconcile_deployed_image() {
+  local expected_id="<unavailable>" latest_id="<unavailable>"
+  local expected_rc=0 latest_rc=0 compose_rc=0 inspect_rc=0 config_rc=0
+  local running_match=0 running_ids="<none>"
+  local compose_args=(compose)
+  local all_services_output="" all_svc non_oneshot_services=()
+  local compose_output="" container_id image_id
+  local reconcile_rc=0
+
+  all_services_output="$(
+    cd "$DEPLOY_DIR" && reconcile_docker "${compose_args[@]}" config --services
+  )" || config_rc=$?
+  if [ "$config_rc" -eq 124 ]; then
+    return 1
+  fi
+  if [ "$config_rc" -ne 0 ]; then
+    echo "::error::image reconcile could not list compose services" >&2
+    return 1
+  fi
+
+  while IFS= read -r all_svc; do
+    [ -n "$all_svc" ] || continue
+    case " $ONESHOT_SERVICES " in
+      *" $all_svc "*) ;;
+      *) non_oneshot_services+=("$all_svc") ;;
+    esac
+  done <<< "$all_services_output"
+
+  if [ "${#non_oneshot_services[@]}" -eq 0 ]; then
+    echo "::error::image reconcile refused: oneshot_services covers every compose service; no long-running service is available for reconciliation; cannot prove this SHA is running in production" >&2
+    return 1
+  fi
+
+  if expected_id="$(reconcile_docker image inspect "${ACR_IMAGE}:${GIT_SHA}" --format '{{.Id}}')"; then
+    [ -n "$expected_id" ] || { expected_id="<empty>"; expected_rc=1; }
+  else
+    expected_rc=$?
+    if [ "$expected_rc" -eq 124 ]; then
+      return 1
+    fi
+    expected_id="<inspect failed>"
+  fi
+
+  if latest_id="$(reconcile_docker image inspect "${IMAGE_NAME}:latest" --format '{{.Id}}')"; then
+    [ -n "$latest_id" ] || { latest_id="<empty>"; latest_rc=1; }
+  else
+    latest_rc=$?
+    if [ "$latest_rc" -eq 124 ]; then
+      return 1
+    fi
+    latest_id="<inspect failed>"
+  fi
+
+  compose_output="<compose ps failed>"
+  if compose_output="$(
+    cd "$DEPLOY_DIR" && reconcile_docker "${compose_args[@]}" ps -q --status running "${non_oneshot_services[@]}"
+  )"; then
+    running_ids=""
+    while IFS= read -r container_id; do
+      [ -n "$container_id" ] || continue
+      image_id="<inspect failed>"
+      if image_id="$(reconcile_docker inspect "$container_id" --format '{{.Image}}')"; then
+        running_ids="${running_ids}${container_id}=${image_id}"$'\n'
+        [ "$image_id" = "$expected_id" ] && running_match=1
+      else
+        inspect_rc=$?
+        if [ "$inspect_rc" -eq 124 ]; then
+          return 1
+        fi
+        running_ids="${running_ids}${container_id}=<inspect failed>"$'\n'
+      fi
+    done <<< "$compose_output"
+    [ -n "$running_ids" ] || running_ids="<none>"
+  else
+    compose_rc=$?
+    if [ "$compose_rc" -eq 124 ]; then
+      return 1
+    fi
+    running_ids="<compose ps failed>"
+  fi
+
+  echo "image reconcile values:"
+  printf '  expected_id=%s\n' "$expected_id"
+  printf '  latest_id=%s\n' "$latest_id"
+  printf '  running_ids=%s\n' "$running_ids"
+
+  if [ "$expected_rc" -ne 0 ]; then
+    echo "::error::image reconcile expected SHA image is unavailable: ${ACR_IMAGE}:${GIT_SHA} (expected_id=${expected_id})"
+    reconcile_rc=1
+  fi
+  if [ "$latest_rc" -ne 0 ]; then
+    echo "::error::image reconcile latest tag could not be inspected: ${IMAGE_NAME}:latest (latest_id=${latest_id})"
+    reconcile_rc=1
+  elif [ "$expected_rc" -ne 0 ]; then
+    echo "::error::image reconcile latest tag cannot be compared because expected_id is unavailable (latest_id=${latest_id})"
+    reconcile_rc=1
+  elif [ "$latest_id" != "$expected_id" ]; then
+    echo "::error::image reconcile latest tag mismatch: expected_id=${expected_id}, latest_id=${latest_id} (if this service has a concurrent or alternative deploy source, this can also mean a newer deploy superseded this run)"
+    reconcile_rc=1
+  fi
+  if [ "$compose_rc" -ne 0 ]; then
+    echo "::error::image reconcile could not list running containers with docker compose ps -q --status running (running_ids=${running_ids})"
+    reconcile_rc=1
+  elif [ "$expected_rc" -ne 0 ]; then
+    echo "::error::image reconcile running container cannot be compared because expected_id is unavailable (running_ids=${running_ids})"
+    reconcile_rc=1
+  elif [ "$running_match" -ne 1 ]; then
+    echo "::error::image reconcile running container mismatch: expected_id=${expected_id}, running_ids=${running_ids}"
+    reconcile_rc=1
+  fi
+
+  if [ "$reconcile_rc" -ne 0 ]; then
+    return 1
+  fi
+  echo "::notice::image reconcile passed: ${GIT_SHA} is the image ID used by latest and at least one running container"
+  return 0
+}
+
 # --- critical section, serialized per host via flock -------------------------
 do_deploy() {
   event enter
@@ -291,6 +429,12 @@ do_deploy() {
 
   local prev_good="" compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
+
+  if [ "$prev_good" = "$GIT_SHA" ]; then
+    log "this SHA already in last_good_tag; skip forward deploy; reconcile only"
+    event exit
+    return 0
+  fi
 
   deploy_tag "$GIT_SHA"
 
@@ -433,6 +577,13 @@ fi
 flock 9
 do_deploy
 rc=$?
+if [ "$rc" -eq 0 ]; then
+  log "image reconcile starting (host lock still held)"
+  if ! reconcile_deployed_image; then
+    echo "::error::image reconcile assertion failed; deployment may have succeeded, but production image identity is not proven" >&2
+    rc=5
+  fi
+fi
 flock -u 9
 # fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于
 # fd 9 释放,才能保证 admission 在 compose up + 探针 + 回滚全程都是关闭的。
