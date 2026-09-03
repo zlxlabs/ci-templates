@@ -1,6 +1,7 @@
 # AGENTS.md — ci-templates
 
 给在本仓工作的 AI agent 的项目级约定。人类读 `README.md`（仓库结构、契约、发布流程都在那里，本文不重复）。
+仓专属事实见 `docs/project-memory.md`。
 
 ## 与 gate-hub 的关系
 
