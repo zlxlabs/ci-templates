@@ -4,6 +4,7 @@
 - **Dispatch-Id**：`dlg-20260903-224844-eec6c4`
 - **分支**：`card/ci-templates-20260904-01`
 - **Base commit**：`13a8a559655181ee83d05f34a1c6c012823ef943`
+- **导入 commit**：`bdcebb23a30f4793892d7cdfe276853a74b1b896`
 - **执行器 / 模型**：cursor / cursor-grok-4.6-high
 - **角色**：implementer（本会话即执行器；全局 AGENTS.md「模型编排」段主代理委派纪律不适用于本卡）
 
