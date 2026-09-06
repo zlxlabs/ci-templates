@@ -20,7 +20,7 @@ def test_release_workflow_contract_and_declared_secrets():
     required_secrets = {
         "ACR_USERNAME", "ACR_PASSWORD", "SSH_DEPLOY_KEY", "KNOWN_HOSTS", "TS_AUTHKEY", "CI_TEMPLATES_PAT"
     }
-    # 过渡期可选(#46):webhook 正从 vars 迁到 secrets,详见 test_workflow_contract.py
+    # 长期可选(#46):webhook 存 secrets 不存 vars;不设必需的理由见 test_workflow_contract.py
     optional_secrets = {"FEISHU_CI_WEBHOOK"}
     assert set(call["secrets"]) == required_secrets | optional_secrets
     for name, spec in call["secrets"].items():
@@ -114,7 +114,10 @@ def test_release_transfer_paths_are_run_unique_and_failure_notify_is_fail_open()
     assert "rm -f" in text
     assert "if: failure()" in text
     assert "continue-on-error: true" in text
-    assert "vars.FEISHU_CI_WEBHOOK" in text
+    # #46 起 webhook 只读 secrets:vars 不被 Actions 打码,会把完整 URL 写进每次部署日志。
+    # TITLE_PREFIX 不是凭据,继续留在 vars。
+    assert "secrets.FEISHU_CI_WEBHOOK" in text
+    assert "vars.FEISHU_CI_WEBHOOK" not in text
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "transport_nonce" in text
     assert "${transport_attempt}" in text

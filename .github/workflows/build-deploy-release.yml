@@ -92,10 +92,11 @@ on:
         required: true
       CI_TEMPLATES_PAT:
         required: true
-      # 2026-09-06 迁移中(#46)：webhook 从 vars 改存 secrets。vars 不被 Actions 打码，
-      # 每个仓每次部署的日志里都会出现一份完整可用的 webhook URL。
-      # required: false 是过渡期设置——等全部 caller 传上后改成 required: true，
-      # 并拆掉下面取值处的 `|| vars.FEISHU_CI_WEBHOOK` 回退。
+      # 飞书告警 webhook。2026-09-06(#46) 从 repo variable 迁到 secret：
+      # vars 不被 Actions 打码,当时每个仓每次部署的日志里都躺着一份完整可用的 webhook URL。
+      # required: false 是**长期**设置,不是过渡期——shoplazza-capabilities 合法地没有 webhook,
+      # 改成 required: true 会让那个仓的部署卡在 workflow 校验上。取不到值时通知层
+      # 打印 `skip notify` 并跳过,不影响部署结论。
       FEISHU_CI_WEBHOOK:
         required: false
 
@@ -403,7 +404,7 @@ jobs:
         if: failure() && steps.deploy.outputs.busy_deferred == 'true'
         continue-on-error: true
         env:
-          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
         run: |
           set -u -o pipefail
@@ -442,7 +443,7 @@ jobs:
         if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
         continue-on-error: true
         env:
-          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC: ${{ github.event.repository.name }}
           HOST: ${{ inputs.host }}
@@ -502,7 +503,7 @@ jobs:
         if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
         continue-on-error: true
         env:
-          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_CI_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC: ${{ github.event.repository.name }}
           HOST: ${{ inputs.host }}
