@@ -17,9 +17,10 @@ REQUIRED_SECRETS = {
     "TS_AUTHKEY",          # runner 入 Tailscale 连内网目标机
     "CI_TEMPLATES_PAT",    # 只读 PAT,checkout private ci-templates 的部署脚本
 }
-# 过渡期可选(#46):webhook 正从 vars 迁到 secrets。vars 不被 Actions 打码,
-# 每次部署都把完整 URL 写进日志。等 13 个 caller 全部传上后改成必需,
-# 并拆掉模板里的 `|| vars.FEISHU_CI_WEBHOOK` 回退。
+# 长期可选(#46,不是过渡期):webhook 2026-09-06 从 vars 迁到 secrets——vars 不被 Actions
+# 打码,当时每次部署都把完整 URL 写进日志。之所以不设成必需:shoplazza-capabilities
+# 合法地没有 webhook,它的 caller 传的表达式求值为空串,必需会让那个仓卡在 workflow 校验上。
+# 取不到值时通知层打印 `skip notify` 跳过,不影响部署结论。
 OPTIONAL_SECRETS = {"FEISHU_CI_WEBHOOK"}
 EXPECTED_SECRETS = REQUIRED_SECRETS | OPTIONAL_SECRETS
 
@@ -100,7 +101,7 @@ def test_secrets_declared_explicitly_not_inherited():
         want = name not in OPTIONAL_SECRETS
         assert spec.get("required") is want, (
             f"{name} required must be {want} "
-            f"(必需组不得被标成可选;过渡期可选组见 OPTIONAL_SECRETS 注释)"
+            f"(必需组不得被标成可选;可选组的理由见 OPTIONAL_SECRETS 上方注释)"
         )
 
 

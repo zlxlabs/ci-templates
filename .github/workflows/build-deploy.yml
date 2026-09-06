@@ -117,10 +117,11 @@ on:
         required: true
       CI_TEMPLATES_PAT:
         required: true
-      # 2026-09-06 迁移中(#46)：webhook 从 vars 改存 secrets。vars 不被 Actions 打码，
-      # 每个仓每次部署的日志里都会出现一份完整可用的 webhook URL。
-      # required: false 是过渡期设置——等全部 caller 传上后改成 required: true，
-      # 并拆掉下面取值处的 `|| vars.FEISHU_CI_WEBHOOK` 回退。
+      # 飞书告警 webhook。2026-09-06(#46) 从 repo variable 迁到 secret：
+      # vars 不被 Actions 打码,当时每个仓每次部署的日志里都躺着一份完整可用的 webhook URL。
+      # required: false 是**长期**设置,不是过渡期——shoplazza-capabilities 合法地没有 webhook,
+      # 改成 required: true 会让那个仓的部署卡在 workflow 校验上。取不到值时通知层
+      # 打印 `skip notify` 并跳过,不影响部署结论。
       FEISHU_CI_WEBHOOK:
         required: false
 
@@ -409,13 +410,13 @@ jobs:
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
       # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
       # fail-open(if:failure + continue-on-error + 吞异常):通知挂了绝不影响部署/回滚结论。
-      # 凭据 = 调用方传入的 secrets.FEISHU_CI_WEBHOOK；过渡期回退到 vars.FEISHU_CI_WEBHOOK;
+      # 凭据 = 调用方传入的 secrets.FEISHU_CI_WEBHOOK(#46 起不再读 vars,vars 不打码会进日志);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
         if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
@@ -483,7 +484,7 @@ jobs:
         if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
@@ -540,7 +541,7 @@ jobs:
         if: failure() && steps.deploy.outputs.deferred == 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK || vars.FEISHU_CI_WEBHOOK }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
           FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
