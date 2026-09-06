@@ -409,7 +409,9 @@ jobs:
       # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
       # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
-      # fail-open(if:failure + continue-on-error + warning):通知挂了绝不影响部署/回滚结论。
+      # fail-open 靠三层:if:failure + continue-on-error + 通知失败只打 warning 且仍 exit 0。
+      # 第三层 2026-09-06(#46) 从「吞异常」改成「打 warning」:两者都不改变部署结论,
+      # 区别是前者在界面上完全看不见——发成功和发失败长得一模一样。
       # 凭据 = 调用方传入的 secrets.FEISHU_CI_WEBHOOK(#46 起不再读 vars,vars 不打码会进日志);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
