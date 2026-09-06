@@ -117,7 +117,7 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 | 故意失败被识别 | run `34009339238`，`probe-attempts: 200(curl=0)×5` —— 探到 200 但期望 599，判死 |
 | 自动回滚到 `last_good` | 同 run，`rollback health probe FAILED for 2a037286ce9b`；`2a037286` 正是上一次成功部署（run 33982274468）的 commit |
 | 飞书红卡送达 | 同 run，卡片标题 `P0 回滚健康未证`，接口返回 `StatusCode:0 / success` |
-| 还原后恢复正常 | commit `a3d89302` 撤回注入，重新部署 |
+| 还原后恢复正常 | commit `a3d89302` 撤回注入，deploy run `34010017141` success，生产 http=200 |
 
 演练顺带发现的问题另开单：ci-templates#46（飞书 webhook 存成 `vars` 而非 `secrets`，
 每次部署都把完整 URL 明文打进 Actions 日志）。
