@@ -10,17 +10,22 @@ def load():
     return raw, raw.get("on", raw.get(True))
 
 
-def test_release_workflow_contract_and_six_secrets():
+def test_release_workflow_contract_and_declared_secrets():
     raw, trigger = load()
     assert "workflow_call" in trigger
     call = trigger["workflow_call"]
     assert call["inputs"]["images_json"]["required"] is True
     assert call["inputs"]["probes_json"]["required"] is True
     assert call["inputs"]["host"]["required"] is True
-    assert set(call["secrets"]) == {
+    required_secrets = {
         "ACR_USERNAME", "ACR_PASSWORD", "SSH_DEPLOY_KEY", "KNOWN_HOSTS", "TS_AUTHKEY", "CI_TEMPLATES_PAT"
     }
-    assert all(spec.get("required") is True for spec in call["secrets"].values())
+    # 过渡期可选(#46):webhook 正从 vars 迁到 secrets,详见 test_workflow_contract.py
+    optional_secrets = {"FEISHU_CI_WEBHOOK"}
+    assert set(call["secrets"]) == required_secrets | optional_secrets
+    for name, spec in call["secrets"].items():
+        want = name not in optional_secrets
+        assert spec.get("required") is want, f"{name} required must be {want}"
     assert raw["permissions"] == {"contents": "read"}
     assert raw["concurrency"]["cancel-in-progress"] is False
     assert "inputs.host" in str(raw["concurrency"]["group"])
@@ -90,7 +95,7 @@ def test_ci_templates_checkout_does_not_pass_dead_pat_token():
     # A public repo checkout needs no token at all; the default github.token
     # is enough. CI_TEMPLATES_PAT stays declared in the workflow_call secrets
     # contract (the whole fleet's callers still pass it explicitly, see
-    # test_release_workflow_contract_and_six_secrets) -- only this step stops
+    # test_release_workflow_contract_and_declared_secrets) -- only this step stops
     # consuming it. Dropping it from the contract is a v2 decision (see
     # docs/BACKLOG.md).
     text = WORKFLOW.read_text()

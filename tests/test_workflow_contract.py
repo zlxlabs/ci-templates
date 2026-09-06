@@ -12,11 +12,16 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "build-deploy.yml"
 SCRIPT = REPO_ROOT / "scripts" / "pull_and_deploy.sh"
 
-EXPECTED_SECRETS = {
+REQUIRED_SECRETS = {
     "ACR_USERNAME", "ACR_PASSWORD", "SSH_DEPLOY_KEY", "KNOWN_HOSTS",
     "TS_AUTHKEY",          # runner 入 Tailscale 连内网目标机
     "CI_TEMPLATES_PAT",    # 只读 PAT,checkout private ci-templates 的部署脚本
 }
+# 过渡期可选(#46):webhook 正从 vars 迁到 secrets。vars 不被 Actions 打码,
+# 每次部署都把完整 URL 写进日志。等 13 个 caller 全部传上后改成必需,
+# 并拆掉模板里的 `|| vars.FEISHU_CI_WEBHOOK` 回退。
+OPTIONAL_SECRETS = {"FEISHU_CI_WEBHOOK"}
+EXPECTED_SECRETS = REQUIRED_SECRETS | OPTIONAL_SECRETS
 
 PINNED_ACTIONS = {
     "actions/checkout": "34e114876b0b11c390a56381ad16ebd13914f8d5",
@@ -91,7 +96,12 @@ def test_secrets_declared_explicitly_not_inherited():
         f"workflow must declare exactly {EXPECTED_SECRETS}, got {set(secrets.keys())}"
     )
     for name, spec in secrets.items():
-        assert spec and spec.get("required") is True, f"{name} must be required"
+        assert spec, f"{name} must have a spec"
+        want = name not in OPTIONAL_SECRETS
+        assert spec.get("required") is want, (
+            f"{name} required must be {want} "
+            f"(必需组不得被标成可选;过渡期可选组见 OPTIONAL_SECRETS 注释)"
+        )
 
 
 def test_ssh_has_keepalive_and_retry():
