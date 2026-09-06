@@ -54,6 +54,16 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 **验证点**：两次推送（正常 / 探针故意失败）在 Actions 里都能看到期望结果；故意
 失败那次，飞书红卡到达，主机上跑的容器版本没有变成故障版本。
 
+> **这个注入方法的两个坑，读之前先知道**（2026-09-06 实跑得出）：
+>
+> 1. **`healthcheck_expect_status: 599` 会同时污染回滚自己的健康探针。** 回滚把
+>    `last_good` 镜像放回去之后，它用同一个 input 去探，探到 200 仍判不健康。所以
+>    这次演练**必然**停在 `rc=4 / rollback health was not proven`，job 红。这是本方法
+>    的预期终点，不是「回滚坏了」。要判回滚有没有真发生，看日志里
+>    `rollback health probe FAILED for <tag>` 里的那个 tag 是不是 `last_good`。
+> 2. **「服务返 200」不能当回滚成功的证据。** 注入的是错误的期望值，服务从头到尾
+>    是健康的——不管回没回滚都返 200。用它当判据等于用一个恒真的东西下结论。
+
 **回滚点**：只动了 canary 一个服务仓的一个 input 值，改回原值即可；全程未触及
 `v1` tag，舰队其余 49+ 服务不受影响。
 
@@ -81,14 +91,36 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 **恢复原设计的前提**（三条都满足才动 `v1`）：
 
 1. canary 仓构建修好（url-parse-api#28 合并且自建 runner 上真实构建绿）。
-2. 阶段 1 的失败注入在 canary 上跑通，拿到自动回滚 + 飞书红卡的实证。
+2. ~~阶段 1 的失败注入在 canary 上跑通，拿到自动回滚 + 飞书红卡的实证。~~
+   **2026-09-06 已满足**，见下方「阶段 1 执行记录」。
 3. 决定是「把 `v1` 移到 main 并让 caller 退回 `@v1`」还是「保留 v2 方案并改写阶段 2」。
 
 **当前钉法**（2026-09-06 逐仓核实远端字节）：
 
 - `zlxlabs/url-parse-api` —— `@main`，常驻 canary，不参与版本 tag。
-- 其余 9 个已迁移仓 —— `@v2`。
-- 尚未迁移的仓 —— 仍是 `@v1`，行为与 2026-08-14 一致。
+- `@v2`（9 个）—— AI_Information_processor、HealthExporter、WechatArticleCommentScrape、
+  WechatChatRoomSummary、imflow、obsidian-clip-api、url2gdocs、web_transcibe_translate、
+  youtube_download_api。
+- `@v1`（2 个）—— **one_translate_tts、shoplazza-capabilities**。
+- 裸 commit `597641a2`（2026-07-27，比 `v1` 还老 68 个 commit）—— **live-recorder**。
+
+隔离带必须写出成员名单才有意义。此前本节只写「尚未迁移的仓」，读的人得到的印象是
+「大家都在 v2」——ci-templates#45 就是这么产生的。
+
+## 阶段 1 执行记录（2026-09-06）
+
+四项判据全部命中，canary 为 `zlxlabs/url-parse-api`：
+
+| 判据 | 证据 |
+|---|---|
+| 正常部署全绿 | run `33982274468`（09-05，url-parse-api#28 修完构建后的首次真实构建） |
+| 故意失败被识别 | run `34009339238`，`probe-attempts: 200(curl=0)×5` —— 探到 200 但期望 599，判死 |
+| 自动回滚到 `last_good` | 同 run，`rollback health probe FAILED for 2a037286ce9b`；`2a037286` 正是上一次成功部署（run 33982274468）的 commit |
+| 飞书红卡送达 | 同 run，卡片标题 `P0 回滚健康未证`，接口返回 `StatusCode:0 / success` |
+| 还原后恢复正常 | commit `a3d89302` 撤回注入，deploy run `34010017141` success，生产 http=200 |
+
+演练顺带发现的问题另开单：ci-templates#46（飞书 webhook 存成 `vars` 而非 `secrets`，
+每次部署都把完整 URL 明文打进 Actions 日志）。
 
 ---
 
