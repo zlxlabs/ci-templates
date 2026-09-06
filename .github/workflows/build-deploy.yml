@@ -121,7 +121,7 @@ on:
       # vars 不被 Actions 打码,当时每个仓每次部署的日志里都躺着一份完整可用的 webhook URL。
       # required: false 是**长期**设置,不是过渡期——shoplazza-capabilities 合法地没有 webhook,
       # 改成 required: true 会让那个仓的部署卡在 workflow 校验上。取不到值时通知层
-      # 打印 `skip notify` 并跳过,不影响部署结论。
+      # 打 warning 并跳过,不影响部署结论。
       FEISHU_CI_WEBHOOK:
         required: false
 
@@ -409,7 +409,9 @@ jobs:
       # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
       # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
-      # fail-open(if:failure + continue-on-error + 吞异常):通知挂了绝不影响部署/回滚结论。
+      # fail-open 靠三层:if:failure + continue-on-error + 通知失败只打 warning 且仍 exit 0。
+      # 第三层 2026-09-06(#46) 从「吞异常」改成「打 warning」:两者都不改变部署结论,
+      # 区别是前者在界面上完全看不见——发成功和发失败长得一模一样。
       # 凭据 = 调用方传入的 secrets.FEISHU_CI_WEBHOOK(#46 起不再读 vars,vars 不打码会进日志);
       # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
       - name: Feishu 部署失败卡 (P0, fail-open)
@@ -424,11 +426,15 @@ jobs:
           SHA:     ${{ steps.sha.outputs.git_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
-          if not hook:
-              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          set -u -o pipefail
+          webhook="${FEISHU_WEBHOOK:-}"
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu 部署失败卡 not sent: FEISHU_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          import json, os
           title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
@@ -469,14 +475,28 @@ jobs:
                   ],
               },
           }
-          req = urllib.request.Request(
-              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
-          except Exception as e:
-              print("feishu notify failed (swallowed):", e)
+          print(json.dumps(card))
           PY
+          )"; then
+            echo "::warning::Feishu 部署失败卡 request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 - "Feishu 部署失败卡" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu 部署失败卡 response parser failed"
+          fi
 
       # rollback_unhealthy=true(rc=4):新版本不健康,且主机未能证明生产停在健康版本。
       # 这是独立的紧急卡,不能与 rc=1 的普通红卡共用「不需要紧急上机」文案。
@@ -492,11 +512,15 @@ jobs:
           SHA:     ${{ steps.sha.outputs.git_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
-          if not hook:
-              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          set -u -o pipefail
+          webhook="${FEISHU_WEBHOOK:-}"
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu 回滚健康未证紧急卡 not sent: FEISHU_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          import json, os
           title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
@@ -525,14 +549,28 @@ jobs:
                   ],
               },
           }
-          req = urllib.request.Request(
-              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
-          except Exception as e:
-              print("feishu notify failed (swallowed):", e)
+          print(json.dumps(card))
           PY
+          )"; then
+            echo "::warning::Feishu 回滚健康未证紧急卡 request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 - "Feishu 回滚健康未证紧急卡" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu 回滚健康未证紧急卡 response parser failed"
+          fi
 
       # deferred(rc=3):busy-lock 门禁(opt-in)超时未等到,服务忙,不是故障。
       # job 仍标红(诚实反映"新 SHA 未上线"),但通知分流成黄卡:不 @全员,
@@ -549,11 +587,15 @@ jobs:
           SHA:     ${{ steps.sha.outputs.git_sha }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
-          python3 - <<'PY'
-          import json, os, urllib.request
-          hook = os.environ.get("FEISHU_WEBHOOK", "").strip()
-          if not hook:
-              print("no FEISHU_CI_WEBHOOK var set — skip notify"); raise SystemExit(0)
+          set -u -o pipefail
+          webhook="${FEISHU_WEBHOOK:-}"
+          if [[ -z "$webhook" ]]; then
+            echo "::warning::Feishu 部署延期卡 not sent: FEISHU_WEBHOOK is not configured"
+            exit 0
+          fi
+          response=""
+          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          import json, os
           title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
@@ -581,11 +623,25 @@ jobs:
                   ],
               },
           }
-          req = urllib.request.Request(
-              hook, data=json.dumps(card).encode(), headers={"Content-Type": "application/json"})
-          try:
-              with urllib.request.urlopen(req, timeout=10) as r:
-                  print("feishu resp:", r.status, r.read(300).decode("utf-8", "replace"))
-          except Exception as e:
-              print("feishu notify failed (swallowed):", e)
+          print(json.dumps(card))
           PY
+          )"; then
+            echo "::warning::Feishu 部署延期卡 request failed or timed out: ${response:-no response}"
+            exit 0
+          fi
+          if ! python3 - "Feishu 部署延期卡" "$response" <<'PY'
+          import json, sys
+          label, raw = sys.argv[1:3]
+          try:
+              result = json.loads(raw)
+              code = result["code"]
+          except (ValueError, KeyError, TypeError) as exc:
+              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu 部署延期卡 response parser failed"
+          fi
