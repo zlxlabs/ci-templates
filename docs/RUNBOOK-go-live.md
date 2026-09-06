@@ -164,7 +164,7 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 这些仓从没被它检查过。one_translate_tts 的日志确认它真的执行并通过：
 `reconcile passed: 021bae8c0cf5 is the image ID used by latest and at least one running container`。
 
-### 这次**没有**验证到什么
+### 这次**没有**验证到什么（已于当日晚些时候补齐，见阶段 3）
 
 **「移动 tag 会让舰队被动升级」这个机制本身，本次无法验证。** 因为移动前后是纯文档差异、
 行为完全相同，没有任何可观测的差别能区分「用了新 `v2`」和「用了旧 `v2`」。
@@ -172,8 +172,85 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 本次只证明了三件事：`v2` 指针确实移动了（`git ls-remote` 核实）、三个掉队仓改钉后能在
 `v2` 上正常部署、`v2` 特有的对账判据真的执行并通过。
 
-传播机制要等**下一次真实的模板改动**才验得到。那一次请显式确认：某个没有改过 caller
-的仓，其部署日志里出现了只有新 `v2` 才有的行为。
+传播机制要等**下一次真实的模板改动**才验得到——那一次就是同日的 `decbf28f`，
+验证记录见下方「阶段 3」。**判据别再找「只有新版才有的行为」**：那个思路要求每次模板改动
+都恰好带一个日志可见的差异，多数改动没有。直接读 GitHub 给出的解析结果：
+
+```bash
+gh api repos/zlxlabs/<仓>/actions/runs/<runid> \
+  --jq '.referenced_workflows[] | "\(.ref) \(.sha)"'
+```
+
+它返回的是**消费方实际解析到的那个 commit**，跟模板改了什么无关，任何一次移动都能用。
+
+## 阶段 3 执行记录：webhook 迁 secrets + 首次验证 tag 传播（2026-09-06）
+
+对应 issue #46。做的事：飞书告警 webhook 从 repo variable 迁到 repo secret。
+起因是 GitHub Actions 不给 `vars` 打码，webhook URL 此前每次部署都完整出现在 job 日志里。
+
+### 三步与各自的证据
+
+| 步 | 内容 | 证据 |
+|---|---|---|
+| 1 | 模板声明 secret，取值加 `secrets.X \|\| vars.X` 过渡回退 | `db34a22e`，canary run 34012914681 success |
+| 2 | 13 个 caller 显式传 secret | 逐仓 `grep -F` 核实远端字节 13/13 |
+| 3 | 拆掉回退，只读 secret | PR #50 → `decbf28f`，canary run 34015600959 success |
+| 收尾 | 删 13 个仓的 repo variable | 逐仓复查 HTTP 404 |
+
+### 通知演练：证明 secret 这条路真能发出卡
+
+拆回退之前必须先证明保留的那条路可用，否则拆完就是静默失效——通知只在部署失败时发，
+平时无从察觉。做法：
+
+1. **先删掉 canary 仓的 repo variable**（`HTTP 404` 确认）。这是判据成立的前提：
+   留着回退的话，secret 传错也会静默落回 `vars` 照常发出，判据恒真。
+2. 注入 `healthcheck_expect_status: 599` 制造失败部署（阶段 1 同款配方），
+   run `34014332003` 停在 `deploy failed (rc=4); rollback health was not proven`。
+3. job 日志拿到
+   `feishu resp: 200 {"StatusCode":0,"StatusMessage":"success","code":0,"data":{},"msg":"success"}`。
+   变量已删，这张卡只可能走 secret 发出；飞书侧 `code:0` 排除了「HTTP 200 但业务失败」。
+4. 立即还原（`01ca6951`），部署 success，生产 `http=200`。
+
+**判据的一个坑**：Actions 会把 step 的脚本源码整段回显进日志，所以
+`grep -c 'skip notify'` 会同时数到源码行和执行输出。只有带实际值的那行
+（`feishu resp: 200 {...}`）才是结果。
+
+### 首次验证 tag 传播
+
+`v2` 从 `db34a22e` 移到 `decbf28f` 后，取 **imflow**（钉 `@v2`，**未改任何文件**）
+手动触发一次部署，读它实际解析到的模板 commit：
+
+```
+zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v2
+  ref=refs/tags/v2
+  sha=decbf28fea1d2b1a6400f884ba38a638b5fa6efc
+```
+
+等于新的 `v2` 目标。**至此推广模型的核心假设有了实证。**
+判据的区分力也验过：同一字段在 canary（钉 `@main`）上返回 `db34a22e`，是另一个值。
+
+### `required` 为什么保持 false
+
+原计划步骤 3 一并改成 `required: true`，撤销了。`shoplazza-capabilities` 合法地没有
+webhook（既无 variable 也无 secret，HTTP 404 确认），它的 caller 传的表达式求值为空串，
+改成必需会让那个仓每次部署卡在 workflow 校验上。迁移真正要达成的是「值不再存在 `vars` 里」，
+这由拆回退保证，跟 `required` 无关。
+
+### canary 补了 `workflow_dispatch`
+
+`url-parse-api` 此前只有 `push` 触发口，做演练时因此只能靠推 commit 才触发得了验证部署。
+补上手动口（commit `c453b6ba`），**不加 `paths-ignore`**——canary 的职责就是吃下每一次推送。
+
+### 遗留（写在这里免得忘）
+
+- **换 webhook 地址**：旧值已经躺在历史 CI 日志里，换存储方式不会让它失效。
+  上面三步只保护将来，不追回过去。这一步需要人去飞书后台操作。
+- **`shoplazza-capabilities` 零 Actions 变量**，即它的部署失败从来没有过任何飞书告警。
+  存量缺口，跟本次迁移无关，需要先定它该报到哪个群。
+- **两个模板对「取不到 webhook」处理不一致**：`build-deploy-release.yml` 打
+  `::warning::` 在界面可见；`build-deploy.yml` 只是普通 `print`，还有一条
+  `print("feishu notify failed (swallowed):", e)` 把发送失败也静默吞了。
+  与「告警发送路径 fail-loud」冲突。
 
 ## 阶段 1 执行记录（2026-09-06）
 
