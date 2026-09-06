@@ -93,19 +93,87 @@ caller 的触发条件与 `paths-ignore` 取舍见 [README「触发条件与 `pa
 1. canary 仓构建修好（url-parse-api#28 合并且自建 runner 上真实构建绿）。
 2. ~~阶段 1 的失败注入在 canary 上跑通，拿到自动回滚 + 飞书红卡的实证。~~
    **2026-09-06 已满足**，见下方「阶段 1 执行记录」。
-3. 决定是「把 `v1` 移到 main 并让 caller 退回 `@v1`」还是「保留 v2 方案并改写阶段 2」。
+3. ~~决定是「把 `v1` 移到 main 并让 caller 退回 `@v1`」还是「保留 v2 方案并改写阶段 2」。~~
+   **2026-09-06 已拍板：两个都不选，改成「移动 `v2`」。** 见下方「版本推广模型（2026-09-06 定稿）」。
 
 **当前钉法**（2026-09-06 逐仓核实远端字节）：
 
 - `zlxlabs/url-parse-api` —— `@main`，常驻 canary，不参与版本 tag。
-- `@v2`（9 个）—— AI_Information_processor、HealthExporter、WechatArticleCommentScrape、
-  WechatChatRoomSummary、imflow、obsidian-clip-api、url2gdocs、web_transcibe_translate、
-  youtube_download_api。
-- `@v1`（2 个）—— **one_translate_tts、shoplazza-capabilities**。
-- 裸 commit `597641a2`（2026-07-27，比 `v1` 还老 68 个 commit）—— **live-recorder**。
+- **其余 12 个仓 —— 全部 `@v2`。** 2026-09-06 起 `@v2` 是会动的 tag，见下节。
+- `@v1` —— **已无使用者**，冻结在 `83b231b`（2026-08-14），仅作历史锚点保留。
+
+2026-09-06 之前有 3 个仓掉队（`one_translate_tts`、`shoplazza-capabilities` 停在 `@v1`，
+`live-recorder` 钉着 `597641a2`，比 `v1` 还老 68 个 commit），当天已全部收敛到 `@v2`。
 
 隔离带必须写出成员名单才有意义。此前本节只写「尚未迁移的仓」，读的人得到的印象是
 「大家都在 v2」——ci-templates#45 就是这么产生的。
+
+## 版本推广模型（2026-09-06 定稿）
+
+**`@v2` 是会动的 tag。推广 = 移动它，不是逐仓改 caller 文件。**
+
+### 为什么
+
+掉队不是「漏推广」造成的，是**「各仓钉的不是同一个会动的东西」**造成的。只要推广方式
+是逐仓改文件，就总会有仓被漏掉，而且漏掉没有任何信号——ci-templates#45 就是这么产生的，
+发现时最老的一个已经落后 5 周半。所有仓钉同一个会动的 tag，掉队从机制上不成立。
+
+### 节奏（这一步不能省）
+
+```
+改动合并到 main
+  → canary（url-parse-api，钉 @main）先吃到并真实部署
+  → 确认它绿
+  → git tag -f v2 <main sha> && git push -f origin v2      ← 显式推广动作
+```
+
+**被动升级 ≠ 自动升级。** 移动 tag 是一个人为的推广动作，只是成本从「改 N 个仓的文件」
+降到一条命令。canary 的全部价值来自「主干落地」与「移动 tag」之间那段观察时间——
+合并完立刻移动 tag，等于 canary 不存在。
+
+### 回滚
+
+移动 tag 可逆：`git tag -f v2 <旧 sha> && git push -f origin v2`。移动前把旧 sha 记下来。
+
+### `v1` 的处置
+
+不动，不再使用。它冻结在 2026-08-14，作为「那之前的流水线行为」的历史锚点。
+不要再往它上面移动任何东西——两个会动的 tag 等于两套推广路径，掉队会重新出现。
+
+## 阶段 2 收敛记录（2026-09-06）
+
+`v2` 从 `c837cd60` 移到主干 `b05690a5`（回退点 `c837cd60dc900c6d0418d178f99be38e3d450d37`）。
+
+**选在这一刻移动是刻意的**：当时 `v2..main` 只有 2 个提交，且都只改
+`docs/RUNBOOK-go-live.md`，**部署行为零变化**。第一次建立「移动 tag」这个做法时，
+让它是个 no-op，是能拿到的最安全的起点。
+
+三个掉队仓收敛到 `@v2` 的实证（改钉提交因各仓已有 `paths-ignore` 而不触发部署，
+全部用 `workflow_dispatch` 手动验证）：
+
+| 仓 | 原 ref | 首次 v2 部署 | 结果 |
+|---|---|---|---|
+| one_translate_tts | `@v1`（2026-08-14） | run `34011091759` | success，生产 http=200 |
+| shoplazza-capabilities | `@v1`（2026-08-14） | run `34011827788` | success，生产 http=200，`reconcile passed: 698f9c9104d6` |
+| live-recorder | `597641a2`（2026-07-27） | run `34011829374` | success，生产 http=200，`reconcile passed: cc7a19d4ddd3`；部署期间连续探测 6 次全 200，无中断窗口 |
+
+起跳前做过输入项预检，三个仓对 `v2` 都兼容：无未知输入（会让 workflow 直接校验失败），
+无缺失必填项（`image_name` / `host` / `deploy_dir`）。
+
+`v1 → v2` 最值得盯的是 **rc=5「镜像身份未证明」**——`v2` 新增、`v1` 完全没有的失败态，
+这些仓从没被它检查过。one_translate_tts 的日志确认它真的执行并通过：
+`reconcile passed: 021bae8c0cf5 is the image ID used by latest and at least one running container`。
+
+### 这次**没有**验证到什么
+
+**「移动 tag 会让舰队被动升级」这个机制本身，本次无法验证。** 因为移动前后是纯文档差异、
+行为完全相同，没有任何可观测的差别能区分「用了新 `v2`」和「用了旧 `v2`」。
+
+本次只证明了三件事：`v2` 指针确实移动了（`git ls-remote` 核实）、三个掉队仓改钉后能在
+`v2` 上正常部署、`v2` 特有的对账判据真的执行并通过。
+
+传播机制要等**下一次真实的模板改动**才验得到。那一次请显式确认：某个没有改过 caller
+的仓，其部署日志里出现了只有新 `v2` 才有的行为。
 
 ## 阶段 1 执行记录（2026-09-06）
 
