@@ -5,7 +5,11 @@ NOT use `secrets: inherit`, so a compromised ci-templates can never reach
 unrelated org secrets. Also asserts the per-host concurrency group (A3).
 """
 import hashlib
+import json
+import os
 from pathlib import Path
+import subprocess
+import sys
 
 import yaml
 
@@ -211,6 +215,45 @@ def test_feishu_notifications_warn_on_each_delivery_failure_mode():
     text = WORKFLOW.read_text()
     assert "swallowed" not in text
     assert "skip notify" not in text
+
+
+def test_feishu_notification_producers_emit_json_payload_for_curl():
+    raw, _ = _load()
+    names = {
+        "Feishu 部署失败卡 (P0, fail-open)",
+        "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
+        "Feishu 部署延期卡 (deferred, fail-open)",
+    }
+    env = os.environ | {
+        "FEISHU_TITLE_PREFIX": "[contract]",
+        "SVC": "contract-service",
+        "HOST": "contract-host",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "0123456789ab",
+        "RUN_URL": "https://example.test/actions/runs/123",
+    }
+
+    for step in raw["jobs"]["build-deploy"]["steps"]:
+        if step.get("name") not in names:
+            continue
+        run = step["run"]
+        producer_start = run.index("\n", run.index("python3 - <<'PY'")) + 1
+        producer_end = run.index("\nPY", producer_start)
+        producer = run[producer_start:producer_end]
+        completed = subprocess.run(
+            [sys.executable, "-"],
+            input=producer,
+            text=True,
+            capture_output=True,
+            env=env,
+            check=False,
+        )
+        assert completed.returncode == 0, completed.stderr
+        payload = json.loads(completed.stdout)
+        assert payload["msg_type"] == "interactive"
+        content = payload["card"]["elements"][0]["text"]["content"]
+        assert "contract-service" in content
+        assert payload["card"]["elements"][1]["actions"][0]["url"] == env["RUN_URL"]
 
 
 # --- busy-lock gate: inputs 透传 + rc=3 deferred 分流 + 双卡通知 --------------
