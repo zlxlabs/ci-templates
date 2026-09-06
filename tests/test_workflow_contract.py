@@ -4,6 +4,7 @@ eng-review A4 (codex#5): the workflow must declare secrets EXPLICITLY and must
 NOT use `secrets: inherit`, so a compromised ci-templates can never reach
 unrelated org secrets. Also asserts the per-host concurrency group (A3).
 """
+import hashlib
 from pathlib import Path
 
 import yaml
@@ -137,6 +138,79 @@ def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "[zlxlabs·CI]" in text
     assert "f\"🔴 {title_prefix} P0 部署失败" in text
+
+
+def test_feishu_notifications_warn_on_each_delivery_failure_mode():
+    raw, _ = _load()
+    steps = {
+        step["name"]: step
+        for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("name")
+        in {
+            "Feishu 部署失败卡 (P0, fail-open)",
+            "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
+            "Feishu 部署延期卡 (deferred, fail-open)",
+        }
+    }
+    expected = {
+        "Feishu 部署失败卡 (P0, fail-open)": (
+            "Feishu 部署失败卡",
+            "failure() && steps.deploy.outputs.deferred != 'true' && "
+            "steps.deploy.outputs.rollback_unhealthy != 'true'",
+            "e27bf0a179d22114c8f5e150a130e6364f8dddd3fd21f4743ff57b6048dc2d40",
+        ),
+        "Feishu 回滚健康未证紧急卡 (P0, fail-open)": (
+            "Feishu 回滚健康未证紧急卡",
+            "failure() && steps.deploy.outputs.deferred != 'true' && "
+            "steps.deploy.outputs.rollback_unhealthy == 'true'",
+            "dc9c201a123fc6b7a4937ed2ef382ee27b67bfc9e0ff8464d9ba35375cfa30b0",
+        ),
+        "Feishu 部署延期卡 (deferred, fail-open)": (
+            "Feishu 部署延期卡",
+            "failure() && steps.deploy.outputs.deferred == 'true'",
+            "7892e7a0a4bfc79cc66d81f5c976aefcfe97dc2e0acfd3da7c47d53fe9b525a4",
+        ),
+    }
+    assert set(steps) == set(expected)
+
+    for step_name, (label, condition, body_digest) in expected.items():
+        step = steps[step_name]
+        run = step["run"]
+        assert step["if"] == condition
+        assert step["continue-on-error"] is True
+
+        # Each channel is independently visible in the Actions annotation UI:
+        # missing webhook, transport failure, response without code, and
+        # non-zero Feishu business code.
+        assert "set -u -o pipefail" in run
+        assert 'webhook="${FEISHU_WEBHOOK:-}"' in run
+        assert (
+            f'echo "::warning::{label} not sent: '
+            'FEISHU_WEBHOOK is not configured"'
+        ) in run
+        assert (
+            "if ! response=\"$(python3 - <<'PY' | curl -fsS "
+            '--max-time 10 -X POST -H \'Content-Type: application/json\' '
+            '--data-binary @- "$webhook" 2>&1'
+        ) in run
+        assert f'::warning::{label} request failed or timed out:' in run
+        assert f'python3 - "{label}" "$response" <<\'PY\'' in run
+        assert 'result["code"]' in run
+        assert (
+            f'::warning::{{label}} response parse failed:'
+        ) in run
+        assert 'if str(code) != "0":' in run
+        assert f'::warning::{{label}} business error: code=' in run
+        assert f'::warning::{label} response parser failed' in run
+
+        body_start = run.index("body = (")
+        body_end = run.index("card = {", body_start)
+        body = run[body_start:body_end]
+        assert hashlib.sha256(body.encode()).hexdigest() == body_digest
+
+    text = WORKFLOW.read_text()
+    assert "swallowed" not in text
+    assert "skip notify" not in text
 
 
 # --- busy-lock gate: inputs 透传 + rc=3 deferred 分流 + 双卡通知 --------------
