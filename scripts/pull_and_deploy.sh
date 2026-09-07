@@ -597,7 +597,6 @@ do_deploy() {
     if [ "$rollback_rc" -ne 0 ]; then
       log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
       DEPLOY_OUTCOME="rollback_unhealthy"
-      IMAGE_DIGEST="$prev_good_digest"
       event exit
       return 4
     fi

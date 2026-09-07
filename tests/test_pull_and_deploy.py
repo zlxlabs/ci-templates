@@ -143,7 +143,7 @@ if [ "$1" = "pull" ]; then
   count=$((count + 1)); echo "$count" > "$count_file"
   [ "$count" -ge 2 ] && exit 23
 fi
-if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 ]]; then
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 || "$3" == *@sha256:oldgood ]]; then
   exit 1
 fi
 exit 0
@@ -747,6 +747,35 @@ def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
     assert result.returncode == 4, result.stdout + result.stderr
     assert good.read_text().strip() == "old1111"
     assert "rollback to old1111 failed" in result.stdout
+
+
+def test_failed_rollback_receipt_does_not_claim_previous_image_identity(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env.update(GIT_SHA="new2222", PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    (state / "last_good_tag").write_text("old1111\n")
+    (state / "last_good_digest").write_text("sha256:oldgood\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log", [("500", 0), ("500", 0)]
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_rollback_pull_failure(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    receipt = json.loads((state / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_unhealthy"
+    assert receipt["image_digest"] == ""
+    assert receipt["image_id"] == ""
 
 
 def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
