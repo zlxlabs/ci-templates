@@ -307,8 +307,8 @@ def test_healthy_deploy_records_last_good_digest(tmp_path):
 
 @pytest.mark.parametrize(
     ("failing_call", "expected_rc"),
-    [("pull", 1), ("compose", 23)],
-    ids=["forward-pull-fails", "forward-compose-fails"],
+    [("pull", 1), ("tag", 7), ("compose", 23)],
+    ids=["forward-pull-fails", "forward-tag-fails", "forward-compose-fails"],
 )
 def test_forward_deploy_failure_writes_deploy_failed_receipt(tmp_path, failing_call, expected_rc):
     mock_dir = tmp_path / "bin"
@@ -328,6 +328,31 @@ def test_forward_deploy_failure_writes_deploy_failed_receipt(tmp_path, failing_c
     receipt = json.loads(receipt_file.read_text())
     assert receipt["outcome"] == "deploy_failed"
     assert result.stdout.count("[deploy][evidence] result-json:") == 1
+
+
+def test_missing_deploy_outcome_is_internal_error_and_skips_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), "pull"),
+    )
+    script = tmp_path / "pull_and_deploy.sh"
+    script_text = SCRIPT.read_text().replace(
+        '    DEPLOY_OUTCOME="deploy_failed"\n', '    DEPLOY_OUTCOME=""\n', 1
+    )
+    _write_exec(script, script_text)
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "::error::internal invariant violation" in result.stderr
+    assert "do_deploy returned without setting DEPLOY_OUTCOME" in result.stderr
 
 
 def test_deploys_immutable_git_sha_tag(tmp_path):
@@ -421,9 +446,11 @@ def test_probe_failure_without_previous_good_just_fails(tmp_path):
     mock_dir.mkdir()
     env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
     res = _run(env)
-    assert res.returncode != 0
+    assert res.returncode == 4
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert not good.exists(), "must not record a bad deploy as good"
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_unhealthy"
 
 
 # 单镜像 lane 退出状态轴表：首次探针 × prev_good × 回滚 compose × 回滚探针。
@@ -854,6 +881,7 @@ def test_result_replace_failure_keeps_previous_complete_receipt(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert result_file.read_text() == previous
     assert json.loads(result_file.read_text()) == {"complete": True}
+    assert "::error::failed to write deploy result" in result.stderr
     assert "failed to atomically replace deploy result file" in result.stderr
 
 
@@ -1090,6 +1118,7 @@ def test_busy_lock_held_defers_untouched(tmp_path):
         assert "tag " not in log, log
         good = Path(env["STATE_DIR"]) / "last_good_tag"
         assert not good.exists()
+        assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
         assert "DEFERRED" in res.stdout
     finally:
         holder.terminate()
@@ -1592,6 +1621,44 @@ def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
     log = docker_log_path.read_text() if docker_log_path.exists() else ""
     assert "compose up" not in log
     assert "BUSY_LOCK_TIMEOUT" in (res.stdout + res.stderr)
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+
+
+def test_busy_lock_flock_error_fails_without_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env.update(BUSY_LOCK_FILE=str(lock_file), PATH=f"{mock_dir}:{os.environ['PATH']}")
+    _write_exec(mock_dir / "flock", "#!/bin/bash\nexit 2\n")
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "flock on busy lock failed" in result.stdout
+
+
+def test_busy_lock_prepull_failure_fails_without_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(
+        BUSY_LOCK_FILE=str(tmp_path / "busy.lock"),
+        PULL_RETRIES="1",
+        PULL_RETRY_DELAY="0",
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), "pull"),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "compose up" not in Path(env["DOCKER_LOG"]).read_text()
 
 
 COMPOSE_ONESHOT_SERVICES = ("app", "migrate")

@@ -260,6 +260,10 @@ if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{
   printf '%s\\n' registry.example.com/ns/demo@sha256:image
   exit 0
 fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{{{.Id}}}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\\n' sha256:image
+  exit 0
+fi
 if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ] && [ "$#" -eq 5 ]; then
   printf '%s\\n' sha256:image
   exit 0
@@ -310,6 +314,7 @@ exit 97
     lines = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
     assert len(lines) == 1
     receipt = json.loads(lines[0][len(prefix):])
+    assert receipt["image_id"] == "sha256:image"
     outputs = {
         "image_digest": receipt["image_digest"],
         "probe_status": receipt["probe"]["status"],
