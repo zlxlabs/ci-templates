@@ -912,7 +912,7 @@ def test_result_replace_failure_keeps_previous_complete_receipt(tmp_path):
     assert result.returncode == 0, result.stdout + result.stderr
     assert result_file.read_text() == previous
     assert json.loads(result_file.read_text()) == {"complete": True}
-    assert "::error::failed to write deploy result" in result.stderr
+    assert "::error::failed to write deploy result" in result.stdout
     assert "failed to atomically replace deploy result file" in result.stderr
 
 

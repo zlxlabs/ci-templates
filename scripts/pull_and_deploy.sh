@@ -727,7 +727,7 @@ else
       rc=5
     fi
   fi
-  write_deploy_result "$DEPLOY_OUTCOME" || echo "::error::failed to write deploy result" >&2
+  write_deploy_result "$DEPLOY_OUTCOME" || echo "::error::failed to write deploy result"
 fi
 flock -u 9
 # fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于
