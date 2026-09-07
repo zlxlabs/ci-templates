@@ -725,10 +725,9 @@ if [ "$rc" -eq 0 ]; then
   fi
 fi
 if [ -z "$DEPLOY_OUTCOME" ]; then
-  [ "$rc" -eq 0 ] || DEPLOY_OUTCOME="deploy_failed"
-fi
-if [ -n "$DEPLOY_OUTCOME" ]; then
-  write_deploy_result "$DEPLOY_OUTCOME" || log "failed to write deploy result"
+  echo "::error::internal invariant violation: do_deploy returned without setting DEPLOY_OUTCOME (rc=${rc}); deploy result receipt will not be written" >&2
+else
+  write_deploy_result "$DEPLOY_OUTCOME" || echo "::error::failed to write deploy result" >&2
 fi
 flock -u 9
 # fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于
