@@ -524,7 +524,7 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good="" prev_good_digest="" rollback_ref=""
+  local prev_good="" prev_good_digest="" rollback_ref="" deploy_rc=0
   local compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
   [ -f "$GOOD_DIGEST_FILE" ] && prev_good_digest="$(cat "$GOOD_DIGEST_FILE")"
@@ -537,7 +537,12 @@ do_deploy() {
     return 0
   fi
 
-  deploy_tag "$GIT_SHA"
+  deploy_tag "$GIT_SHA" || deploy_rc=$?
+  if [ "$deploy_rc" -ne 0 ]; then
+    log "deploy of $GIT_SHA failed (rc=$deploy_rc)"
+    event exit
+    return "$deploy_rc"
+  fi
 
   if health_probe; then
     echo "$GIT_SHA" > "$GOOD_TAG_FILE"

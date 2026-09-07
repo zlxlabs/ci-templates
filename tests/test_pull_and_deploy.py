@@ -10,6 +10,7 @@ Contract (eng-review A3 / T4):
 docker / curl are mocked so no real daemon or network is touched. The script
 honours DOCKER_BIN / CURL_BIN overrides for exactly this reason.
 """
+import json
 import os
 import stat
 import subprocess
@@ -35,7 +36,7 @@ fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   printf '{container}\\n'; exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ "$*" == *"{{{{.Id}}}}"* ]]; then
   printf '{image_id}\\n'; exit 0
 fi
 if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
@@ -475,6 +476,88 @@ def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
     assert result.returncode == 1, result.stdout + result.stderr
     assert "[deploy][evidence] probe-attempts: 000(curl=28),503(curl=0)" in result.stdout
     assert "old version passed the same-budget health probe" in result.stdout
+
+
+def _mock_docker_reconcile_mismatch_with_digest(log_path: Path) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$*" == *"{{index .RepoDigests 0}}"* ]]; then
+  printf '%s\\n' 'registry.example.com/ns/demo@sha256:gooddigest'
+  exit 0
+fi
+if [ "$1" = "inspect" ]; then
+  printf '%s\\n' 'sha256:OTHER'
+  exit 0
+fi
+{_reconcile_ok_bash()}
+exit 0
+"""
+
+
+RESULT_KEYS = {
+    "schema_version", "deploy_id", "git_sha", "tag", "image_id",
+    "image_digest", "outcome", "probe", "finished_at",
+}
+PROBE_KEYS = {"status", "final_code", "attempts", "elapsed_s"}
+
+
+@pytest.mark.parametrize(
+    ("name", "status_sequence", "prev_good", "prev_digest", "expected_rc", "expected_outcome", "mismatch"),
+    [
+        ("deployed", [("200", 0)], None, None, 0, "deployed", False),
+        ("rolled-back", [("500", 0), ("500", 0), ("200", 0)], "old1111", "sha256:oldgood", 1, "rolled_back", False),
+        ("rollback-unhealthy", [("500", 0)] * 4, "old1111", "sha256:oldgood", 4, "rollback_unhealthy", False),
+        ("reconcile-failed", [("200", 0)], None, None, 5, "reconcile_failed", True),
+        ("skipped-already-deployed", [], "abc1234", "sha256:already", 0, "skipped_already_deployed", False),
+    ],
+    ids=["deployed", "rolled-back", "rollback-unhealthy", "reconcile-failed", "skipped-already-deployed"],
+)
+def test_deploy_result_is_valid_and_emitted_once_for_each_outcome(
+    tmp_path, name, status_sequence, prev_good, prev_digest,
+    expected_rc, expected_outcome, mismatch,
+):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    if prev_good is not None:
+        (state / "last_good_tag").write_text(prev_good + "\n")
+    if prev_digest is not None:
+        (state / "last_good_digest").write_text(prev_digest + "\n")
+
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(tmp_path / "curl-attempts.log", status_sequence),
+    )
+    docker_body = (
+        _mock_docker_reconcile_mismatch_with_digest(Path(env["DOCKER_LOG"]))
+        if mismatch
+        else _mock_docker_with_digest(Path(env["DOCKER_LOG"]), "sha256:gooddigest")
+    )
+    _write_exec(mock_dir / "docker", docker_body)
+
+    result = _run(env)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
+    result_file = state / "last_deploy_result.json"
+    assert result_file.exists()
+    payload = json.loads(result_file.read_text())
+    assert set(payload) == RESULT_KEYS
+    assert payload["schema_version"] == 1
+    assert payload["git_sha"] == env["GIT_SHA"]
+    assert payload["tag"] == env["GIT_SHA"]
+    assert payload["outcome"] == expected_outcome
+    assert set(payload["probe"]) == PROBE_KEYS
+    assert isinstance(payload["probe"]["attempts"], int)
+    assert isinstance(payload["probe"]["elapsed_s"], int)
+    assert result.stdout.count("[deploy][evidence] result-json:") == 1
+
+    if name == "deployed":
+        assert payload["image_digest"] == "sha256:gooddigest"
+        assert (state / "last_good_digest").read_text().strip() == payload["image_digest"]
+    if name == "rolled-back":
+        assert payload["image_digest"] == prev_digest
 
 
 def test_http_200_with_curl_timeout_is_unhealthy_and_rolls_back(tmp_path):
