@@ -778,6 +778,26 @@ def test_failed_rollback_receipt_does_not_claim_previous_image_identity(tmp_path
     assert receipt["image_id"] == ""
 
 
+def test_result_replace_failure_keeps_previous_complete_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    result_file = state / "last_deploy_result.json"
+    previous = '{"complete":true}\n'
+    result_file.write_text(previous)
+    _write_exec(mock_dir / "mv", "#!/bin/bash\nexit 1\n")
+    env["PATH"] = f"{mock_dir}:{os.environ['PATH']}"
+
+    result = _run(env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result_file.read_text() == previous
+    assert json.loads(result_file.read_text()) == {"complete": True}
+    assert "failed to atomically replace deploy result file" in result.stderr
+
+
 def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()

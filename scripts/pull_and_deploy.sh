@@ -123,7 +123,7 @@ json_quote() {
 }
 
 write_deploy_result() {
-  local outcome="$1" finished_at result
+  local outcome="$1" finished_at result result_tmp
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
   printf -v result '{"schema_version":1,"deploy_id":%s,"git_sha":%s,"tag":%s,"image_id":%s,"image_digest":%s,"outcome":%s,"probe":{"status":%s,"final_code":%s,"attempts":%d,"elapsed_s":%d},"finished_at":%s}' \
     "$(json_quote "$DEPLOY_ID")" \
@@ -137,7 +137,20 @@ write_deploy_result() {
     "$PROBE_ATTEMPTS" \
     "$PROBE_ELAPSED_S" \
     "$(json_quote "$finished_at")"
-  printf '%s\n' "$result" > "$RESULT_FILE"
+  if ! result_tmp="$(mktemp "${RESULT_FILE}.tmp.XXXXXX")"; then
+    echo "::warning::failed to create temporary deploy result file" >&2
+    return 1
+  fi
+  if ! printf '%s\n' "$result" > "$result_tmp"; then
+    rm -f -- "$result_tmp" || true
+    echo "::warning::failed to write temporary deploy result file" >&2
+    return 1
+  fi
+  if ! mv -f -- "$result_tmp" "$RESULT_FILE"; then
+    rm -f -- "$result_tmp" || true
+    echo "::warning::failed to atomically replace deploy result file" >&2
+    return 1
+  fi
   echo "[deploy][evidence] result-json: ${result}"
 }
 
