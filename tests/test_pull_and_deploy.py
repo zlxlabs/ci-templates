@@ -10,6 +10,7 @@ Contract (eng-review A3 / T4):
 docker / curl are mocked so no real daemon or network is touched. The script
 honours DOCKER_BIN / CURL_BIN overrides for exactly this reason.
 """
+import json
 import os
 import stat
 import subprocess
@@ -35,7 +36,10 @@ fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   printf '{container}\\n'; exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = "--format" ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [[ "$*" == *"{{{{.Id}}}}"* ]]; then
   printf '{image_id}\\n'; exit 0
 fi
 if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
@@ -53,10 +57,30 @@ def _mock_docker(log_path: Path, compose_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
-if [ "$1" = "compose" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   sleep {compose_sleep}
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+
+
+def _mock_docker_with_digest(log_path: Path, digest: str) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$*" == *"{{index .RepoDigests 0}}"* ]]; then
+  printf '%s\\n' "registry.example.com/ns/demo@{digest}"
+  exit 0
+fi
+{_reconcile_ok_bash()}
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -97,11 +121,21 @@ def _mock_docker_matrix(log_path: Path, fail_compose_on: int | None = None) -> s
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
 if [ "$1" = "compose" ]; then
+  if [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then exit 0; fi
+  if [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then exit 0; fi
+  if [ "$2" != "up" ] || [ "$3" != "-d" ] || [ "$#" -ne 3 ]; then
+    echo "unexpected-docker: $*" >&2
+    exit 97
+  fi
   count_file="{log_path}.compose-count"
   count=$(cat "$count_file" 2>/dev/null || echo 0)
   count=$((count + 1)); echo "$count" > "$count_file"{fail_clause}
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -109,15 +143,30 @@ def _mock_docker_evidence(log_path: Path, evidence_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
 if [ "$1" = "compose" ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
-  sleep {evidence_sleep}
+  if [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then
+    sleep {evidence_sleep}
+    printf '%s\n' 'new-container running'
+    exit 0
+  fi
+  if [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then
+    sleep {evidence_sleep}
+    printf '%s\n' 'new-container last-line'
+    exit 0
+  fi
 fi
-if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
-  printf '%s\n' 'new-container running'
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$4" = "--format" ] && [ "$5" = "{{.Id}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\n' 'sha256:image'
+  exit 0
 fi
-if [ "$1" = "compose" ] && [ "$2" = "logs" ]; then
-  printf '%s\n' 'new-container last-line'
+if [ "$1" = "inspect" ] && [ "$3" = "--format" ] && [ "$4" = "{{.Image}}" ] && [ "$#" -eq 4 ]; then
+  printf '%s\n' 'sha256:image'
+  exit 0
 fi
-exit 0
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -130,10 +179,38 @@ if [ "$1" = "pull" ]; then
   count=$((count + 1)); echo "$count" > "$count_file"
   [ "$count" -ge 2 ] && exit 23
 fi
-if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 ]]; then
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 || "$3" == *@sha256:oldgood ]]; then
   exit 1
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+
+
+def _mock_docker_forward_failure(log_path: Path, failing_call: str) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  [ "{failing_call}" = pull ] && exit 1
+  [ "$#" -eq 2 ] && exit 0
+  exit 1
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$#" -eq 3 ]; then
+  exit 1
+fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then
+  [ "{failing_call}" = tag ] && exit 7
+  exit 0
+fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
+  [ "{failing_call}" = compose ] && exit 23
+  exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -184,6 +261,21 @@ def test_script_exists_and_is_bash():
     assert SCRIPT.read_text().startswith("#!"), "must have a shebang"
 
 
+def test_docker_fake_rejects_unexpected_subcommand(tmp_path):
+    docker = tmp_path / "docker"
+    _write_exec(docker, _mock_docker(tmp_path / "docker.log"))
+
+    result = subprocess.run(
+        [str(docker), "rm", "-f", "container"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 97
+    assert "unexpected-docker: rm -f container" in result.stderr
+
+
 def test_healthy_deploy_succeeds_and_records_good_tag(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
@@ -194,6 +286,104 @@ def test_healthy_deploy_succeeds_and_records_good_tag(tmp_path):
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert good.exists(), "must record the last good tag on success"
     assert good.read_text().strip() == "abc1234"
+
+
+def test_healthy_deploy_records_last_good_digest(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_with_digest(Path(env["DOCKER_LOG"]), "sha256:gooddigest"),
+    )
+
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    digest = Path(env["STATE_DIR"]) / "last_good_digest"
+    assert digest.exists()
+    assert digest.read_text().strip() == "sha256:gooddigest"
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "expected_rc"),
+    [("pull", 1), ("tag", 7), ("compose", 23)],
+    ids=["forward-pull-fails", "forward-tag-fails", "forward-compose-fails"],
+)
+def test_forward_deploy_failure_writes_deploy_failed_receipt(tmp_path, failing_call, expected_rc):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), failing_call),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
+    receipt_file = Path(env["STATE_DIR"]) / "last_deploy_result.json"
+    assert receipt_file.exists()
+    receipt = json.loads(receipt_file.read_text())
+    assert receipt["outcome"] == "deploy_failed"
+    assert result.stdout.count("[deploy][evidence] result-json:") == 1
+
+
+def test_missing_deploy_outcome_is_internal_error_and_skips_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), "pull"),
+    )
+    script = tmp_path / "pull_and_deploy.sh"
+    script_text = SCRIPT.read_text().replace(
+        '    DEPLOY_OUTCOME="deploy_failed"\n', '    DEPLOY_OUTCOME=""\n', 1
+    )
+    _write_exec(script, script_text)
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, check=False
+    )
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "::error::internal invariant violation" in result.stdout
+    assert "do_deploy returned without setting DEPLOY_OUTCOME" in result.stdout
+
+
+def test_missing_success_deploy_outcome_skips_reconcile_and_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
+    _write_exec(
+        docker,
+        "#!/bin/bash\n"
+        'if [ "$1" = inspect ]; then printf \'sha256:OTHER\\n\'; exit 0; fi\n'
+        + body,
+    )
+    script = tmp_path / "pull_and_deploy.sh"
+    script_text = SCRIPT.read_text().replace(
+        '    DEPLOY_OUTCOME="deployed"\n', '    DEPLOY_OUTCOME=""\n', 1
+    )
+    _write_exec(script, script_text)
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, check=False
+    )
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "::error::internal invariant violation" in result.stdout
+    assert "image reconcile starting" not in out
+    assert "image reconcile assertion failed" not in out
+    assert "[deploy][evidence] result-json:" not in out
 
 
 def test_deploys_immutable_git_sha_tag(tmp_path):
@@ -234,14 +424,64 @@ def test_probe_failure_triggers_rollback(tmp_path):
     assert good == "abc1234", f"last good tag must stay abc1234, got {good}"
 
 
+@pytest.mark.parametrize(
+    ("digest_file", "expected_pull"),
+    [
+        (
+            "sha256:oldgood",
+            "pull registry.example.com/ns/demo@sha256:oldgood",
+        ),
+        (None, "pull registry.example.com/ns/demo:old1111"),
+        ("", "pull registry.example.com/ns/demo:old1111"),
+    ],
+    ids=["digest-first", "missing-digest-falls-back-to-tag", "empty-digest-falls-back-to-tag"],
+)
+def test_rollback_prefers_last_good_digest_and_falls_back_to_tag(
+    tmp_path, digest_file, expected_pull
+):
+    """回滚优先拉 digest；digest 缺失或为空时保留旧 tag 路径。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good_dir = Path(env["STATE_DIR"])
+    good_dir.mkdir(parents=True)
+    (good_dir / "last_good_tag").write_text("old1111\n")
+    if digest_file is not None:
+        (good_dir / "last_good_digest").write_text(digest_file + "\n")
+
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    assert expected_pull in docker_log
+    if digest_file:
+        assert "pull registry.example.com/ns/demo:old1111" not in docker_log
+        assert (good_dir / "last_good_digest").read_text().strip() == digest_file
+
+
 def test_probe_failure_without_previous_good_just_fails(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
     env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
     res = _run(env)
-    assert res.returncode != 0
+    assert res.returncode == 4
     good = Path(env["STATE_DIR"]) / "last_good_tag"
     assert not good.exists(), "must not record a bad deploy as good"
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_unhealthy"
 
 
 # 单镜像 lane 退出状态轴表：首次探针 × prev_good × 回滚 compose × 回滚探针。
@@ -400,6 +640,92 @@ def test_probe_evidence_keeps_http_code_and_curl_exit_code_sequence(tmp_path):
     assert "old version passed the same-budget health probe" in result.stdout
 
 
+def _mock_docker_reconcile_mismatch_with_digest(log_path: Path) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$*" == *"{{index .RepoDigests 0}}"* ]]; then
+  printf '%s\\n' 'registry.example.com/ns/demo@sha256:gooddigest'
+  exit 0
+fi
+if [ "$1" = "inspect" ]; then
+  printf '%s\\n' 'sha256:OTHER'
+  exit 0
+fi
+{_reconcile_ok_bash()}
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+
+
+RESULT_KEYS = {
+    "schema_version", "deploy_id", "git_sha", "tag", "image_id",
+    "image_digest", "outcome", "probe", "finished_at",
+}
+PROBE_KEYS = {"status", "final_code", "attempts", "elapsed_s"}
+
+
+@pytest.mark.parametrize(
+    ("name", "status_sequence", "prev_good", "prev_digest", "expected_rc", "expected_outcome", "mismatch"),
+    [
+        ("deployed", [("200", 0)], None, None, 0, "deployed", False),
+        ("rolled-back", [("500", 0), ("500", 0), ("200", 0)], "old1111", "sha256:oldgood", 1, "rolled_back", False),
+        ("rollback-unhealthy", [("500", 0)] * 4, "old1111", "sha256:oldgood", 4, "rollback_unhealthy", False),
+        ("reconcile-failed", [("200", 0)], None, None, 5, "reconcile_failed", True),
+        ("skipped-already-deployed", [], "abc1234", "sha256:already", 0, "skipped_already_deployed", False),
+    ],
+    ids=["deployed", "rolled-back", "rollback-unhealthy", "reconcile-failed", "skipped-already-deployed"],
+)
+def test_deploy_result_is_valid_and_emitted_once_for_each_outcome(
+    tmp_path, name, status_sequence, prev_good, prev_digest,
+    expected_rc, expected_outcome, mismatch,
+):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    if prev_good is not None:
+        (state / "last_good_tag").write_text(prev_good + "\n")
+    if prev_digest is not None:
+        (state / "last_good_digest").write_text(prev_digest + "\n")
+
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(tmp_path / "curl-attempts.log", status_sequence),
+    )
+    docker_body = (
+        _mock_docker_reconcile_mismatch_with_digest(Path(env["DOCKER_LOG"]))
+        if mismatch
+        else _mock_docker_with_digest(Path(env["DOCKER_LOG"]), "sha256:gooddigest")
+    )
+    _write_exec(mock_dir / "docker", docker_body)
+
+    result = _run(env)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
+    result_file = state / "last_deploy_result.json"
+    assert result_file.exists()
+    payload = json.loads(result_file.read_text())
+    assert set(payload) == RESULT_KEYS
+    assert payload["schema_version"] == 1
+    assert payload["git_sha"] == env["GIT_SHA"]
+    assert payload["tag"] == env["GIT_SHA"]
+    assert payload["outcome"] == expected_outcome
+    assert set(payload["probe"]) == PROBE_KEYS
+    assert isinstance(payload["probe"]["attempts"], int)
+    assert isinstance(payload["probe"]["elapsed_s"], int)
+    assert result.stdout.count("[deploy][evidence] result-json:") == 1
+
+    if name == "deployed":
+        assert payload["image_digest"] == "sha256:gooddigest"
+        assert (state / "last_good_digest").read_text().strip() == payload["image_digest"]
+    if name == "rolled-back":
+        assert payload["image_digest"] == prev_digest
+
+
 def test_http_200_with_curl_timeout_is_unhealthy_and_rolls_back(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
@@ -540,6 +866,56 @@ def test_rollback_pull_failure_returns_rc4_and_keeps_last_good(tmp_path):
     assert "rollback to old1111 failed" in result.stdout
 
 
+def test_failed_rollback_receipt_does_not_claim_previous_image_identity(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env.update(GIT_SHA="new2222", PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    (state / "last_good_tag").write_text("old1111\n")
+    (state / "last_good_digest").write_text("sha256:oldgood\n")
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log", [("500", 0), ("500", 0)]
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_rollback_pull_failure(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    receipt = json.loads((state / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_unhealthy"
+    assert receipt["image_digest"] == ""
+    assert receipt["image_id"] == ""
+
+
+def test_result_replace_failure_keeps_previous_complete_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    result_file = state / "last_deploy_result.json"
+    previous = '{"complete":true}\n'
+    result_file.write_text(previous)
+    _write_exec(mock_dir / "mv", "#!/bin/bash\nexit 1\n")
+    env["PATH"] = f"{mock_dir}:{os.environ['PATH']}"
+
+    result = _run(env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result_file.read_text() == previous
+    assert json.loads(result_file.read_text()) == {"complete": True}
+    assert "::error::failed to write deploy result" in result.stdout
+    assert "failed to atomically replace deploy result file" in result.stderr
+
+
 def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
@@ -561,12 +937,18 @@ def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
         mock_dir / "docker",
         f'''#!/bin/bash
 echo "$@" >> "{docker_log}"
-if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   count=$(cat "{compose_count}" 2>/dev/null || echo 0)
   count=$((count + 1)); echo "$count" > "{compose_count}"
   [ "$count" -eq 2 ] && exit 23
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 ''',
     )
 
@@ -628,7 +1010,10 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit {0 if image_local else 1}
 fi
-exit 0
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -764,6 +1149,7 @@ def test_busy_lock_held_defers_untouched(tmp_path):
         assert "tag " not in log, log
         good = Path(env["STATE_DIR"]) / "last_good_tag"
         assert not good.exists()
+        assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
         assert "DEFERRED" in res.stdout
     finally:
         holder.terminate()
@@ -808,16 +1194,21 @@ def _mock_docker_admission_probe(log_path: Path) -> str:
     LOCK_SH 必然失败(admission 已关闭),没有 TOCTOU 窗口。
     """
     return f"""#!/bin/bash
-if [ "$1" = "compose" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   if flock -n -s "$BUSY_LOCK_FILE" true; then
     echo "sh_probe=open" >> "{log_path}"
   else
     echo "sh_probe=closed" >> "{log_path}"
   fi
+  echo "$@" >> "{log_path}"
+  exit 0
 fi
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -941,7 +1332,10 @@ if [ "$1" = "pull" ]; then
   exit 1
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -1214,11 +1608,15 @@ if [ "$1" = "pull" ]; then
   exit 1
 fi
 if [ "$1" = "tag" ]; then
-  [ "$2" = "{local_ref}" ] && exit 1
-  exit 0
+  [ "$#" -eq 3 ] && [ "$2" = "{local_ref}" ] && exit 1
+  [ "$#" -eq 3 ] && [ "$2" = "{acr_ref}" ] && exit 0
+  echo "unexpected-docker: $*" >&2
+  exit 97
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """,
     )
     env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
@@ -1254,6 +1652,44 @@ def test_invalid_busy_lock_timeout_fails_hard(tmp_path):
     log = docker_log_path.read_text() if docker_log_path.exists() else ""
     assert "compose up" not in log
     assert "BUSY_LOCK_TIMEOUT" in (res.stdout + res.stderr)
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+
+
+def test_busy_lock_flock_error_fails_without_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    lock_file = tmp_path / "busy.lock"
+    lock_file.touch()
+    env.update(BUSY_LOCK_FILE=str(lock_file), PATH=f"{mock_dir}:{os.environ['PATH']}")
+    _write_exec(mock_dir / "flock", "#!/bin/bash\nexit 2\n")
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "flock on busy lock failed" in result.stdout
+
+
+def test_busy_lock_prepull_failure_fails_without_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(
+        BUSY_LOCK_FILE=str(tmp_path / "busy.lock"),
+        PULL_RETRIES="1",
+        PULL_RETRY_DELAY="0",
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), "pull"),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "compose up" not in Path(env["DOCKER_LOG"]).read_text()
 
 
 COMPOSE_ONESHOT_SERVICES = ("app", "migrate")
@@ -1263,23 +1699,34 @@ def _mock_docker_oneshot(log_path: Path) -> str:
     service_lines = "\\n".join(COMPOSE_ONESHOT_SERVICES)
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
-if [ "$1" = "compose" ] && [[ " $* " == *" config --services "* ]]; then
+if [ "$1" = "compose" ] && [ "$2" = "config" ] && [ "$3" = "--services" ] && [ "$#" -eq 3 ]; then
   printf '{service_lines}\\n'
   exit 0
 fi
-if [ "$1" = "compose" ] && [[ " $* " == *" ps -q --status running"* ]]; then
+if [ "$1" = "compose" ] && [ "$2" = "ps" ] && [ "$3" = "-q" ] && [ "$4" = "--status" ] && [ "$5" = "running" ] && [ "$#" -ge 5 ]; then
   printf 'cid-app\\n'
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = "--format" ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  printf 'registry.example.com/ns/demo@sha256:deadbeef\\n'
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = "--format" ] && [ "$#" -eq 5 ]; then
   printf '{RECONCILE_IMAGE_ID}\\n'
   exit 0
 fi
-if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = inspect ] && [ "$3" = "--format" ] && [ "$#" -eq 4 ]; then
   printf '{RECONCILE_IMAGE_ID}\\n'
   exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+  [ "$#" -eq 3 ] && exit 0
+  [ "$#" -eq 4 ] && [ "$4" = "app" ] && exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 

@@ -66,6 +66,11 @@ on:
         required: false
         default: "10"
         type: string
+      notify_on_success:
+        description: "Send a Feishu success receipt after deployment reconciliation"
+        required: false
+        default: false
+        type: boolean
       local_registry:
         description: "opt-in local-network registry mirror host:port (e.g. a tailnet MagicDNS name:5001), used as the primary push/pull target for this deploy; ACR remains the offsite archive + fallback. Empty (default) disables this entirely — same ACR-only code path, same exit codes, same success-path stdout as today; the one documented exception is that a default-path ACR-push failure now also prints one extra summary line before failing."
         required: false
@@ -293,10 +298,49 @@ jobs:
           [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
           REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
 
+          capture_deploy_result() {
+            local remote_output="$1" result_prefix='[deploy][evidence] result-json: ' line result_json="" parsed=""
+            while IFS= read -r line; do
+              if [[ "$line" == "$result_prefix"* ]]; then
+                result_json="${line:${#result_prefix}}"
+              fi
+            done <<< "$remote_output"
+            if [[ -z "$result_json" ]]; then
+              echo "::warning::deploy result evidence missing"
+              return 0
+            fi
+            if ! parsed="$(printf '%s\n' "$result_json" | python3 -c '
+          import json
+          import sys
+
+          result = json.load(sys.stdin)
+          probe = result["probe"]
+          for key, value in (
+              ("image_digest", result["image_digest"]),
+              ("probe_status", probe["status"]),
+              ("probe_final_code", probe["final_code"]),
+              ("probe_attempts", probe["attempts"]),
+              ("probe_elapsed_s", probe["elapsed_s"]),
+              ("outcome", result["outcome"]),
+          ):
+              print(f"{key}={value}")
+          ')"; then
+              echo "::warning::deploy result evidence JSON parse failed"
+              return 0
+            fi
+            while IFS= read -r line; do
+              [[ -n "$line" ]] || continue
+              echo "$line" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deploy result output"
+            done <<< "$parsed"
+          }
+
           deploy_once() {
             scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh" \
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
-            ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+            remote_output=""
+            remote_rc=0
+            remote_output="$(
+              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
               "IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
                LOCAL_IMAGE='${LOCAL_IMAGE}' \
                GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
@@ -310,6 +354,10 @@ jobs:
                BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
                ONESHOT_SERVICES='${ONESHOT_SERVICES}' \
                bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}'; exit \$rc"
+            )" || remote_rc=$?
+            printf '%s\n' "$remote_output"
+            capture_deploy_result "$remote_output"
+            return "$remote_rc"
           }
 
           attempt=1; max_attempts=3; had_transport_failure=0
@@ -405,6 +453,117 @@ jobs:
           set -euo pipefail
           echo "::error::image reconcile assertion failed (rc=5); deployment may have succeeded, but production image identity is not proven"
           exit 1
+
+      - name: Feishu 部署成功回执卡 (opt-in, fail-open)
+        if: success() && inputs.notify_on_success == true
+        continue-on-error: true
+        env:
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          IMAGE_DIGEST: ${{ steps.deploy.outputs.image_digest }}
+          PROBE_STATUS: ${{ steps.deploy.outputs.probe_status }}
+          PROBE_FINAL_CODE: ${{ steps.deploy.outputs.probe_final_code }}
+          PROBE_ATTEMPTS: ${{ steps.deploy.outputs.probe_attempts }}
+          PROBE_ELAPSED_S: ${{ steps.deploy.outputs.probe_elapsed_s }}
+          OUTCOME: ${{ steps.deploy.outputs.outcome }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u -o pipefail
+          missing=""
+          [ -n "$IMAGE_DIGEST" ] || missing="${missing:+$missing,}image_digest"
+          [ -n "$PROBE_STATUS" ] || missing="${missing:+$missing,}probe_status"
+          [ -n "$PROBE_FINAL_CODE" ] || missing="${missing:+$missing,}probe_final_code"
+          [ -n "$PROBE_ATTEMPTS" ] || missing="${missing:+$missing,}probe_attempts"
+          [ -n "$PROBE_ELAPSED_S" ] || missing="${missing:+$missing,}probe_elapsed_s"
+          [ -n "$OUTCOME" ] || missing="${missing:+$missing,}outcome"
+          if [ -n "$missing" ]; then
+            echo "::warning::success receipt skipped: ${missing}"
+            exit 0
+          fi
+          webhook="${FEISHU_WEBHOOK:-}"
+          if [ -z "$webhook" ]; then
+            echo "::warning::success receipt skipped: FEISHU_WEBHOOK is not configured"
+            exit 0
+          fi
+          response_file="$(mktemp)"
+          curl_stderr="${response_file}.stderr"
+          trap 'rm -f -- "$response_file" "$curl_stderr"' EXIT
+          http_status=""
+          curl_rc=0
+          http_status="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- -o "$response_file" -w '%{http_code}' "$webhook" 2>"$curl_stderr"
+          import json
+          import os
+
+          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
+          svc = os.environ["SVC"]
+          host = os.environ["HOST"]
+          repo = os.environ["REPO"]
+          sha = os.environ["SHA"]
+          image_digest = os.environ["IMAGE_DIGEST"]
+          probe_status = os.environ["PROBE_STATUS"]
+          probe_final_code = os.environ["PROBE_FINAL_CODE"]
+          probe_attempts = os.environ["PROBE_ATTEMPTS"]
+          probe_elapsed_s = os.environ["PROBE_ELAPSED_S"]
+          outcome = os.environ["OUTCOME"]
+          run_url = os.environ["RUN_URL"]
+          body = (f"服务 {svc} · 目标机 {host}\n"
+                  f"仓库 {repo} · SHA {sha}\n"
+                  f"镜像 digest {image_digest}\n"
+                  f"探针 status={probe_status} · final_code={probe_final_code} · "
+                  f"attempts={probe_attempts} · elapsed_s={probe_elapsed_s} · "
+                  f"outcome={outcome}\n"
+                  f"部署成功，镜像对账已通过。\n"
+                  f"Run: {run_url}")
+          card = {
+              "msg_type": "interactive",
+              "card": {
+                  "config": {"wide_screen_mode": True},
+                  "header": {
+                      "template": "green",
+                      "title": {
+                          "tag": "plain_text",
+                          "content": f"✅ {title_prefix} 部署成功 · {svc}",
+                      },
+                  },
+                  "elements": [
+                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
+                      {"tag": "action", "actions": [
+                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
+                           "type": "primary", "url": run_url},
+                      ]},
+                  ],
+              },
+          }
+          print(json.dumps(card))
+          PY
+          )" || curl_rc=$?
+          if [ "$curl_rc" -ne 0 ]; then
+            echo "::warning::Feishu 部署成功回执卡 request failed or timed out: curl_rc=${curl_rc}, http_status=${http_status:-unknown}"
+            exit 0
+          fi
+          if ! python3 - "Feishu 部署成功回执卡" "$response_file" "$http_status" <<'PY'
+          import json
+          import sys
+
+          label, response_file, http_status = sys.argv[1:4]
+          try:
+              with open(response_file, encoding="utf-8") as response:
+                  result = json.load(response)
+              code = result["code"]
+          except (OSError, ValueError, KeyError, TypeError):
+              print(f"::warning::{label} response parse failed; http_status={http_status or 'unknown'}")
+          else:
+              if str(code) != "0":
+                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
+                  print(f"::warning::{label} business error: code={code}, msg={msg}")
+          PY
+          then
+            echo "::warning::Feishu 部署成功回执卡 response parser failed"
+          fi
 
       # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+

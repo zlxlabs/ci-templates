@@ -8,9 +8,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -133,6 +135,432 @@ def test_per_host_concurrency_group():
     assert concurrency.get("cancel-in-progress") is False, (
         "must not cancel an in-flight deploy mid-rollout"
     )
+
+
+def test_notify_on_success_input_is_optional_boolean_disabled_by_default():
+    _, trigger = _load()
+    spec = trigger["workflow_call"]["inputs"]["notify_on_success"]
+    assert spec["type"] == "boolean"
+    assert spec["required"] is False
+    assert spec["default"] is False
+
+
+def test_deploy_result_evidence_is_parsed_into_step_outputs():
+    raw, _ = _load()
+    deploy = next(
+        step for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    assert "capture_deploy_result" in run
+    assert "result_prefix='[deploy][evidence] result-json: '" in run
+    for output in (
+        "image_digest", "probe_status", "probe_attempts",
+        "probe_elapsed_s", "outcome",
+    ):
+        assert f'(\"{output}\",' in run
+    assert "result_json" in run
+    assert "result_json=\"${line:${#result_prefix}}\"" in run
+    assert "remote_output=\"$(\n" in run
+    assert "printf '%s\\n' \"$remote_output\"" in run
+
+
+@pytest.mark.parametrize(
+    ("name", "evidence", "remote_rc"),
+    [
+        ("missing-result-json", "remote log without receipt", 0),
+        ("missing-probe", '[deploy][evidence] result-json: {"outcome":"deployed"}', 1),
+        (
+            "missing-fields",
+            '[deploy][evidence] result-json: {"probe":{"status":"ok"}}',
+            255,
+        ),
+    ],
+    ids=lambda value: value[0] if isinstance(value, tuple) else str(value),
+)
+def test_deploy_once_preserves_remote_rc_when_evidence_is_malformed(
+    tmp_path, name, evidence, remote_rc
+):
+    deploy = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    fixture_end = run.index("\nattempt=1;")
+    fixture = (
+        run[:fixture_end]
+        + '\nrc=0; deploy_once || rc=$?; printf \'deploy_once_rc=%s\\n\' "$rc"; exit "$rc"\n'
+    )
+
+    scp = tmp_path / "scp"
+    scp.write_text("#!/bin/bash\nexit 0\n")
+    scp.chmod(0o755)
+    ssh = tmp_path / "ssh"
+    ssh.write_text(
+        f"#!/bin/bash\nprintf '%s\\n' {shlex.quote(evidence)}\nexit {remote_rc}\n"
+    )
+    ssh.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = os.environ | {
+        "SSH_USER": "deploy",
+        "DEPLOY_HOST": "host.example",
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_REPOSITORY": "zlxlabs/ci-templates",
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(output),
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+
+    completed = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == remote_rc, (
+        f"{name}: expected remote rc {remote_rc}, got {completed.returncode}; "
+        f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+    )
+    output_text = completed.stdout + completed.stderr
+    assert "deploy result evidence missing" in output_text or (
+        "deploy result evidence JSON parse failed" in output_text
+    )
+    assert f"deploy_once_rc={remote_rc}" in output_text
+
+
+def test_real_deploy_stdout_is_the_receipt_parser_fixture(tmp_path):
+    """跨 shell→workflow 边界使用真实脚本 stdout，不手写 result-json。"""
+    docker_log = tmp_path / "docker.log"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        f"""#!/bin/bash
+echo "$@" >> "{docker_log}"
+if [ "$1" = pull ] && [ "$#" -eq 2 ]; then
+  exit 0
+fi
+if [ "$1" = tag ] && [ "$#" -eq 3 ]; then
+  exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = up ] && [ "$3" = -d ] && [ "$#" -eq 3 ]; then
+  exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = config ] && [ "$3" = --services ] && [ "$#" -eq 3 ]; then
+  printf '%s\\n' app
+  exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = ps ] && [ "$3" = -q ] && [ "$4" = --status ] && [ "$5" = running ] && [ "$#" -ge 5 ]; then
+  printf '%s\\n' cid-app
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\\n' registry.example.com/ns/demo@sha256:image
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{{{.Id}}}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\\n' sha256:image
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ] && [ "$5" = "{{{{.Id}}}}" ] && [ "$#" -eq 5 ]; then
+  case "$3" in
+    registry.example.com/ns/demo:abc1234|demo:latest)
+      printf '%s\\n' sha256:image
+      exit 0
+      ;;
+  esac
+fi
+if [ "$1" = inspect ] && [ "$3" = --format ] && [ "$#" -eq 4 ]; then
+  printf '%s\\n' sha256:image
+  exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+    )
+    docker.chmod(0o755)
+    unexpected = subprocess.run(
+        [
+            str(docker),
+            "image",
+            "inspect",
+            "registry.example.com/ns/demo:abc1234",
+            "--format",
+            "{{.Unexpected}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unexpected.returncode == 97
+    assert "unexpected-docker: image inspect registry.example.com/ns/demo:abc1234 --format {{.Unexpected}}" in unexpected.stderr
+    curl = tmp_path / "curl"
+    curl.write_text("#!/bin/bash\nprintf '200'\n")
+    curl.chmod(0o755)
+    deploy_dir = tmp_path / "app"
+    deploy_dir.mkdir()
+    (deploy_dir / "docker-compose.yml").write_text("services: {}\n")
+    env = os.environ.copy()
+    env.update(
+        IMAGE_NAME="demo",
+        ACR_IMAGE="registry.example.com/ns/demo",
+        GIT_SHA="abc1234",
+        DEPLOY_DIR=str(deploy_dir),
+        STATE_DIR=str(tmp_path / "state"),
+        HOST_LOCK=str(tmp_path / "host.lock"),
+        HEALTHCHECK_URL="http://localhost/health",
+        HEALTHCHECK_EXPECT_STATUS="200",
+        HEALTHCHECK_RETRIES="1",
+        HEALTHCHECK_INTERVAL="0",
+        HEALTHCHECK_WARMUP="0",
+        HEALTHCHECK_TIMEOUT="1",
+        DOCKER_BIN=str(docker),
+        CURL_BIN=str(curl),
+        DEPLOY_ID="workflow-fixture",
+    )
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=env,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+    prefix = "[deploy][evidence] result-json: "
+    lines = [line for line in result.stdout.splitlines() if line.startswith(prefix)]
+    assert len(lines) == 1
+    receipt = json.loads(lines[0][len(prefix):])
+    assert receipt["image_id"] == "sha256:image"
+    outputs = {
+        "image_digest": receipt["image_digest"],
+        "probe_status": receipt["probe"]["status"],
+        "probe_final_code": receipt["probe"]["final_code"],
+        "probe_attempts": receipt["probe"]["attempts"],
+        "probe_elapsed_s": receipt["probe"]["elapsed_s"],
+        "outcome": receipt["outcome"],
+    }
+    assert outputs == {
+        "image_digest": "sha256:image",
+        "probe_status": "ok",
+        "probe_final_code": "200",
+        "probe_attempts": 1,
+        "probe_elapsed_s": 0,
+        "outcome": "deployed",
+    }
+    deploy_run = next(
+        step["run"]
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    assert "result_json" in deploy_run
+    for key, value in outputs.items():
+        assert f'("{key}",' in deploy_run
+
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    assert success["env"] == {
+        "FEISHU_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}",
+        "FEISHU_TITLE_PREFIX": "${{ vars.FEISHU_CI_TITLE_PREFIX }}",
+        "SVC": "${{ inputs.image_name }}",
+        "HOST": "${{ inputs.host }}",
+        "REPO": "${{ github.repository }}",
+        "SHA": "${{ steps.sha.outputs.git_sha }}",
+        "IMAGE_DIGEST": "${{ steps.deploy.outputs.image_digest }}",
+        "PROBE_STATUS": "${{ steps.deploy.outputs.probe_status }}",
+        "PROBE_FINAL_CODE": "${{ steps.deploy.outputs.probe_final_code }}",
+        "PROBE_ATTEMPTS": "${{ steps.deploy.outputs.probe_attempts }}",
+        "PROBE_ELAPSED_S": "${{ steps.deploy.outputs.probe_elapsed_s }}",
+        "OUTCOME": "${{ steps.deploy.outputs.outcome }}",
+        "RUN_URL": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+    }
+
+
+def test_success_receipt_card_is_opt_in_fail_open_and_complete():
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    reconcile_index = next(
+        i for i, step in enumerate(steps)
+        if step.get("name", "").startswith("Reconcile deployed image")
+    )
+    success = steps[reconcile_index + 1]
+    assert success["name"] == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    assert success["if"] == "success() && inputs.notify_on_success == true"
+    assert success["continue-on-error"] is True
+    run = success["run"]
+    assert "success receipt skipped:" in run
+    assert "image_digest" in run
+    assert "probe_status" in run
+    for field in (
+        "PROBE_FINAL_CODE", "PROBE_ATTEMPTS", "PROBE_ELAPSED_S",
+        "IMAGE_DIGEST", "OUTCOME", "RUN_URL",
+    ):
+        assert field in run
+    assert "FEISHU_WEBHOOK" in run
+    assert "FEISHU_TITLE_PREFIX" in run
+    assert "curl -fsS --max-time 10 -X POST" in run
+    assert "部署成功" in run
+    assert "镜像对账已通过" in run
+
+
+def test_success_receipt_diagnostics_do_not_echo_response_body():
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    run = success["run"]
+
+    assert "response_file" in run
+    assert "curl_rc=" in run
+    assert "http_status=" in run
+    assert "response={raw" not in run
+    assert "response:-no response" not in run
+    assert "response parser failed" in run
+
+
+def test_success_receipt_request_failure_reports_status_without_body(tmp_path):
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    fake_curl = tmp_path / "curl"
+    fake_curl.write_text(
+        """#!/bin/bash
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi
+done
+printf '%s' '{"code":13,"msg":"sensitive response body"}' > "$output"
+printf '%s' '502'
+exit 22
+"""
+    )
+    fake_curl.chmod(0o755)
+    env = os.environ | {
+        "FEISHU_WEBHOOK": "https://example.test/webhook",
+        "FEISHU_TITLE_PREFIX": "[contract]",
+        "SVC": "contract-service",
+        "HOST": "contract-host",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "0123456789ab",
+        "IMAGE_DIGEST": "sha256:contract",
+        "PROBE_STATUS": "ok",
+        "PROBE_FINAL_CODE": "200",
+        "PROBE_ATTEMPTS": "1",
+        "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
+        "RUN_URL": "https://example.test/actions/runs/123",
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+
+    completed = subprocess.run(
+        ["bash", "-c", success["run"]],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    output = completed.stdout + completed.stderr
+    assert "curl_rc=22" in output
+    assert "http_status=502" in output
+    assert "sensitive response body" not in output
+    assert '"code":13' not in output
+
+
+def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
+    raw, _ = _load()
+    success = next(
+        step for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    env = os.environ | {
+        "FEISHU_TITLE_PREFIX": "[contract]",
+        "SVC": "contract-service",
+        "HOST": "contract-host",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "0123456789ab",
+        "IMAGE_DIGEST": "sha256:contract",
+        "PROBE_STATUS": "ok",
+        "PROBE_FINAL_CODE": "200",
+        "PROBE_ATTEMPTS": "1",
+        "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
+        "RUN_URL": "https://example.test/actions/runs/123",
+    }
+    run = success["run"]
+    producer_start = run.index("\n", run.index("python3 - <<'PY'")) + 1
+    producer_end = run.index("\nPY", producer_start)
+    producer = run[producer_start:producer_end]
+    completed = subprocess.run(
+        [sys.executable, "-"],
+        input=producer,
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stderr
+    payload = json.loads(completed.stdout)
+    content = payload["card"]["elements"][0]["text"]["content"]
+    assert payload["msg_type"] == "interactive"
+    assert payload["card"]["header"]["template"] == "green"
+    for value in (
+        "contract-service", "contract-host", "zlxlabs/ci-templates",
+        "0123456789ab", "sha256:contract", "status=ok",
+        "final_code=200", "attempts=1", "elapsed_s=3",
+        "outcome=deployed",
+    ):
+        assert value in content
+    assert payload["card"]["elements"][1]["actions"][0]["url"] == env["RUN_URL"]
+
+
+def test_success_receipt_skips_without_digest_and_does_not_call_curl(tmp_path):
+    raw, _ = _load()
+    success = next(
+        step for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    curl_called = tmp_path / "curl-called"
+    fake_curl = tmp_path / "curl"
+    fake_curl.write_text(f"#!/bin/bash\\ntouch '{curl_called}'\\n")
+    fake_curl.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = os.environ | {
+        "FEISHU_WEBHOOK": "https://example.test/webhook",
+        "FEISHU_TITLE_PREFIX": "[contract]",
+        "SVC": "contract-service",
+        "HOST": "contract-host",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "0123456789ab",
+        "IMAGE_DIGEST": "",
+        "PROBE_STATUS": "ok",
+        "PROBE_FINAL_CODE": "200",
+        "PROBE_ATTEMPTS": "1",
+        "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
+        "RUN_URL": "https://example.test/actions/runs/123",
+        "GITHUB_OUTPUT": str(output),
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+    completed = subprocess.run(
+        ["bash", "-c", success["run"]],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert "::warning::success receipt skipped: image_digest" in completed.stdout
+    assert not curl_called.exists()
 
 
 def test_deploy_notify_title_prefix_is_repo_variable_with_default():
@@ -386,7 +814,7 @@ def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers(
     assert "image reconcile assertion failed" in thin
 
     script = SCRIPT.read_text()
-    after_do_deploy = script[script.index("do_deploy\nrc=$?"):]
+    after_do_deploy = script[script.index("rc=0\ndo_deploy || rc=$?"):]
     assert "reconcile_deployed_image" in after_do_deploy
     assert after_do_deploy.index("reconcile_deployed_image") < after_do_deploy.index(
         "flock -u 9"
