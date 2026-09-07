@@ -60,9 +60,86 @@ DEPLOY_EVENT_LOG="${DEPLOY_EVENT_LOG:-}"
 DEPLOY_ID="${DEPLOY_ID:-$$}"
 
 GOOD_TAG_FILE="${STATE_DIR}/last_good_tag"
+GOOD_DIGEST_FILE="${STATE_DIR}/last_good_digest"
+RESULT_FILE="${STATE_DIR}/last_deploy_result.json"
+
+DEPLOY_OUTCOME=""
+IMAGE_ID=""
+IMAGE_DIGEST=""
+PROBE_STATUS="skipped"
+PROBE_FINAL_CODE=""
+PROBE_ATTEMPTS=0
+PROBE_ELAPSED_S=0
 
 log()   { echo "[deploy] $*"; }
 event() { [ -n "$DEPLOY_EVENT_LOG" ] && echo "$1:${DEPLOY_ID}" >> "$DEPLOY_EVENT_LOG" || true; }
+
+image_digest_for_ref() {
+  local ref="$1" raw=""
+  if ! raw="$("$DOCKER_BIN" image inspect --format '{{index .RepoDigests 0}}' "$ref" 2>/dev/null)"; then
+    raw=""
+  fi
+  [ -n "$raw" ] || return 0
+  # A local-registry retag may expose a local RepoDigests entry. It is not an
+  # offsite rollback anchor, so deliberately record an empty digest instead.
+  if [ -n "$LOCAL_IMAGE" ] && [[ "$raw" == "${LOCAL_IMAGE}"@* ]]; then
+    return 0
+  fi
+  case "$raw" in
+    sha256:*) printf '%s\n' "$raw" ;;
+    *@sha256:*) printf '%s\n' "${raw##*@}" ;;
+  esac
+}
+
+image_id_for_ref() {
+  local ref="$1" image_id=""
+  if ! image_id="$("$DOCKER_BIN" image inspect --format '{{.Id}}' "$ref" 2>/dev/null)"; then
+    image_id=""
+  fi
+  printf '%s\n' "$image_id"
+}
+
+record_last_good_identity() {
+  local ref="$1" digest=""
+  digest="$(image_digest_for_ref "$ref")"
+  printf '%s\n' "$digest" > "$GOOD_DIGEST_FILE"
+  IMAGE_DIGEST="$digest"
+  IMAGE_ID="$(image_id_for_ref "$ref")"
+  if [ -n "$digest" ]; then
+    log "recorded last good digest ${digest}"
+  else
+    log "last good digest unavailable for ${ref}; recorded an empty digest and will fall back to tag on rollback"
+  fi
+}
+
+json_quote() {
+  local value="$1"
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//$'\n'/\\n}
+  value=${value//$'\r'/\\r}
+  value=${value//$'\t'/\\t}
+  printf '"%s"' "$value"
+}
+
+write_deploy_result() {
+  local outcome="$1" finished_at result
+  finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf -v result '{"schema_version":1,"deploy_id":%s,"git_sha":%s,"tag":%s,"image_id":%s,"image_digest":%s,"outcome":%s,"probe":{"status":%s,"final_code":%s,"attempts":%d,"elapsed_s":%d},"finished_at":%s}' \
+    "$(json_quote "$DEPLOY_ID")" \
+    "$(json_quote "$GIT_SHA")" \
+    "$(json_quote "$GIT_SHA")" \
+    "$(json_quote "$IMAGE_ID")" \
+    "$(json_quote "$IMAGE_DIGEST")" \
+    "$(json_quote "$outcome")" \
+    "$(json_quote "$PROBE_STATUS")" \
+    "$(json_quote "$PROBE_FINAL_CODE")" \
+    "$PROBE_ATTEMPTS" \
+    "$PROBE_ELAPSED_S" \
+    "$(json_quote "$finished_at")"
+  printf '%s\n' "$result" > "$RESULT_FILE"
+  echo "[deploy][evidence] result-json: ${result}"
+}
 
 is_positive_integer() {
   [[ "$1" =~ ^[1-9][0-9]*$ ]]
@@ -170,7 +247,7 @@ pull_from_local_registry() {
 pull_image() {
   local ref="$1" attempt=1
   local tag="${ref##*:}"
-  if [ -n "$LOCAL_IMAGE" ] && pull_from_local_registry "$tag"; then
+  if [[ "$ref" != *@* ]] && [ -n "$LOCAL_IMAGE" ] && pull_from_local_registry "$tag"; then
     return 0
   fi
   while [ "$attempt" -le "$PULL_RETRIES" ]; do
@@ -240,10 +317,13 @@ oneshot_schema_hint() {
 
 # --- deploy a specific tag: pull (if remote) + retag + compose up ------------
 deploy_tag() {
-  local tag="$1"
-  log "deploying ${ACR_IMAGE}:${tag}"
-  pull_image "${ACR_IMAGE}:${tag}" || return $?
-  "$DOCKER_BIN" tag "${ACR_IMAGE}:${tag}" "${IMAGE_NAME}:latest" || return $?
+  local ref="$1"
+  if [[ "$ref" != *@* ]]; then
+    ref="${ACR_IMAGE}:${ref}"
+  fi
+  log "deploying ${ref}"
+  pull_image "$ref" || return $?
+  "$DOCKER_BIN" tag "$ref" "${IMAGE_NAME}:latest" || return $?
   if [ "$ROLLBACK_MODE" -eq 0 ]; then
     validate_oneshot_services || return $?
   fi
@@ -262,10 +342,17 @@ deploy_tag() {
 
 # --- health probe: returns 0 if the service answers as expected --------------
 health_probe() {
-  [ -z "$HEALTHCHECK_URL" ] && { log "no HEALTHCHECK_URL, skipping probe"; return 0; }
+  if [ -z "$HEALTHCHECK_URL" ]; then
+    PROBE_STATUS="skipped"
+    PROBE_FINAL_CODE=""
+    PROBE_ATTEMPTS=0
+    PROBE_ELAPSED_S=0
+    log "no HEALTHCHECK_URL, skipping probe"
+    return 0
+  fi
   log "warmup ${HEALTHCHECK_WARMUP}s before probing ${HEALTHCHECK_URL}"
   sleep "$HEALTHCHECK_WARMUP"
-  local attempt=1 probe_attempts=""
+  local attempt=1 probe_attempts="" probe_started=$SECONDS
   while [ "$attempt" -le "$HEALTHCHECK_RETRIES" ]; do
     local code curl_rc
     if code="$("$CURL_BIN" -s -o /dev/null -w '%{http_code}' \
@@ -275,12 +362,16 @@ health_probe() {
       curl_rc=$?
     fi
     [ -n "$code" ] || code="000"
+    PROBE_FINAL_CODE="$code"
+    PROBE_ATTEMPTS="$attempt"
+    PROBE_ELAPSED_S=$((SECONDS - probe_started))
     if [ -n "$probe_attempts" ]; then
       probe_attempts+=",${code}(curl=${curl_rc})"
     else
       probe_attempts="${code}(curl=${curl_rc})"
     fi
     if [ "$code" = "$HEALTHCHECK_EXPECT_STATUS" ] && [ "$curl_rc" -eq 0 ]; then
+      PROBE_STATUS="ok"
       log "health probe OK (attempt ${attempt}, status ${code})"
       echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
       return 0
@@ -293,6 +384,7 @@ health_probe() {
     attempt=$((attempt + 1))
     [ "$attempt" -le "$HEALTHCHECK_RETRIES" ] && sleep "$HEALTHCHECK_INTERVAL"
   done
+  PROBE_STATUS="failed"
   echo "[deploy][evidence] probe-attempts: ${probe_attempts}"
   return 1
 }
@@ -432,11 +524,15 @@ do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good="" compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
+  local prev_good="" prev_good_digest="" rollback_ref=""
+  local compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
+  [ -f "$GOOD_DIGEST_FILE" ] && prev_good_digest="$(cat "$GOOD_DIGEST_FILE")"
 
   if [ "$prev_good" = "$GIT_SHA" ]; then
     log "this SHA already in last_good_tag; skip forward deploy; reconcile only"
+    record_last_good_identity "$ACR_IMAGE:$GIT_SHA"
+    DEPLOY_OUTCOME="skipped_already_deployed"
     event exit
     return 0
   fi
@@ -445,6 +541,8 @@ do_deploy() {
 
   if health_probe; then
     echo "$GIT_SHA" > "$GOOD_TAG_FILE"
+    record_last_good_identity "$ACR_IMAGE:$GIT_SHA"
+    DEPLOY_OUTCOME="deployed"
     log "deploy of ${GIT_SHA} healthy; recorded as last good"
     event exit
     return 0
@@ -479,25 +577,43 @@ do_deploy() {
     log "rolling back to previous good tag ${prev_good}"
     rollback_rc=0
     ROLLBACK_MODE=1
-    deploy_tag "$prev_good" || rollback_rc=$?
+    rollback_ref="$ACR_IMAGE:$prev_good"
+    if [ -n "$prev_good_digest" ]; then
+      rollback_ref="$ACR_IMAGE@$prev_good_digest"
+      log "rolling back by last good digest $prev_good_digest"
+    fi
+    if [ -n "$prev_good_digest" ]; then
+      deploy_tag "$rollback_ref" || rollback_rc=$?
+    else
+      deploy_tag "$prev_good" || rollback_rc=$?
+    fi
     ROLLBACK_MODE=0
     if [ "$rollback_rc" -ne 0 ]; then
       log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
+      DEPLOY_OUTCOME="rollback_unhealthy"
+      IMAGE_DIGEST="$prev_good_digest"
       event exit
       return 4
     fi
     if health_probe; then
       # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
+      DEPLOY_OUTCOME="rolled_back"
+      IMAGE_DIGEST="$prev_good_digest"
+      IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
       log "rollback to ${prev_good} complete; old version passed the same-budget health probe"
       event exit
       return 1
     fi
     log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
     oneshot_schema_hint
+    DEPLOY_OUTCOME="rollback_unhealthy"
+    IMAGE_DIGEST="$prev_good_digest"
+    IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
     event exit
     return 4
   else
     log "no previous good tag to roll back to"
+    DEPLOY_OUTCOME="rollback_unhealthy"
     event exit
     return 4
   fi
@@ -580,14 +696,26 @@ fi
 # opt-out 路径:busy-lock if 块整体跳过,fd 9 尚未加锁,这一行就是原来的行为——
 # 阻塞直到这台主机的部署锁空闲。
 flock 9
-do_deploy
-rc=$?
+rc=0
+do_deploy || rc=$?
 if [ "$rc" -eq 0 ]; then
   log "image reconcile starting (host lock still held)"
   if ! reconcile_deployed_image; then
     echo "::error::image reconcile assertion failed; deployment may have succeeded, but production image identity is not proven" >&2
+    DEPLOY_OUTCOME="reconcile_failed"
     rc=5
   fi
+fi
+if [ -z "$DEPLOY_OUTCOME" ]; then
+  case "$rc" in
+    0) DEPLOY_OUTCOME="deployed" ;;
+    1) DEPLOY_OUTCOME="rolled_back" ;;
+    4) DEPLOY_OUTCOME="rollback_unhealthy" ;;
+    5) DEPLOY_OUTCOME="reconcile_failed" ;;
+  esac
+fi
+if [ -n "$DEPLOY_OUTCOME" ]; then
+  write_deploy_result "$DEPLOY_OUTCOME"
 fi
 flock -u 9
 # fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于

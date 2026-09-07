@@ -60,6 +60,18 @@ exit 0
 """
 
 
+def _mock_docker_with_digest(log_path: Path, digest: str) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$*" == *"{{index .RepoDigests 0}}"* ]]; then
+  printf '%s\\n' "registry.example.com/ns/demo@{digest}"
+  exit 0
+fi
+{_reconcile_ok_bash()}
+exit 0
+"""
+
+
 def _mock_curl(status: str) -> str:
     # mimics: curl -s -o /dev/null -w '%{{http_code}}' ... -> prints an HTTP code
     return f"""#!/bin/bash
@@ -196,6 +208,23 @@ def test_healthy_deploy_succeeds_and_records_good_tag(tmp_path):
     assert good.read_text().strip() == "abc1234"
 
 
+def test_healthy_deploy_records_last_good_digest(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_with_digest(Path(env["DOCKER_LOG"]), "sha256:gooddigest"),
+    )
+
+    res = _run(env)
+    assert res.returncode == 0, res.stdout + res.stderr
+
+    digest = Path(env["STATE_DIR"]) / "last_good_digest"
+    assert digest.exists()
+    assert digest.read_text().strip() == "sha256:gooddigest"
+
+
 def test_deploys_immutable_git_sha_tag(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
@@ -232,6 +261,54 @@ def test_probe_failure_triggers_rollback(tmp_path):
     # the failed tag must NOT be promoted to last good
     good = (Path(env_bad["STATE_DIR"]) / "last_good_tag").read_text().strip()
     assert good == "abc1234", f"last good tag must stay abc1234, got {good}"
+
+
+@pytest.mark.parametrize(
+    ("digest_file", "expected_pull"),
+    [
+        (
+            "sha256:oldgood",
+            "pull registry.example.com/ns/demo@sha256:oldgood",
+        ),
+        (None, "pull registry.example.com/ns/demo:old1111"),
+        ("", "pull registry.example.com/ns/demo:old1111"),
+    ],
+    ids=["digest-first", "missing-digest-falls-back-to-tag", "empty-digest-falls-back-to-tag"],
+)
+def test_rollback_prefers_last_good_digest_and_falls_back_to_tag(
+    tmp_path, digest_file, expected_pull
+):
+    """回滚优先拉 digest；digest 缺失或为空时保留旧 tag 路径。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="500")
+    env["GIT_SHA"] = "new2222"
+    good_dir = Path(env["STATE_DIR"])
+    good_dir.mkdir(parents=True)
+    (good_dir / "last_good_tag").write_text("old1111\n")
+    if digest_file is not None:
+        (good_dir / "last_good_digest").write_text(digest_file + "\n")
+
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(
+            tmp_path / "curl-attempts.log",
+            [("500", 0), ("500", 0), ("200", 0)],
+        ),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    assert expected_pull in docker_log
+    if digest_file:
+        assert "pull registry.example.com/ns/demo:old1111" not in docker_log
+        assert (good_dir / "last_good_digest").read_text().strip() == digest_file
 
 
 def test_probe_failure_without_previous_good_just_fails(tmp_path):
