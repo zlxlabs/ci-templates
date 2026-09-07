@@ -469,6 +469,7 @@ jobs:
           PROBE_FINAL_CODE: ${{ steps.deploy.outputs.probe_final_code }}
           PROBE_ATTEMPTS: ${{ steps.deploy.outputs.probe_attempts }}
           PROBE_ELAPSED_S: ${{ steps.deploy.outputs.probe_elapsed_s }}
+          OUTCOME: ${{ steps.deploy.outputs.outcome }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
@@ -478,6 +479,7 @@ jobs:
           [ -n "$PROBE_FINAL_CODE" ] || missing="${missing:+$missing,}probe_final_code"
           [ -n "$PROBE_ATTEMPTS" ] || missing="${missing:+$missing,}probe_attempts"
           [ -n "$PROBE_ELAPSED_S" ] || missing="${missing:+$missing,}probe_elapsed_s"
+          [ -n "$OUTCOME" ] || missing="${missing:+$missing,}outcome"
           if [ -n "$missing" ]; then
             echo "::warning::success receipt skipped: ${missing}"
             exit 0
@@ -506,12 +508,14 @@ jobs:
           probe_final_code = os.environ["PROBE_FINAL_CODE"]
           probe_attempts = os.environ["PROBE_ATTEMPTS"]
           probe_elapsed_s = os.environ["PROBE_ELAPSED_S"]
+          outcome = os.environ["OUTCOME"]
           run_url = os.environ["RUN_URL"]
           body = (f"服务 {svc} · 目标机 {host}\n"
                   f"仓库 {repo} · SHA {sha}\n"
                   f"镜像 digest {image_digest}\n"
                   f"探针 status={probe_status} · final_code={probe_final_code} · "
-                  f"attempts={probe_attempts} · elapsed_s={probe_elapsed_s}\n"
+                  f"attempts={probe_attempts} · elapsed_s={probe_elapsed_s} · "
+                  f"outcome={outcome}\n"
                   f"部署成功，镜像对账已通过。\n"
                   f"Run: {run_url}")
           card = {

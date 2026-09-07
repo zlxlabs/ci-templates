@@ -257,9 +257,21 @@ exit 0
         for step in _load()[0]["jobs"]["build-deploy"]["steps"]
         if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
     )
-    assert success["env"]["PROBE_FINAL_CODE"] == (
-        "${{ steps.deploy.outputs.probe_final_code }}"
-    )
+    assert success["env"] == {
+        "FEISHU_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}",
+        "FEISHU_TITLE_PREFIX": "${{ vars.FEISHU_CI_TITLE_PREFIX }}",
+        "SVC": "${{ inputs.image_name }}",
+        "HOST": "${{ inputs.host }}",
+        "REPO": "${{ github.repository }}",
+        "SHA": "${{ steps.sha.outputs.git_sha }}",
+        "IMAGE_DIGEST": "${{ steps.deploy.outputs.image_digest }}",
+        "PROBE_STATUS": "${{ steps.deploy.outputs.probe_status }}",
+        "PROBE_FINAL_CODE": "${{ steps.deploy.outputs.probe_final_code }}",
+        "PROBE_ATTEMPTS": "${{ steps.deploy.outputs.probe_attempts }}",
+        "PROBE_ELAPSED_S": "${{ steps.deploy.outputs.probe_elapsed_s }}",
+        "OUTCOME": "${{ steps.deploy.outputs.outcome }}",
+        "RUN_URL": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+    }
 
 
 def test_success_receipt_card_is_opt_in_fail_open_and_complete():
@@ -279,7 +291,7 @@ def test_success_receipt_card_is_opt_in_fail_open_and_complete():
     assert "probe_status" in run
     for field in (
         "PROBE_FINAL_CODE", "PROBE_ATTEMPTS", "PROBE_ELAPSED_S",
-        "IMAGE_DIGEST", "RUN_URL",
+        "IMAGE_DIGEST", "OUTCOME", "RUN_URL",
     ):
         assert field in run
     assert "FEISHU_WEBHOOK" in run
@@ -336,6 +348,7 @@ exit 22
         "PROBE_FINAL_CODE": "200",
         "PROBE_ATTEMPTS": "1",
         "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
         "RUN_URL": "https://example.test/actions/runs/123",
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
     }
@@ -373,6 +386,7 @@ def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
         "PROBE_FINAL_CODE": "200",
         "PROBE_ATTEMPTS": "1",
         "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
         "RUN_URL": "https://example.test/actions/runs/123",
     }
     run = success["run"]
@@ -396,6 +410,7 @@ def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
         "contract-service", "contract-host", "zlxlabs/ci-templates",
         "0123456789ab", "sha256:contract", "status=ok",
         "final_code=200", "attempts=1", "elapsed_s=3",
+        "outcome=deployed",
     ):
         assert value in content
     assert payload["card"]["elements"][1]["actions"][0]["url"] == env["RUN_URL"]
@@ -424,6 +439,7 @@ def test_success_receipt_skips_without_digest_and_does_not_call_curl(tmp_path):
         "PROBE_FINAL_CODE": "200",
         "PROBE_ATTEMPTS": "1",
         "PROBE_ELAPSED_S": "3",
+        "OUTCOME": "deployed",
         "RUN_URL": "https://example.test/actions/runs/123",
         "GITHUB_OUTPUT": str(output),
         "PATH": f"{tmp_path}:{os.environ['PATH']}",
