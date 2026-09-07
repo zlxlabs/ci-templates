@@ -239,23 +239,37 @@ def test_real_deploy_stdout_is_the_receipt_parser_fixture(tmp_path):
     docker.write_text(
         f"""#!/bin/bash
 echo "$@" >> "{docker_log}"
-if [ "$1" = compose ] && [ "$2" = config ]; then
+if [ "$1" = pull ] && [ "$#" -eq 2 ]; then
+  exit 0
+fi
+if [ "$1" = tag ] && [ "$#" -eq 3 ]; then
+  exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = up ] && [ "$3" = -d ] && [ "$#" -eq 3 ]; then
+  exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = config ] && [ "$3" = --services ] && [ "$#" -eq 3 ]; then
   printf '%s\\n' app
   exit 0
 fi
-if [ "$1" = compose ] && [ "$2" = ps ] && [[ "$*" == *" -q "* ]]; then
+if [ "$1" = compose ] && [ "$2" = ps ] && [ "$3" = -q ] && [ "$4" = --status ] && [ "$5" = running ] && [ "$#" -ge 5 ]; then
   printf '%s\\n' cid-app
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ]; then
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\\n' registry.example.com/ns/demo@sha256:image
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ] && [ "$#" -eq 5 ]; then
   printf '%s\\n' sha256:image
   exit 0
 fi
-if [ "$1" = inspect ]; then
+if [ "$1" = inspect ] && [ "$3" = --format ] && [ "$#" -eq 4 ]; then
   printf '%s\\n' sha256:image
   exit 0
 fi
-exit 0
+echo "unexpected-docker: $*" >&2
+exit 97
 """
     )
     docker.chmod(0o755)

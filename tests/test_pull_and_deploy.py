@@ -36,6 +36,9 @@ fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q --status running"* ]]; then
   printf '{container}\\n'; exit 0
 fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = "--format" ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  exit 0
+fi
 if [ "$1" = image ] && [ "$2" = inspect ] && [[ "$*" == *"{{{{.Id}}}}"* ]]; then
   printf '{image_id}\\n'; exit 0
 fi
@@ -54,10 +57,14 @@ def _mock_docker(log_path: Path, compose_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
-if [ "$1" = "compose" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   sleep {compose_sleep}
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -69,7 +76,11 @@ if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$*" == *"{{index .RepoDiges
   exit 0
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -110,11 +121,21 @@ def _mock_docker_matrix(log_path: Path, fail_compose_on: int | None = None) -> s
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
 if [ "$1" = "compose" ]; then
+  if [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then exit 0; fi
+  if [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then exit 0; fi
+  if [ "$2" != "up" ] || [ "$3" != "-d" ] || [ "$#" -ne 3 ]; then
+    echo "unexpected-docker: $*" >&2
+    exit 97
+  fi
   count_file="{log_path}.compose-count"
   count=$(cat "$count_file" 2>/dev/null || echo 0)
   count=$((count + 1)); echo "$count" > "$count_file"{fail_clause}
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -122,15 +143,30 @@ def _mock_docker_evidence(log_path: Path, evidence_sleep: float = 0.0) -> str:
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
 if [ "$1" = "compose" ] && [[ " $* " == *" ps "* || " $* " == *" logs "* ]]; then
-  sleep {evidence_sleep}
+  if [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then
+    sleep {evidence_sleep}
+    printf '%s\n' 'new-container running'
+    exit 0
+  fi
+  if [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then
+    sleep {evidence_sleep}
+    printf '%s\n' 'new-container last-line'
+    exit 0
+  fi
 fi
-if [ "$1" = "compose" ] && [ "$2" = "ps" ]; then
-  printf '%s\n' 'new-container running'
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$4" = "--format" ] && [ "$5" = "{{.Id}}" ] && [ "$#" -eq 5 ]; then
+  printf '%s\n' 'sha256:image'
+  exit 0
 fi
-if [ "$1" = "compose" ] && [ "$2" = "logs" ]; then
-  printf '%s\n' 'new-container last-line'
+if [ "$1" = "inspect" ] && [ "$3" = "--format" ] && [ "$4" = "{{.Image}}" ] && [ "$#" -eq 4 ]; then
+  printf '%s\n' 'sha256:image'
+  exit 0
 fi
-exit 0
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -146,7 +182,11 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [[ "$3" == *old1111 || "$3" == *@sha256:oldgood ]]; then
   exit 1
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -219,6 +259,21 @@ def _run(env, extra=None, timeout=None):
 def test_script_exists_and_is_bash():
     assert SCRIPT.exists(), "pull_and_deploy.sh must exist"
     assert SCRIPT.read_text().startswith("#!"), "must have a shebang"
+
+
+def test_docker_fake_rejects_unexpected_subcommand(tmp_path):
+    docker = tmp_path / "docker"
+    _write_exec(docker, _mock_docker(tmp_path / "docker.log"))
+
+    result = subprocess.run(
+        [str(docker), "rm", "-f", "container"],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert result.returncode == 97
+    assert "unexpected-docker: rm -f container" in result.stderr
 
 
 def test_healthy_deploy_succeeds_and_records_good_tag(tmp_path):
@@ -539,7 +594,11 @@ if [ "$1" = "inspect" ]; then
   exit 0
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -819,12 +878,18 @@ def test_rollback_compose_failure_returns_rc4_and_keeps_last_good(tmp_path):
         mock_dir / "docker",
         f'''#!/bin/bash
 echo "$@" >> "{docker_log}"
-if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   count=$(cat "{compose_count}" 2>/dev/null || echo 0)
   count=$((count + 1)); echo "$count" > "{compose_count}"
   [ "$count" -eq 2 ] && exit 23
+  exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "ps" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "logs" ] && [ "$3" = "--tail" ] && [ "$4" = "100" ] && [ "$5" = "--no-color" ] && [ "$#" -eq 5 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 ''',
     )
 
@@ -886,7 +951,10 @@ fi
 if [ "$1" = "image" ] && [ "$2" = "inspect" ]; then
   exit {0 if image_local else 1}
 fi
-exit 0
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -1066,16 +1134,21 @@ def _mock_docker_admission_probe(log_path: Path) -> str:
     LOCK_SH 必然失败(admission 已关闭),没有 TOCTOU 窗口。
     """
     return f"""#!/bin/bash
-if [ "$1" = "compose" ]; then
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
   if flock -n -s "$BUSY_LOCK_FILE" true; then
     echo "sh_probe=open" >> "{log_path}"
   else
     echo "sh_probe=closed" >> "{log_path}"
   fi
+  echo "$@" >> "{log_path}"
+  exit 0
 fi
 echo "$@" >> "{log_path}"
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -1199,7 +1272,10 @@ if [ "$1" = "pull" ]; then
   exit 1
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
@@ -1472,11 +1548,15 @@ if [ "$1" = "pull" ]; then
   exit 1
 fi
 if [ "$1" = "tag" ]; then
-  [ "$2" = "{local_ref}" ] && exit 1
-  exit 0
+  [ "$#" -eq 3 ] && [ "$2" = "{local_ref}" ] && exit 1
+  [ "$#" -eq 3 ] && [ "$2" = "{acr_ref}" ] && exit 0
+  echo "unexpected-docker: $*" >&2
+  exit 97
 fi
 {_reconcile_ok_bash()}
-exit 0
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """,
     )
     env["LOCAL_IMAGE"] = "local.example:5001/ns/demo"
@@ -1521,23 +1601,34 @@ def _mock_docker_oneshot(log_path: Path) -> str:
     service_lines = "\\n".join(COMPOSE_ONESHOT_SERVICES)
     return f"""#!/bin/bash
 echo "$@" >> "{log_path}"
-if [ "$1" = "compose" ] && [[ " $* " == *" config --services "* ]]; then
+if [ "$1" = "compose" ] && [ "$2" = "config" ] && [ "$3" = "--services" ] && [ "$#" -eq 3 ]; then
   printf '{service_lines}\\n'
   exit 0
 fi
-if [ "$1" = "compose" ] && [[ " $* " == *" ps -q --status running"* ]]; then
+if [ "$1" = "compose" ] && [ "$2" = "ps" ] && [ "$3" = "-q" ] && [ "$4" = "--status" ] && [ "$5" = "running" ] && [ "$#" -ge 5 ]; then
   printf 'cid-app\\n'
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = "--format" ] && [ "$4" = "{{{{index .RepoDigests 0}}}}" ] && [ "$#" -eq 5 ]; then
+  printf 'registry.example.com/ns/demo@sha256:deadbeef\\n'
+  exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = "--format" ] && [ "$#" -eq 5 ]; then
   printf '{RECONCILE_IMAGE_ID}\\n'
   exit 0
 fi
-if [ "$1" = inspect ] && [[ " $* " == *" --format "* ]]; then
+if [ "$1" = inspect ] && [ "$3" = "--format" ] && [ "$#" -eq 4 ]; then
   printf '{RECONCILE_IMAGE_ID}\\n'
   exit 0
 fi
-exit 0
+if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
+  [ "$#" -eq 3 ] && exit 0
+  [ "$#" -eq 4 ] && [ "$4" = "app" ] && exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
 """
 
 
