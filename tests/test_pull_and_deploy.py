@@ -351,8 +351,8 @@ def test_missing_deploy_outcome_is_internal_error_and_skips_receipt(tmp_path):
 
     assert result.returncode == 1, result.stdout + result.stderr
     assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
-    assert "::error::internal invariant violation" in result.stderr
-    assert "do_deploy returned without setting DEPLOY_OUTCOME" in result.stderr
+    assert "::error::internal invariant violation" in result.stdout
+    assert "do_deploy returned without setting DEPLOY_OUTCOME" in result.stdout
 
 
 def test_missing_success_deploy_outcome_skips_reconcile_and_receipt(tmp_path):
@@ -380,7 +380,7 @@ def test_missing_success_deploy_outcome_skips_reconcile_and_receipt(tmp_path):
     out = result.stdout + result.stderr
     assert result.returncode == 0, out
     assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
-    assert "::error::internal invariant violation" in result.stderr
+    assert "::error::internal invariant violation" in result.stdout
     assert "image reconcile starting" not in out
     assert "image reconcile assertion failed" not in out
     assert "[deploy][evidence] result-json:" not in out
