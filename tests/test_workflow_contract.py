@@ -289,6 +289,73 @@ def test_success_receipt_card_is_opt_in_fail_open_and_complete():
     assert "镜像对账已通过" in run
 
 
+def test_success_receipt_diagnostics_do_not_echo_response_body():
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    run = success["run"]
+
+    assert "response_file" in run
+    assert "curl_rc=" in run
+    assert "http_status=" in run
+    assert "response={raw" not in run
+    assert "response:-no response" not in run
+    assert "response parser failed" in run
+
+
+def test_success_receipt_request_failure_reports_status_without_body(tmp_path):
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    fake_curl = tmp_path / "curl"
+    fake_curl.write_text(
+        """#!/bin/bash
+output=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi
+done
+printf '%s' '{"code":13,"msg":"sensitive response body"}' > "$output"
+printf '%s' '502'
+exit 22
+"""
+    )
+    fake_curl.chmod(0o755)
+    env = os.environ | {
+        "FEISHU_WEBHOOK": "https://example.test/webhook",
+        "FEISHU_TITLE_PREFIX": "[contract]",
+        "SVC": "contract-service",
+        "HOST": "contract-host",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "0123456789ab",
+        "IMAGE_DIGEST": "sha256:contract",
+        "PROBE_STATUS": "ok",
+        "PROBE_FINAL_CODE": "200",
+        "PROBE_ATTEMPTS": "1",
+        "PROBE_ELAPSED_S": "3",
+        "RUN_URL": "https://example.test/actions/runs/123",
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+
+    completed = subprocess.run(
+        ["bash", "-c", success["run"]],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    output = completed.stdout + completed.stderr
+    assert "curl_rc=22" in output
+    assert "http_status=502" in output
+    assert "sensitive response body" not in output
+    assert '"code":13' not in output
+
+
 def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
     raw, _ = _load()
     success = next(
