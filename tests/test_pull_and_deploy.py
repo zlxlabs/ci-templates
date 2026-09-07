@@ -355,6 +355,37 @@ def test_missing_deploy_outcome_is_internal_error_and_skips_receipt(tmp_path):
     assert "do_deploy returned without setting DEPLOY_OUTCOME" in result.stderr
 
 
+def test_missing_success_deploy_outcome_skips_reconcile_and_receipt(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    docker = Path(env["DOCKER_BIN"])
+    body = docker.read_text().split("\n", 1)[1]
+    _write_exec(
+        docker,
+        "#!/bin/bash\n"
+        'if [ "$1" = inspect ]; then printf \'sha256:OTHER\\n\'; exit 0; fi\n'
+        + body,
+    )
+    script = tmp_path / "pull_and_deploy.sh"
+    script_text = SCRIPT.read_text().replace(
+        '    DEPLOY_OUTCOME="deployed"\n', '    DEPLOY_OUTCOME=""\n', 1
+    )
+    _write_exec(script, script_text)
+
+    result = subprocess.run(
+        ["bash", str(script)], env=env, capture_output=True, text=True, check=False
+    )
+
+    out = result.stdout + result.stderr
+    assert result.returncode == 0, out
+    assert not (Path(env["STATE_DIR"]) / "last_deploy_result.json").exists()
+    assert "::error::internal invariant violation" in result.stderr
+    assert "image reconcile starting" not in out
+    assert "image reconcile assertion failed" not in out
+    assert "[deploy][evidence] result-json:" not in out
+
+
 def test_deploys_immutable_git_sha_tag(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()

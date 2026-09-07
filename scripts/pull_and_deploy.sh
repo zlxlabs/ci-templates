@@ -716,17 +716,17 @@ fi
 flock 9
 rc=0
 do_deploy || rc=$?
-if [ "$rc" -eq 0 ]; then
-  log "image reconcile starting (host lock still held)"
-  if ! reconcile_deployed_image; then
-    echo "::error::image reconcile assertion failed; deployment may have succeeded, but production image identity is not proven" >&2
-    DEPLOY_OUTCOME="reconcile_failed"
-    rc=5
-  fi
-fi
 if [ -z "$DEPLOY_OUTCOME" ]; then
   echo "::error::internal invariant violation: do_deploy returned without setting DEPLOY_OUTCOME (rc=${rc}); deploy result receipt will not be written" >&2
 else
+  if [ "$rc" -eq 0 ]; then
+    log "image reconcile starting (host lock still held)"
+    if ! reconcile_deployed_image; then
+      echo "::error::image reconcile assertion failed; deployment may have succeeded, but production image identity is not proven" >&2
+      DEPLOY_OUTCOME="reconcile_failed"
+      rc=5
+    fi
+  fi
   write_deploy_result "$DEPLOY_OUTCOME" || echo "::error::failed to write deploy result" >&2
 fi
 flock -u 9
