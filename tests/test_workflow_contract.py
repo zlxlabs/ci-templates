@@ -264,9 +264,13 @@ if [ "$1" = image ] && [ "$2" = inspect ] && [ "$3" = --format ] && [ "$4" = "{{
   printf '%s\\n' sha256:image
   exit 0
 fi
-if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ] && [ "$#" -eq 5 ]; then
-  printf '%s\\n' sha256:image
-  exit 0
+if [ "$1" = image ] && [ "$2" = inspect ] && [ "$4" = --format ] && [ "$5" = "{{{{.Id}}}}" ] && [ "$#" -eq 5 ]; then
+  case "$3" in
+    registry.example.com/ns/demo:abc1234|demo:latest)
+      printf '%s\\n' sha256:image
+      exit 0
+      ;;
+  esac
 fi
 if [ "$1" = inspect ] && [ "$3" = --format ] && [ "$#" -eq 4 ]; then
   printf '%s\\n' sha256:image
@@ -277,6 +281,21 @@ exit 97
 """
     )
     docker.chmod(0o755)
+    unexpected = subprocess.run(
+        [
+            str(docker),
+            "image",
+            "inspect",
+            "registry.example.com/ns/demo:abc1234",
+            "--format",
+            "{{.Unexpected}}",
+        ],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert unexpected.returncode == 97
+    assert "unexpected-docker: image inspect registry.example.com/ns/demo:abc1234 --format {{.Unexpected}}" in unexpected.stderr
     curl = tmp_path / "curl"
     curl.write_text("#!/bin/bash\nprintf '200'\n")
     curl.chmod(0o755)
