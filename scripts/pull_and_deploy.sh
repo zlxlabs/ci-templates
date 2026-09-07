@@ -540,6 +540,7 @@ do_deploy() {
   deploy_tag "$GIT_SHA" || deploy_rc=$?
   if [ "$deploy_rc" -ne 0 ]; then
     log "deploy of $GIT_SHA failed (rc=$deploy_rc)"
+    DEPLOY_OUTCOME="deploy_failed"
     event exit
     return "$deploy_rc"
   fi
@@ -712,15 +713,10 @@ if [ "$rc" -eq 0 ]; then
   fi
 fi
 if [ -z "$DEPLOY_OUTCOME" ]; then
-  case "$rc" in
-    0) DEPLOY_OUTCOME="deployed" ;;
-    1) DEPLOY_OUTCOME="rolled_back" ;;
-    4) DEPLOY_OUTCOME="rollback_unhealthy" ;;
-    5) DEPLOY_OUTCOME="reconcile_failed" ;;
-  esac
+  [ "$rc" -eq 0 ] || DEPLOY_OUTCOME="deploy_failed"
 fi
 if [ -n "$DEPLOY_OUTCOME" ]; then
-  write_deploy_result "$DEPLOY_OUTCOME"
+  write_deploy_result "$DEPLOY_OUTCOME" || log "failed to write deploy result"
 fi
 flock -u 9
 # fd 8(忙锁,若开启)必须活过整个 do_deploy()(含探针失败后的回滚),并且晚于

@@ -150,6 +150,30 @@ exit 0
 """
 
 
+def _mock_docker_forward_failure(log_path: Path, failing_call: str) -> str:
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  [ "{failing_call}" = pull ] && exit 1
+  [ "$#" -eq 2 ] && exit 0
+  exit 1
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$#" -eq 3 ]; then
+  exit 1
+fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then
+  [ "{failing_call}" = tag ] && exit 7
+  exit 0
+fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then
+  [ "{failing_call}" = compose ] && exit 23
+  exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+
+
 def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
               compose_sleep: float = 0.0) -> dict:
     docker_log = tmp_path / "docker.log"
@@ -224,6 +248,31 @@ def test_healthy_deploy_records_last_good_digest(tmp_path):
     digest = Path(env["STATE_DIR"]) / "last_good_digest"
     assert digest.exists()
     assert digest.read_text().strip() == "sha256:gooddigest"
+
+
+@pytest.mark.parametrize(
+    ("failing_call", "expected_rc"),
+    [("pull", 1), ("compose", 23)],
+    ids=["forward-pull-fails", "forward-compose-fails"],
+)
+def test_forward_deploy_failure_writes_deploy_failed_receipt(tmp_path, failing_call, expected_rc):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), failing_call),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == expected_rc, result.stdout + result.stderr
+    receipt_file = Path(env["STATE_DIR"]) / "last_deploy_result.json"
+    assert receipt_file.exists()
+    receipt = json.loads(receipt_file.read_text())
+    assert receipt["outcome"] == "deploy_failed"
+    assert result.stdout.count("[deploy][evidence] result-json:") == 1
 
 
 def test_deploys_immutable_git_sha_tag(tmp_path):
