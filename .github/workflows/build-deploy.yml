@@ -318,6 +318,7 @@ jobs:
           for key, value in (
               ("image_digest", result["image_digest"]),
               ("probe_status", probe["status"]),
+              ("probe_final_code", probe["final_code"]),
               ("probe_attempts", probe["attempts"]),
               ("probe_elapsed_s", probe["elapsed_s"]),
               ("outcome", result["outcome"]),

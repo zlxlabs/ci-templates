@@ -230,6 +230,7 @@ exit 0
     outputs = {
         "image_digest": receipt["image_digest"],
         "probe_status": receipt["probe"]["status"],
+        "probe_final_code": receipt["probe"]["final_code"],
         "probe_attempts": receipt["probe"]["attempts"],
         "probe_elapsed_s": receipt["probe"]["elapsed_s"],
         "outcome": receipt["outcome"],
@@ -237,6 +238,7 @@ exit 0
     assert outputs == {
         "image_digest": "sha256:image",
         "probe_status": "ok",
+        "probe_final_code": "200",
         "probe_attempts": 1,
         "probe_elapsed_s": 0,
         "outcome": "deployed",
@@ -249,6 +251,15 @@ exit 0
     assert "result_json" in deploy_run
     for key, value in outputs.items():
         assert f'("{key}",' in deploy_run
+
+    success = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+    )
+    assert success["env"]["PROBE_FINAL_CODE"] == (
+        "${{ steps.deploy.outputs.probe_final_code }}"
+    )
 
 
 def test_success_receipt_card_is_opt_in_fail_open_and_complete():
