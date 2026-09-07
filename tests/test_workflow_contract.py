@@ -8,9 +8,11 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import sys
 
+import pytest
 import yaml
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -161,6 +163,73 @@ def test_deploy_result_evidence_is_parsed_into_step_outputs():
     assert "result_json=\"${line:${#result_prefix}}\"" in run
     assert "remote_output=\"$(\n" in run
     assert "printf '%s\\n' \"$remote_output\"" in run
+
+
+@pytest.mark.parametrize(
+    ("name", "evidence", "remote_rc"),
+    [
+        ("missing-result-json", "remote log without receipt", 0),
+        ("missing-probe", '[deploy][evidence] result-json: {"outcome":"deployed"}', 1),
+        (
+            "missing-fields",
+            '[deploy][evidence] result-json: {"probe":{"status":"ok"}}',
+            255,
+        ),
+    ],
+    ids=lambda value: value[0] if isinstance(value, tuple) else str(value),
+)
+def test_deploy_once_preserves_remote_rc_when_evidence_is_malformed(
+    tmp_path, name, evidence, remote_rc
+):
+    deploy = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    fixture_end = run.index("\nattempt=1;")
+    fixture = (
+        run[:fixture_end]
+        + '\nrc=0; deploy_once || rc=$?; printf \'deploy_once_rc=%s\\n\' "$rc"; exit "$rc"\n'
+    )
+
+    scp = tmp_path / "scp"
+    scp.write_text("#!/bin/bash\nexit 0\n")
+    scp.chmod(0o755)
+    ssh = tmp_path / "ssh"
+    ssh.write_text(
+        f"#!/bin/bash\nprintf '%s\\n' {shlex.quote(evidence)}\nexit {remote_rc}\n"
+    )
+    ssh.chmod(0o755)
+    output = tmp_path / "github-output"
+    env = os.environ | {
+        "SSH_USER": "deploy",
+        "DEPLOY_HOST": "host.example",
+        "RUNNER_TEMP": str(tmp_path),
+        "GITHUB_REPOSITORY": "zlxlabs/ci-templates",
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(output),
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+
+    completed = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == remote_rc, (
+        f"{name}: expected remote rc {remote_rc}, got {completed.returncode}; "
+        f"stdout={completed.stdout!r}, stderr={completed.stderr!r}"
+    )
+    output_text = completed.stdout + completed.stderr
+    assert "deploy result evidence missing" in output_text or (
+        "deploy result evidence JSON parse failed" in output_text
+    )
+    assert f"deploy_once_rc={remote_rc}" in output_text
 
 
 def test_real_deploy_stdout_is_the_receipt_parser_fixture(tmp_path):
