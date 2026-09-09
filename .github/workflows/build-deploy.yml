@@ -50,6 +50,11 @@ on:
         required: false
         default: ""
         type: string
+      rollback_safety:
+        description: "Rollback policy from registry.yaml: safe, unsafe, or conditional"
+        required: false
+        default: "safe"
+        type: string
       healthcheck_expect_status:
         required: false
         default: "200"
@@ -251,6 +256,7 @@ jobs:
           HEALTHCHECK_RETRIES: ${{ inputs.healthcheck_retries }}
           HEALTHCHECK_INTERVAL: ${{ inputs.healthcheck_interval }}
           HEALTHCHECK_WARMUP: ${{ inputs.healthcheck_warmup }}
+          ROLLBACK_SAFETY: ${{ inputs.rollback_safety }}
           BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
           BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
           ONESHOT_SERVICES: ${{ inputs.oneshot_services }}
@@ -298,6 +304,40 @@ jobs:
           [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
           REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
 
+          rollback_safety="${ROLLBACK_SAFETY:-safe}"
+          case "$rollback_safety" in
+            safe)
+              DEPLOY_SCRIPT="$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh"
+              ;;
+            unsafe|conditional)
+              # Only an explicitly safe registry value permits automatic rollback;
+              # conditional has no workflow-level condition to prove it safe.
+              DEPLOY_SCRIPT="$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.rollback-safety.sh"
+              rollback_safety_guard='  if [ "${ROLLBACK_SAFETY:-safe}" != "safe" ]; then
+              rollback_safety="${ROLLBACK_SAFETY:-safe}"
+              log "rollback safety=${rollback_safety}; skipping automatic rollback"
+              DEPLOY_OUTCOME="rollback_skipped_${rollback_safety}"
+              event exit
+              return 4
+            fi'
+              if ! awk -v guard="$rollback_safety_guard" '
+                /^  if \[ -n "\$prev_good" \] && \[ "\$prev_good" != "\$GIT_SHA" \]; then$/ {
+                  printf "%s\n", guard
+                  found++
+                }
+                { print }
+                END { exit(found != 1) }
+              ' "$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh" > "$DEPLOY_SCRIPT"; then
+                echo "::error::failed to install rollback_safety guard in deploy script"
+                exit 1
+              fi
+              ;;
+            *)
+              echo "::error::invalid rollback_safety; expected safe, unsafe, or conditional"
+              exit 1
+              ;;
+          esac
+
           capture_deploy_result() {
             local remote_output="$1" result_prefix='[deploy][evidence] result-json: ' line result_json="" parsed=""
             while IFS= read -r line; do
@@ -335,7 +375,7 @@ jobs:
           }
 
           deploy_once() {
-            scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/pull_and_deploy.sh" \
+            scp $SSH_OPTS "$DEPLOY_SCRIPT" \
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             remote_output=""
             remote_rc=0
@@ -350,6 +390,7 @@ jobs:
                HEALTHCHECK_RETRIES='${HEALTHCHECK_RETRIES}' \
                HEALTHCHECK_INTERVAL='${HEALTHCHECK_INTERVAL}' \
                HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
+               ROLLBACK_SAFETY='${rollback_safety}' \
                BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
                BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
                ONESHOT_SERVICES='${ONESHOT_SERVICES}' \
@@ -390,7 +431,11 @@ jobs:
               if [ -n "$ONESHOT_SERVICES" ]; then
                 schema_hint=" This release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required."
               fi
-              echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required${schema_hint}"
+              if [ "$rollback_safety" != "safe" ]; then
+                echo "::error::deploy failed (rc=4); automatic rollback skipped per rollback_safety=${rollback_safety}, production may be unavailable — immediate host intervention required${schema_hint}"
+              else
+                echo "::error::deploy failed (rc=4); rollback health was not proven, production may be unavailable — immediate host intervention required${schema_hint}"
+              fi
               exit 4
             fi
             if [ "$rc" -eq 5 ]; then
