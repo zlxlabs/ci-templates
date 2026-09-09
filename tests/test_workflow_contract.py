@@ -145,6 +145,185 @@ def test_notify_on_success_input_is_optional_boolean_disabled_by_default():
     assert spec["default"] is False
 
 
+def test_rollback_safety_input_matches_registry_domain_and_defaults_to_safe():
+    _, trigger = _load()
+    spec = trigger["workflow_call"]["inputs"]["rollback_safety"]
+
+    assert spec["type"] == "string"
+    assert spec["required"] is False
+    assert spec["default"] == "safe"
+
+    text = WORKFLOW.read_text()
+    assert 'case "$rollback_safety" in' in text
+    for value in ("safe", "unsafe", "conditional"):
+        assert value in text
+
+
+def test_unsafe_rollback_safety_is_wired_and_skips_remote_auto_rollback(tmp_path):
+    deploy = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    assert deploy["env"]["ROLLBACK_SAFETY"] == "${{ inputs.rollback_safety }}"
+    assert "ROLLBACK_SAFETY='${rollback_safety}'" in run
+    assert "rollback_skipped_${rollback_safety}" in run
+    assert "automatic rollback skipped per rollback_safety=${rollback_safety}" in run
+
+    source_dir = tmp_path / "ci-templates" / "scripts"
+    source_dir.mkdir(parents=True)
+    source = source_dir / "pull_and_deploy.sh"
+    source.write_text(SCRIPT.read_text())
+    captured_script = tmp_path / "captured-script.sh"
+    ssh_args = tmp_path / "ssh-args"
+
+    scp = tmp_path / "scp"
+    scp.write_text(
+        """#!/bin/bash
+for arg in "$@"; do
+  case "$arg" in
+    "$RUNNER_TEMP"/ci-templates/scripts/*) cp "$arg" "$CAPTURED_SCRIPT" ;;
+  esac
+done
+exit 0
+"""
+    )
+    scp.chmod(0o755)
+    ssh = tmp_path / "ssh"
+    ssh.write_text(
+        """#!/bin/bash
+printf '%s\\n' "$@" > "$SSH_ARGS"
+printf '%s\\n' '[deploy][evidence] result-json: {"image_digest":"","probe":{"status":"failed","final_code":"500","attempts":1,"elapsed_s":0},"outcome":"rollback_skipped_unsafe"}'
+exit 4
+"""
+    )
+    ssh.chmod(0o755)
+    output = tmp_path / "github-output"
+
+    fixture = run
+    env = os.environ | {
+        "ACR_REGISTRY": "registry.example.com",
+        "ACR_NAMESPACE": "namespace",
+        "IMAGE_NAME": "demo",
+        "GIT_SHA": "abc1234",
+        "SSH_USER": "deploy",
+        "DEPLOY_HOST": "host.example",
+        "DEPLOY_DIR": str(tmp_path),
+        "RUNNER_TEMP": str(tmp_path),
+        "LOCAL_REGISTRY": "",
+        "HEALTHCHECK_URL": "http://localhost/health",
+        "HEALTHCHECK_EXPECT_STATUS": "200",
+        "HEALTHCHECK_RETRIES": "1",
+        "HEALTHCHECK_INTERVAL": "0",
+        "HEALTHCHECK_WARMUP": "0",
+        "BUSY_LOCK_FILE": "",
+        "BUSY_LOCK_TIMEOUT": "600",
+        "ONESHOT_SERVICES": "",
+        "CAPTURED_SCRIPT": str(captured_script),
+        "SSH_ARGS": str(ssh_args),
+        "ROLLBACK_SAFETY": "unsafe",
+        "GITHUB_REPOSITORY": "zlxlabs/ci-templates",
+        "GITHUB_RUN_ID": "123",
+        "GITHUB_RUN_ATTEMPT": "1",
+        "GITHUB_OUTPUT": str(output),
+        "PATH": f"{tmp_path}:{os.environ['PATH']}",
+    }
+    completed = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+
+    assert completed.returncode == 4, completed.stdout + completed.stderr
+    assert "automatic rollback skipped per rollback_safety=unsafe" in completed.stdout
+    assert captured_script.exists(), "scp must receive the guarded script payload"
+    guarded = captured_script.read_text()
+    assert guarded != source.read_text(), "unsafe input must alter only the uploaded script copy"
+    assert 'DEPLOY_OUTCOME="rollback_skipped_${rollback_safety}"' in guarded
+    assert "ROLLBACK_SAFETY='unsafe'" in ssh_args.read_text()
+
+    safe_captured = tmp_path / "safe-captured-script.sh"
+    safe_result = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env | {
+            "ROLLBACK_SAFETY": "safe",
+            "CAPTURED_SCRIPT": str(safe_captured),
+        },
+        check=False,
+    )
+    assert safe_result.returncode == 4, safe_result.stdout + safe_result.stderr
+    assert safe_captured.read_bytes() == source.read_bytes(), (
+        "safe/default input must upload the original deploy script unchanged"
+    )
+
+    conditional_result = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env | {"ROLLBACK_SAFETY": "conditional"},
+        check=False,
+    )
+    assert conditional_result.returncode == 4
+    assert "automatic rollback skipped per rollback_safety=conditional" in conditional_result.stdout
+    assert captured_script.read_text() != source.read_text()
+
+    docker_log = tmp_path / "docker.log"
+    docker = tmp_path / "docker"
+    docker.write_text(
+        """#!/bin/bash
+echo "$@" >> "$DOCKER_LOG"
+if [ "$1" = pull ] || [ "$1" = tag ]; then exit 0; fi
+if [ "$1" = compose ] && [ "$2" = up ]; then exit 0; fi
+if [ "$1" = compose ] && [ "$2" = ps ]; then exit 0; fi
+if [ "$1" = compose ] && [ "$2" = logs ]; then exit 0; fi
+echo "unexpected docker command: $*" >&2
+exit 97
+"""
+    )
+    docker.chmod(0o755)
+    curl = tmp_path / "curl"
+    curl.write_text("#!/bin/bash\nprintf '500'\n")
+    curl.chmod(0o755)
+    deploy_dir = tmp_path / "app"
+    deploy_dir.mkdir()
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    (state_dir / "last_good_tag").write_text("old1111\n")
+    script_env = env | {
+        "ACR_IMAGE": "registry.example.com/namespace/demo",
+        "STATE_DIR": str(state_dir),
+        "HOST_LOCK": str(tmp_path / "host.lock"),
+        "DOCKER_BIN": str(docker),
+        "DOCKER_LOG": str(docker_log),
+        "CURL_BIN": str(curl),
+        "DEPLOY_DIR": str(deploy_dir),
+        "PULL_RETRIES": "1",
+        "HEALTHCHECK_TIMEOUT": "1",
+        "EVIDENCE_TIMEOUT": "1",
+        "DEPLOY_ID": "rollback-safety-contract",
+    }
+    guarded_result = subprocess.run(
+        ["bash", str(captured_script)],
+        text=True,
+        capture_output=True,
+        env=script_env,
+        check=False,
+    )
+    assert guarded_result.returncode == 4, guarded_result.stdout + guarded_result.stderr
+    assert "rollback safety=unsafe; skipping automatic rollback" in guarded_result.stdout
+    receipt = json.loads((state_dir / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_skipped_unsafe"
+    assert [
+        line for line in docker_log.read_text().splitlines()
+        if line == "compose up -d"
+    ] == ["compose up -d"], "unsafe probe failure must not run a second compose up"
+
+
 def test_deploy_result_evidence_is_parsed_into_step_outputs():
     raw, _ = _load()
     deploy = next(
