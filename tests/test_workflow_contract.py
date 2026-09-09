@@ -261,6 +261,17 @@ exit 4
         "safe/default input must upload the original deploy script unchanged"
     )
 
+    conditional_result = subprocess.run(
+        ["bash", "-c", fixture],
+        text=True,
+        capture_output=True,
+        env=env | {"ROLLBACK_SAFETY": "conditional"},
+        check=False,
+    )
+    assert conditional_result.returncode == 4
+    assert "automatic rollback skipped per rollback_safety=conditional" in conditional_result.stdout
+    assert captured_script.read_text() != source.read_text()
+
     docker_log = tmp_path / "docker.log"
     docker = tmp_path / "docker"
     docker.write_text(
