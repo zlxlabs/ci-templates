@@ -726,6 +726,45 @@ def test_deploy_result_is_valid_and_emitted_once_for_each_outcome(
         assert payload["image_digest"] == prev_digest
 
 
+@pytest.mark.parametrize(
+    "result_preexists",
+    [False, True],
+    ids=["receipt-absent-first-write", "receipt-preexists-replace"],
+)
+def test_deploy_result_atomic_publish_first_write_and_replace(tmp_path, result_preexists):
+    """点名锁死 write_deploy_result() 原子发布的两条路径：目标不存在（首次部署）
+    与目标已存在（mktemp + mv -f 原子替换）。issue #55 订正评论指出此前只有
+    前者被顺带走到、从未被点名断言；两种情形都必须产出同一份回执字节，
+    且不在 STATE_DIR 留下 .tmp.* 残留。"""
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    state = Path(env["STATE_DIR"])
+    if result_preexists:
+        state.mkdir(parents=True)
+        (state / "last_deploy_result.json").write_text(
+            '{"schema_version":1,"outcome":"rolled_back","stale":true}\n'
+        )
+
+    result = _run(env)
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    emitted = [
+        line.split(": ", 1)[1]
+        for line in result.stdout.splitlines()
+        if line.startswith("[deploy][evidence] result-json: ")
+    ]
+    assert len(emitted) == 1
+    receipt_file = state / "last_deploy_result.json"
+    assert receipt_file.exists()
+    payload = json.loads(receipt_file.read_text())
+    assert payload["outcome"] == "deployed"
+    assert payload == json.loads(emitted[0])
+    assert not list(state.glob("last_deploy_result.json.tmp.*")), (
+        "atomic publish must not leave temporary files behind"
+    )
+
+
 def test_http_200_with_curl_timeout_is_unhealthy_and_rolls_back(tmp_path):
     mock_dir = tmp_path / "bin"
     mock_dir.mkdir()
