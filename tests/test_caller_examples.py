@@ -5,7 +5,6 @@ examples 是用户照抄的范例 —— 漏一个就让新服务"生成即部�
 契约钉死,例子漂移就 fail。
 """
 import json
-import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,7 +21,6 @@ EXPECTED_SECRETS = {
     "ACR_USERNAME", "ACR_PASSWORD", "SSH_DEPLOY_KEY", "KNOWN_HOSTS",
     "TS_AUTHKEY", "CI_TEMPLATES_PAT",
 }
-TS_IP = re.compile(r"^100\.\d{1,3}\.\d{1,3}\.\d{1,3}$")  # Tailscale CGNAT 段
 
 
 def _ship_with(path: Path):
@@ -45,11 +43,11 @@ def test_examples_pass_all_six_secrets():
         assert set(secrets.keys()) == EXPECTED_SECRETS, name
 
 
-def test_examples_host_is_tailscale_ip_not_alias():
+def test_examples_host_uses_tailscale_ip_placeholder():
     # runner 没有 ~/.ssh/config,host 必须是 tailnet 可达地址,不能是别名(如 host-1)
     for name in ("caller-workflow.yml", "canary-workflow.yml"):
         with_, _ = _ship_with(EXAMPLES / name)
-        assert TS_IP.match(str(with_["host"])), f"{name}: host 应是 Tailscale IP"
+        assert with_["host"] == "<tailscale-ip>", f"{name}: example must use a host placeholder"
         assert with_["host"] != "host-1", name
 
 
@@ -91,9 +89,9 @@ def test_release_example_passes_all_six_secrets():
     assert set(secrets.keys()) == EXPECTED_SECRETS
 
 
-def test_release_example_host_is_tailscale_ip_not_alias():
+def test_release_example_host_uses_tailscale_ip_placeholder():
     with_, _ = _release_ship_with()
-    assert TS_IP.match(str(with_["host"])), "release example: host 应是 Tailscale IP"
+    assert with_["host"] == "<tailscale-ip>", "release example must use a host placeholder"
     assert with_["host"] != "host-1"
 
 

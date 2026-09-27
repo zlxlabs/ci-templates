@@ -6,17 +6,17 @@
 # 给舰队第 3..50 个服务接入复用。
 #
 # 用法:
-#   scripts/set-fleet-secrets.sh <owner/repo> <deploy_host_ip> [ssh_key_path]
+#   scripts/set-fleet-secrets.sh <owner/repo> [ssh_key_path]
 # 例:
-#   scripts/set-fleet-secrets.sh your-org/your-service 100.64.0.1
+#   DEPLOY_HOST_IP='your-tailscale-ip' scripts/set-fleet-secrets.sh your-org/your-service
 #
-# 前置:.env 里要有 ACR_USERNAME / ACR_PASSWORD / GH_PAT_TOKEN / TS_AUTHKEY。
+# 前置:DEPLOY_HOST_IP 由调用环境提供；.env 里要有 ACR_USERNAME / ACR_PASSWORD / GH_PAT_TOKEN / TS_AUTHKEY。
 # TS_AUTHKEY 过期了用 TS_API_KEY 经 Tailscale API 重生成再写回 .env(见 README 轮换段)。
 set -euo pipefail
 
-REPO="${1:?用法: set-fleet-secrets.sh <owner/repo> <deploy_host_ip> [ssh_key_path]}"
-HOST_IP="${2:?缺 deploy_host_ip(Tailscale 100.x IP)}"
-SSH_KEY="${3:-$HOME/.ssh/id_ed25519}"
+REPO="${1:?用法: set-fleet-secrets.sh <owner/repo> [ssh_key_path]}"
+HOST_IP="${DEPLOY_HOST_IP:?缺少环境变量 DEPLOY_HOST_IP}"
+SSH_KEY="${2:-$HOME/.ssh/id_ed25519}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ENV_FILE="$SCRIPT_DIR/../.env"
