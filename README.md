@@ -93,7 +93,7 @@ jobs:
     uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
     with:
       image_name: web-api
-      host: 100.64.0.1           # Tailscale 可达 IP/MagicDNS（runner 无 ~/.ssh/config，不能用别名 host-1）
+      host: <tailscale-ip>           # Tailscale 可达 IP/MagicDNS（runner 无 ~/.ssh/config，不能用别名 host-1）
       ssh_user: deploy
       deploy_dir: /srv/automation/web-api
       healthcheck_url: http://localhost:8001/healthz
@@ -149,7 +149,7 @@ opt-in 用法，在 caller 的 `with:` 块加一个 input（不加则行为与�
 ```yaml
     with:
       # ...其余 input 照常...
-      local_registry: zlx-vm-work-i7-ci-runner.taile9071.ts.net:5001
+      local_registry: <local-registry-host>:5001
 ```
 
 开启后：

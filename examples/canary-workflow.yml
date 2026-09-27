@@ -10,7 +10,7 @@ jobs:
     uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@main
     with:
       image_name: canary-svc
-      host: 100.64.0.1          # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)
+      host: <tailscale-ip>          # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-1)
       ssh_user: deploy
       deploy_dir: /srv/automation/canary-svc
       healthcheck_url: http://localhost:9999/healthz
