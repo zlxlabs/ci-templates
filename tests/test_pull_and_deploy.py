@@ -2099,13 +2099,17 @@ def test_promoted_sha_reentry_pulls_missing_sha_before_reconcile(tmp_path):
 
     docker_calls = Path(env["DOCKER_LOG"]).read_text().splitlines()
     pull_indexes = [i for i, call in enumerate(docker_calls) if call.startswith("pull ")]
-    sha_inspect_indexes = [
+    precheck_indexes = [
+        i for i, call in enumerate(docker_calls)
+        if call.startswith("image inspect --format {{.Id}} registry.example.com/ns/demo:abc1234")
+    ]
+    reconcile_indexes = [
         i for i, call in enumerate(docker_calls)
         if call.startswith("image inspect registry.example.com/ns/demo:abc1234 --format {{.Id}}")
     ]
-    assert len(pull_indexes) == 1, docker_calls
-    assert len(sha_inspect_indexes) == 2, docker_calls
-    assert sha_inspect_indexes[0] < pull_indexes[0] < sha_inspect_indexes[1], docker_calls
+    assert len(pull_indexes) == len(reconcile_indexes) == 1, docker_calls
+    assert len(precheck_indexes) == 2, docker_calls
+    assert precheck_indexes[0] < pull_indexes[0] < precheck_indexes[1] < reconcile_indexes[0], docker_calls
 
 
 def test_promoted_sha_reentry_pull_failure_is_not_success(tmp_path):
