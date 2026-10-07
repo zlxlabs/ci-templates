@@ -428,6 +428,11 @@ jobs:
             fi
             if [ "$rc" -eq 4 ]; then
               echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
+              if [ "$rollback_safety" != "safe" ]; then
+                echo "rollback_skipped=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_skipped output"
+              else
+                echo "rollback_skipped=false" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_skipped output"
+              fi
               schema_hint=""
               if [ -n "$ONESHOT_SERVICES" ]; then
                 schema_hint=" This release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required."
@@ -715,6 +720,7 @@ jobs:
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
           SHA:     ${{ steps.sha.outputs.git_sha }}
+          ROLLBACK_SKIPPED: ${{ steps.deploy.outputs.rollback_skipped }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
@@ -732,11 +738,19 @@ jobs:
           repo    = os.environ["REPO"]
           sha     = os.environ.get("SHA", "") or "?"
           run_url = os.environ["RUN_URL"]
+          if os.environ["ROLLBACK_SKIPPED"] == "true":
+              rollback_status = "自动回滚未执行；不健康的新版本仍在运行。"
+              title_status = "自动回滚未执行"
+              next_action = "生产可能不可用，必须立即上机确认生产状态，并决定是否手动回滚。"
+          else:
+              rollback_status = "新版本健康探针失败,且回滚未能用同预算探针证明旧版本在应答。"
+              title_status = "回滚健康未证"
+              next_action = ("生产可能不可用，必须立即上机。请先查看回滚前现场证据"
+                             "(compose ps / 容器日志 / 探针 code 与 curl 退出码序列),再人工确认生产状态。")
           body = (f"服务 {svc} · 目标机 {host}\n"
                   f"仓库 {repo} · SHA {sha}\n"
-                  f"新版本健康探针失败,且回滚未能用同预算探针证明旧版本在应答。\n"
-                  f"生产可能不可用，必须立即上机。请先查看回滚前现场证据"
-                  f"(compose ps / 容器日志 / 探针 code 与 curl 退出码序列),再人工确认生产状态。\n"
+                  f"{rollback_status}\n"
+                  f"{next_action}\n"
                   f"点按钮看详情。\n"
                   f"<at id=all></at>")
           card = {
@@ -744,7 +758,7 @@ jobs:
               "card": {
                   "config": {"wide_screen_mode": True},
                   "header": {"template": "red",
-                             "title": {"tag": "plain_text", "content": f"🚨 {title_prefix} P0 回滚健康未证 · {svc}"}},
+                             "title": {"tag": "plain_text", "content": f"🚨 {title_prefix} P0 {title_status} · {svc}"}},
                   "elements": [
                       {"tag": "div", "text": {"tag": "lark_md", "content": body}},
                       {"tag": "action", "actions": [
