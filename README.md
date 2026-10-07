@@ -22,7 +22,7 @@ scripts/
 registry.schema.json    # registry 契约（JSON Schema draft 2020-12）
 registry.yaml           # 舰队 host→service 单一真相源
 examples/
-  caller-workflow.yml   # 服务仓 caller 模板（钉 @v1）
+  caller-workflow.yml   # 服务仓 caller 模板（钉 @v2）
   canary-workflow.yml   # canary 服务模板（钉 @main）
 tests/                  # pytest（schema + 部署逻辑 + workflow 契约）
 ```
@@ -90,13 +90,14 @@ on:
 
 jobs:
   ship:
-    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v1
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy.yml@v2
     with:
       image_name: web-api
       host: <tailscale-ip>           # Tailscale 可达 IP/MagicDNS（runner 无 ~/.ssh/config，不能用别名 host-1）
       ssh_user: deploy
       deploy_dir: /srv/automation/web-api
       healthcheck_url: http://localhost:8001/healthz
+      ci_templates_ref: v2
     secrets:                       # 6 个显式传，不用 inherit
       ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
       ACR_PASSWORD: ${{ secrets.ACR_PASSWORD }}
@@ -222,7 +223,7 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 | `rc=0` | 新版本已上线、通过健康探针**且通过三段镜像对账** | `deployed`（已部署）或 `skipped_already_deployed`（已是 last-good） | 新版本，已验证在应答 | 无需动作 |
 | `rc=1` | 新版本探针失败，已回滚，且**回滚后的同预算探针已通过**；若前向 pull/tag/compose 在探针和回滚前失败，则是另一种实际情况 | `rolled_back`；前向失败时为 `deploy_failed`，**不表示发生过回滚** | 前者为 `last_good` 且已验证；后者未证实 | 前者不需要紧急上机；后者按失败处置 |
 | `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | 空闲后点黄卡按钮重跑 |
-| `rc=4` | 新版本不健康，且脚本未能证明生产停在一个健康版本上 | `rollback_unhealthy` | 不确定，可能不可用 | **立即上机** |
+| `rc=4` | 新版本探针失败；`rollback_safety=safe` 时已回滚但同预算探针未证实旧版应答，非 `safe` 时自动回滚未执行 | `rollback_unhealthy`（safe）/ `rollback_skipped_<safety>`（非 safe） | safe：旧版是否应答未证实；非 safe：不健康的新版本仍在运行 | safe：先确认生产是否应答；非 safe：确认生产状态并决定是否手动回滚 |
 | `rc=5` | 探针已过、`last_good` 已推进、镜像对账失败 | `reconcile_failed` | 新版本在跑但身份未证明 | **立即上机核对**，不自动回滚，不要重跑 |
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | —（仅 release lane 定义） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
 | `rc=255` | SSH 传输层失败 | —（远端脚本未必执行） | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
@@ -390,7 +391,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | # | 契约 | 落点 |
 |---|------|------|
 | **A4** | secrets **显式声明，不 `inherit`** —— 只 6 个 secret 可见，最小权限 | `build-deploy.yml` `secrets:` 块 + `test_workflow_contract.py` |
-| 爆炸半径 | caller 钉 `@v1` 不钉 `@main`；canary 仓先吃 `@main`，验证后移 v1 tag | `examples/*` |
+| 爆炸半径 | 稳定 caller 钉 `@v2`；canary 先吃 `@main`，验证后手动推广 v2 | `examples/*` / [go-live runbook](docs/RUNBOOK-go-live.md) |
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
@@ -451,7 +452,7 @@ python -m pytest -q
 - `test_release_deploy.py` —— release lane 多镜像发布与整组回滚、回滚后探针、`rc=4` 分流（docker/curl mock，无需真实守护进程）。
 - `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
-- `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、caller 钉 `@v1` / canary 钉 `@main`。
+- `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、单镜像 caller 钉 `@v2` 且脚本 ref 同为 v2、canary 钉 `@main`。
 
 ## 端到端 / canary（需真实凭证与主机，未在本机执行）
 
@@ -461,20 +462,10 @@ python -m pytest -q
    `ACR_USERNAME` / `ACR_PASSWORD` / `SSH_DEPLOY_KEY` / `KNOWN_HOSTS` / `TS_AUTHKEY` / `CI_TEMPLATES_PAT`。
 2. 建一个低风险 canary 服务仓，用 `examples/canary-workflow.yml`（钉 `@main`）。
 3. push → 观察 build→ACR→SSH 部署→探针→（人为让探针失败）→自动回滚。
-4. 全绿后再 `git tag -f v1 && git push -f origin v1`，存量服务的 `@v1` caller 才吃到新流水线。
+4. 合并到 `main` 后先让 canary 实际部署验证；全绿后按 [go-live runbook](docs/RUNBOOK-go-live.md) 手动推广 v2。CI 全绿本身不等于推广完成。
 
 > ⚠️ 真实 canary 会向生产主机 `host-1` 部署并推 ACR，属对外不可逆操作，需人工授权后执行。
 
 ## 版本与爆炸半径
 
-- caller **必须钉 `@v1`**（主版本 tag），不钉 `@main`。
-- 只有 canary 仓吃 `@main`。验证通过后移动 `v1` tag 推平舰队。
-- 一个坏 commit 进 `@main` 只炸 canary 一个，不会一次炸 50 个部署。
-
-### 发布 `v1`（单人维护版）
-
-1. 合并修复到 `main`；让唯一 canary 服务继续引用 `@main`，推一次低风险变更。
-2. 在 Actions 确认 build、ACR、SSH、健康探针和回滚门均通过。
-3. `git tag -f v1 main && git push -f origin v1`；记录发布 SHA。引用 `@v1` 的服务在下次部署自动采用该版本。
-
-不要为单个服务的紧急修复移动 `v1`；该服务可临时钉具体 commit，待 canary 验证后再统一发布。
+稳定调用方的 `build-deploy.yml` 使用 `@v2`，并传 `ci_templates_ref: v2`；唯一 canary（url-parse-api）使用 `@main`，并传 `ci_templates_ref: main`。`@v2` 是会动的 tag：合并到 `main` 后先由 canary 实际部署验证，确认通过后再手动移动 `v2` 推广。完整推广节奏、回滚与历史记录以[部署 go-live runbook](docs/RUNBOOK-go-live.md)为唯一依据；不要逐仓改 caller 来推广版本。

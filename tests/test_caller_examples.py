@@ -28,11 +28,13 @@ def _ship_with(path: Path):
     return raw["jobs"]["ship"]["with"], raw["jobs"]["ship"]["secrets"]
 
 
-def test_caller_pins_v1_canary_pins_main():
+def test_caller_pins_v2_canary_pins_main():
     caller = yaml.safe_load((EXAMPLES / "caller-workflow.yml").read_text())
     canary = yaml.safe_load((EXAMPLES / "canary-workflow.yml").read_text())
-    assert caller["jobs"]["ship"]["uses"].endswith("build-deploy.yml@v1")
+    assert caller["jobs"]["ship"]["uses"].endswith("build-deploy.yml@v2")
+    assert caller["jobs"]["ship"]["with"]["ci_templates_ref"] == "v2"
     assert canary["jobs"]["ship"]["uses"].endswith("build-deploy.yml@main")
+    assert canary["jobs"]["ship"]["with"]["ci_templates_ref"] == "main"
 
 
 def test_examples_pass_all_six_secrets():
