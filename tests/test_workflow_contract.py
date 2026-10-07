@@ -239,6 +239,9 @@ exit 4
 
     assert completed.returncode == 4, completed.stdout + completed.stderr
     assert "automatic rollback skipped per rollback_safety=unsafe" in completed.stdout
+    unsafe_outputs = output.read_text().splitlines()
+    assert "rollback_unhealthy=true" in unsafe_outputs
+    assert "rollback_skipped=true" in unsafe_outputs
     assert captured_script.exists(), "scp must receive the guarded script payload"
     guarded = captured_script.read_text()
     assert guarded != source.read_text(), "unsafe input must alter only the uploaded script copy"
@@ -253,10 +256,14 @@ exit 4
         env=env | {
             "ROLLBACK_SAFETY": "safe",
             "CAPTURED_SCRIPT": str(safe_captured),
+            "GITHUB_OUTPUT": str(tmp_path / "safe-github-output"),
         },
         check=False,
     )
     assert safe_result.returncode == 4, safe_result.stdout + safe_result.stderr
+    safe_outputs = (tmp_path / "safe-github-output").read_text().splitlines()
+    assert "rollback_unhealthy=true" in safe_outputs
+    assert "rollback_skipped=false" in safe_outputs
     assert safe_captured.read_bytes() == source.read_bytes(), (
         "safe/default input must upload the original deploy script unchanged"
     )
@@ -265,11 +272,17 @@ exit 4
         ["bash", "-c", fixture],
         text=True,
         capture_output=True,
-        env=env | {"ROLLBACK_SAFETY": "conditional"},
+        env=env | {
+            "ROLLBACK_SAFETY": "conditional",
+            "GITHUB_OUTPUT": str(tmp_path / "conditional-github-output"),
+        },
         check=False,
     )
     assert conditional_result.returncode == 4
     assert "automatic rollback skipped per rollback_safety=conditional" in conditional_result.stdout
+    conditional_outputs = (tmp_path / "conditional-github-output").read_text().splitlines()
+    assert "rollback_unhealthy=true" in conditional_outputs
+    assert "rollback_skipped=true" in conditional_outputs
     assert captured_script.read_text() != source.read_text()
 
     docker_log = tmp_path / "docker.log"
@@ -322,6 +335,66 @@ exit 97
         line for line in docker_log.read_text().splitlines()
         if line == "compose up -d"
     ] == ["compose up -d"], "unsafe probe failure must not run a second compose up"
+
+
+def test_rc4_emergency_card_payload_distinguishes_skipped_and_unproven_rollback(tmp_path):
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    deploy = next(step for step in steps if step.get("id") == "deploy")
+    notification = next(step for step in steps if "回滚健康未证紧急卡" in step.get("name", ""))
+
+    assert 'echo "rollback_skipped=true"' in deploy["run"]
+    assert 'echo "rollback_skipped=false"' in deploy["run"]
+    assert notification["if"] == (
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'"
+    ), "both rc=4 cases must continue to send exactly one emergency card"
+    assert notification["env"]["ROLLBACK_SKIPPED"] == "${{ steps.deploy.outputs.rollback_skipped }}"
+
+    curl = tmp_path / "curl"
+    curl.write_text(
+        "#!/usr/bin/env python3\n"
+        "import os, sys\n"
+        "open(os.environ['FEISHU_PAYLOAD'], 'wb').write(sys.stdin.buffer.read())\n"
+        "print('{\\\"code\\\":0}')\n"
+    )
+    curl.chmod(0o755)
+    payloads = {}
+    for skipped in ("true", "false"):
+        payload_path = tmp_path / f"card-{skipped}.json"
+        result = subprocess.run(
+            ["bash", "-c", notification["run"]],
+            text=True,
+            capture_output=True,
+            env=os.environ | {
+                "FEISHU_WEBHOOK": "https://example.invalid/webhook",
+                "FEISHU_TITLE_PREFIX": "[test]",
+                "SVC": "demo",
+                "HOST": "host.example",
+                "REPO": "zlxlabs/ci-templates",
+                "SHA": "abc1234",
+                "RUN_URL": "https://example.invalid/run/1",
+                "ROLLBACK_SKIPPED": skipped,
+                "FEISHU_PAYLOAD": str(payload_path),
+                "PATH": f"{tmp_path}:{os.environ['PATH']}",
+            },
+            check=False,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        payloads[skipped] = json.loads(payload_path.read_text())
+
+    skipped_body = payloads["true"]["card"]["elements"][0]["text"]["content"]
+    unproven_body = payloads["false"]["card"]["elements"][0]["text"]["content"]
+    skipped_phrase = "自动回滚未执行；不健康的新版本仍在运行。"
+    unproven_phrase = "新版本健康探针失败,且回滚未能用同预算探针证明旧版本在应答。"
+    assert skipped_phrase in skipped_body
+    assert unproven_phrase not in skipped_body
+    assert "决定是否手动回滚" in skipped_body
+    assert "决定是否手动回滚" not in unproven_body
+    assert unproven_phrase in unproven_body
+    assert skipped_phrase not in unproven_body
+    assert "查看回滚前现场证据" in unproven_body
+    assert "查看回滚前现场证据" not in skipped_body
 
 
 def test_deploy_result_evidence_is_parsed_into_step_outputs():
@@ -774,7 +847,7 @@ def test_feishu_notifications_warn_on_each_delivery_failure_mode():
             "Feishu 回滚健康未证紧急卡",
             "failure() && steps.deploy.outputs.deferred != 'true' && "
             "steps.deploy.outputs.rollback_unhealthy == 'true'",
-            "dc9c201a123fc6b7a4937ed2ef382ee27b67bfc9e0ff8464d9ba35375cfa30b0",
+            "5caf77ff8da0d5e5a6554038124d0e50a2a86e73fd7b84332a30c3f98ac37ff9",
         ),
         "Feishu 部署延期卡 (deferred, fail-open)": (
             "Feishu 部署延期卡",
@@ -838,6 +911,7 @@ def test_feishu_notification_producers_emit_json_payload_for_curl():
         "REPO": "zlxlabs/ci-templates",
         "SHA": "0123456789ab",
         "RUN_URL": "https://example.test/actions/runs/123",
+        "ROLLBACK_SKIPPED": "false",
     }
 
     for step in raw["jobs"]["build-deploy"]["steps"]:
