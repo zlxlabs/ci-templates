@@ -2026,3 +2026,103 @@ def test_promoted_sha_reentry_skips_forward_and_reconciles_only(tmp_path):
     assert " up -d" not in log
     assert "compose up" not in log
     assert not any(line.split()[:1] == ["pull"] for line in log.splitlines())
+
+
+def _mock_docker_reentry_with_missing_sha(log_path: Path, marker: Path, *, pull_succeeds: bool) -> str:
+    pull_result = f'touch "{marker}"; exit 0' if pull_succeeds else "exit 1"
+    return f'''#!/bin/bash
+printf '%s\\n' "$*" >> "{log_path}"
+expected_ref="registry.example.com/ns/demo:abc1234"
+if [ "$1" = compose ] && [ "$2" = config ] && [ "$3" = --services ]; then
+  printf '%s\\n' app; exit 0
+fi
+if [ "$1" = compose ] && [ "$2" = ps ] && [ "$3" = -q ]; then
+  printf '%s\\n' cid-app; exit 0
+fi
+if [ "$1" = image ] && [ "$2" = inspect ]; then
+  if [[ "$*" == *"{{index .RepoDigests 0}}"* ]]; then
+    printf '%s\\n' 'registry.example.com/ns/demo@sha256:good'
+    exit 0
+  fi
+  inspect_ref=""
+  for arg in "$@"; do
+    case "$arg" in "$expected_ref"|demo:latest) inspect_ref="$arg";; esac
+  done
+  if [ "$inspect_ref" = demo:latest ]; then
+    printf '%s\\n' sha256:running
+    exit 0
+  fi
+  if [ "$inspect_ref" = "$expected_ref" ]; then
+    [ -e "{marker}" ] || exit 1
+    printf '%s\\n' sha256:running
+    exit 0
+  fi
+fi
+if [ "$1" = pull ] && [ "$2" = "$expected_ref" ]; then
+  {pull_result}
+fi
+if [ "$1" = inspect ] && [ "$2" = cid-app ] && [ "$3" = --format ]; then
+  printf '%s\\n' sha256:running; exit 0
+fi
+echo "unexpected-docker: $*" >&2
+exit 97
+'''
+
+
+def _reentry_missing_sha_env(tmp_path: Path, *, pull_succeeds: bool) -> dict:
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    state = Path(env["STATE_DIR"])
+    state.mkdir(parents=True)
+    (state / "last_good_tag").write_text(env["GIT_SHA"] + "\n")
+    marker = tmp_path / "sha-image-present"
+    _write_exec(
+        Path(env["DOCKER_BIN"]),
+        _mock_docker_reentry_with_missing_sha(
+            Path(env["DOCKER_LOG"]), marker, pull_succeeds=pull_succeeds
+        ),
+    )
+    env.update(PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    return env
+
+
+def test_promoted_sha_reentry_pulls_missing_sha_before_reconcile(tmp_path):
+    env = _reentry_missing_sha_env(tmp_path, pull_succeeds=True)
+
+    result = _run(env)
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "skip forward deploy; reconcile only" in output
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "skipped_already_deployed"
+
+    docker_calls = Path(env["DOCKER_LOG"]).read_text().splitlines()
+    pull_indexes = [i for i, call in enumerate(docker_calls) if call.startswith("pull ")]
+    precheck_indexes = [
+        i for i, call in enumerate(docker_calls)
+        if call.startswith("image inspect --format {{.Id}} registry.example.com/ns/demo:abc1234")
+    ]
+    reconcile_indexes = [
+        i for i, call in enumerate(docker_calls)
+        if call.startswith("image inspect registry.example.com/ns/demo:abc1234 --format {{.Id}}")
+    ]
+    assert len(pull_indexes) == len(reconcile_indexes) == 1, docker_calls
+    assert len(precheck_indexes) == 2, docker_calls
+    assert precheck_indexes[0] < pull_indexes[0] < precheck_indexes[1] < reconcile_indexes[0], docker_calls
+
+
+def test_promoted_sha_reentry_pull_failure_is_not_success(tmp_path):
+    env = _reentry_missing_sha_env(tmp_path, pull_succeeds=False)
+
+    result = _run(env)
+    output = result.stdout + result.stderr
+    assert result.returncode != 0, output
+    assert "pull failed 1x and registry.example.com/ns/demo:abc1234 not local — aborting" in output
+    assert "deployed" not in output and "skipped_already_deployed" not in output
+    receipt_path = Path(env["STATE_DIR"]) / "last_deploy_result.json"
+    assert receipt_path.exists()
+    receipt = json.loads(receipt_path.read_text())
+    assert receipt["outcome"] == "deploy_failed"
+    docker_calls = Path(env["DOCKER_LOG"]).read_text().splitlines()
+    assert sum(call.startswith("pull ") for call in docker_calls) == 1

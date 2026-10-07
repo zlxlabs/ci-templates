@@ -544,7 +544,17 @@ do_deploy() {
 
   if [ "$prev_good" = "$GIT_SHA" ]; then
     log "this SHA already in last_good_tag; skip forward deploy; reconcile only"
-    record_last_good_identity "$ACR_IMAGE:$GIT_SHA"
+    local expected_ref="$ACR_IMAGE:$GIT_SHA"
+    if ! "$DOCKER_BIN" image inspect --format '{{.Id}}' "$expected_ref" >/dev/null 2>&1; then
+      pull_image "$expected_ref" || deploy_rc=$?
+      if [ "$deploy_rc" -ne 0 ]; then
+        log "deploy of $GIT_SHA failed (rc=$deploy_rc)"
+        DEPLOY_OUTCOME=deploy_failed
+        event exit
+        return "$deploy_rc"
+      fi
+    fi
+    record_last_good_identity "$expected_ref"
     DEPLOY_OUTCOME="skipped_already_deployed"
     event exit
     return 0
