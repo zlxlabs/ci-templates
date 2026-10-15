@@ -214,6 +214,28 @@ exit 97
 """
 
 
+def _mock_docker_first_pull_fails(log_path: Path) -> str:
+    """Forward pull of the new SHA fails; later pulls (rollback) succeed."""
+    return f"""#!/bin/bash
+echo "$@" >> "{log_path}"
+if [ "$1" = "pull" ]; then
+  count_file="{log_path}.pull-count"
+  count=$(cat "$count_file" 2>/dev/null || echo 0)
+  count=$((count + 1)); echo "$count" > "$count_file"
+  [ "$count" -eq 1 ] && exit 1
+  [ "$#" -eq 2 ] && exit 0
+  exit 1
+fi
+if [ "$1" = "image" ] && [ "$2" = "inspect" ] && [ "$#" -eq 3 ]; then
+  exit 1
+fi
+if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
+if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ] && [ "$#" -eq 3 ]; then exit 0; fi
+echo "unexpected-docker: $*" >&2
+exit 97
+"""
+
+
 def _base_env(tmp_path: Path, *, mock_dir: Path, status: str = "200",
               compose_sleep: float = 0.0) -> dict:
     docker_log = tmp_path / "docker.log"
@@ -328,6 +350,93 @@ def test_forward_deploy_failure_writes_deploy_failed_receipt(tmp_path, failing_c
     receipt = json.loads(receipt_file.read_text())
     assert receipt["outcome"] == "deploy_failed"
     assert result.stdout.count("[deploy][evidence] result-json:") == 1
+    assert "rollback triggered by forward deploy failure" not in result.stdout
+    assert "rolling back to previous good tag" not in result.stdout
+
+
+def _seed_prev_good(env, tag="old1111"):
+    good = Path(env["STATE_DIR"]) / "last_good_tag"
+    good.parent.mkdir(parents=True, exist_ok=True)
+    good.write_text(tag + "\n")
+    return good
+
+
+def test_compose_up_failure_with_prev_good_rolls_back_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["GIT_SHA"] = "new2222"
+    good = _seed_prev_good(env)
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(tmp_path / "curl-attempts.log", [("200", 0)]),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_matrix(Path(env["DOCKER_LOG"]), fail_compose_on=1),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "rollback triggered by forward deploy failure" in result.stdout
+    assert "rollback to old1111 complete" in result.stdout
+    assert good.read_text().strip() == "old1111"
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rolled_back"
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    assert "pull registry.example.com/ns/demo:new2222" in docker_log
+    assert "pull registry.example.com/ns/demo:old1111" in docker_log
+
+
+def test_pull_failure_with_prev_good_rolls_back_keeps_last_good(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env.update(GIT_SHA="new2222", PULL_RETRIES="1", PULL_RETRY_DELAY="0")
+    good = _seed_prev_good(env)
+    _write_exec(
+        mock_dir / "curl",
+        _mock_curl_sequence(tmp_path / "curl-attempts.log", [("200", 0)]),
+    )
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_first_pull_fails(Path(env["DOCKER_LOG"])),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert "rollback triggered by forward deploy failure" in result.stdout
+    assert "rollback to old1111 complete" in result.stdout
+    assert good.read_text().strip() == "old1111"
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rolled_back"
+    docker_log = Path(env["DOCKER_LOG"]).read_text()
+    assert "pull registry.example.com/ns/demo:new2222" in docker_log
+    assert "pull registry.example.com/ns/demo:old1111" in docker_log
+
+
+def test_forward_deploy_failure_rollback_itself_fails_returns_rc4(tmp_path):
+    mock_dir = tmp_path / "bin"
+    mock_dir.mkdir()
+    env = _base_env(tmp_path, mock_dir=mock_dir, status="200")
+    env["GIT_SHA"] = "new2222"
+    good = _seed_prev_good(env)
+    _write_exec(
+        mock_dir / "docker",
+        _mock_docker_forward_failure(Path(env["DOCKER_LOG"]), "compose"),
+    )
+
+    result = _run(env)
+
+    assert result.returncode == 4, result.stdout + result.stderr
+    assert "rollback triggered by forward deploy failure" in result.stdout
+    assert "rollback to old1111 failed" in result.stdout
+    assert "rollback to old1111 complete" not in result.stdout
+    assert good.read_text().strip() == "old1111"
+    receipt = json.loads((Path(env["STATE_DIR"]) / "last_deploy_result.json").read_text())
+    assert receipt["outcome"] == "rollback_unhealthy"
 
 
 def test_missing_deploy_outcome_is_internal_error_and_skips_receipt(tmp_path):
