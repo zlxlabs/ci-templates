@@ -221,24 +221,31 @@ push 幂等极快），代价是多花几分钟构建时间，不是"跳过 buil
 | 退出码 | 语义 | 回执 `outcome` | 生产状态 | on-call 处置 |
 |---|---|---|---|---|
 | `rc=0` | 新版本已上线、通过健康探针**且通过三段镜像对账** | `deployed`（已部署）或 `skipped_already_deployed`（已是 last-good） | 新版本，已验证在应答 | 无需动作 |
-| `rc=1` | 新版本探针失败，已回滚，且**回滚后的同预算探针已通过**；若前向 pull/tag/compose 在探针和回滚前失败，则是另一种实际情况 | `rolled_back`；前向失败时为 `deploy_failed`，**不表示发生过回滚** | 前者为 `last_good` 且已验证；后者未证实 | 前者不需要紧急上机；后者按失败处置 |
+| `rc=1` | 新版本探针失败，**或**前向 pull/retag/compose up 失败；已回滚到 last_good，且**回滚后的同预算探针已通过** | `rolled_back` | `last_good` 且已验证 | 不需要紧急上机。前向失败触发时日志含 `rollback triggered by forward deploy failure` |
 | `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | 空闲后点黄卡按钮重跑 |
-| `rc=4` | 新版本探针失败；`rollback_safety=safe` 时已回滚但同预算探针未证实旧版应答，非 `safe` 时自动回滚未执行 | `rollback_unhealthy`（safe）/ `rollback_skipped_<safety>`（非 safe） | safe：旧版是否应答未证实；非 safe：不健康的新版本仍在运行 | safe：先确认生产是否应答；非 safe：确认生产状态并决定是否手动回滚 |
+| `rc=4` | 新版本探针失败或前向部署失败之后：`rollback_safety=safe` 时已回滚但同预算探针未证实旧版应答（或回滚动作本身失败）；非 `safe` 时自动回滚未执行（守卫同时覆盖探针失败与前向失败） | `rollback_unhealthy`（safe）/ `rollback_skipped_<safety>`（非 safe） | safe：旧版是否应答未证实；非 safe：生产状态未证实 | safe：先确认生产是否应答；非 safe：确认生产状态并决定是否手动回滚 |
 | `rc=5` | 探针已过、`last_good` 已推进、镜像对账失败 | `reconcile_failed` | 新版本在跑但身份未证明 | **立即上机核对**，不自动回滚，不要重跑 |
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | —（仅 release lane 定义） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
 | `rc=255` | SSH 传输层失败 | —（远端脚本未必执行） | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
-| 其他前向非零码 | pull/tag/compose 等在探针和回滚前失败 | `deploy_failed` | 未发生回滚，生产状态未证实 | 按失败处置并确认主机 |
+| 其他前向非零码 | pull/retag/compose 失败，且**没有**可回滚的 `prev_good`（≠ 本次 GIT_SHA） | `deploy_failed` | 未发生回滚，生产状态未证实 | 按失败处置并确认主机 |
 
-`deploy_failed` 是前向部署动作失败的诚实结论，不从退出码推断回滚是否发生。因此 `rc=1`
-只有在回滚动作实际成功且回滚探针通过时才对应 `rolled_back`；前向动作恰好返回 `1` 时对应
-`deploy_failed`，前向 compose 返回 `23` 也必须写 `deploy_failed` 回执。
+`deploy_failed` 只在前向 pull/retag/compose 失败、并且没有可回滚的 `prev_good` 时出现。
+有 `prev_good`（且不等于本次 GIT_SHA）时，单镜像 lane 走与探针失败同一套回滚：成功则
+`rolled_back` / `rc=1`（日志含 `rollback triggered by forward deploy failure`），回滚失败或
+回滚后探针失败则 `rollback_unhealthy` / `rc=4`。因此前向 compose 返回 `23` 且存在 last_good
+时，回执不再是 `deploy_failed`。
+
+`rollback_safety` 为 `unsafe` 或 `conditional` 时，`build-deploy.yml` 注入的守卫打在这道
+共用回滚门上，探针失败与前向部署失败都会跳过自动回滚，结局是 `rollback_skipped_<safety>` /
+`rc=4`，**不是** `deploy_failed` + 原 rc。`safe`（默认）不注入守卫，行为如上一段。
 
 `rc=1` 的已回滚情形对 on-call 是同一条指引。
 
 **情形一：已执行回滚，且回滚后的旧版本在同一探针预算内通过了探针。** 这是本次新增的证明
-步骤；在此之前 `rc=1` 只证明回滚 compose 被执行过，并不证明旧版本真的在应答。注意 release
-lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门禁不通过）**也会落进这一类**
-——只要存在 `last_good_release`，脚本仍会执行一次旧版本的 `compose up -d` 并探针验证。
+步骤；在此之前 `rc=1` 只证明回滚 compose 被执行过，并不证明旧版本真的在应答。单镜像 lane
+里前向 pull/retag/compose up 失败、只要存在 `prev_good`，也走同一条路径。release lane 里
+「新版本还没走到 `compose up -d` 就失败」（例如身份门禁不通过）**同样落进这一类**——只要
+存在 `last_good_release`，脚本仍会执行一次旧版本的 `compose up -d` 并探针验证。
 也就是说生产确实发生过一次 compose 行为（旧版本可能被重启），只是结果已被证明健康。
 
 **情形二：本次运行从未执行过任何 `compose up -d`。** 只在没有 `last_good_release` 可回滚、
@@ -248,17 +255,21 @@ lane 里「新版本还没走到 `compose up -d` 就失败」（例如身份门�
 `rc=1` 与 `rc=4` 的处置严格互斥。
 
 `rc=4` 的具体来源因 lane 略有不同。单镜像 lane 包括：无 `last_good_tag` 可回滚（含首次部署；`last_good` 已等于本次 SHA 时走
-skip-forward 只对账，不再是 rc=4 来源）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败。
+skip-forward 只对账，不再是 rc=4 来源）、回滚的 pull/compose 执行失败、回滚 compose 成功但回滚后探针仍失败、
+以及 `rollback_safety` 非 `safe` 时守卫跳过自动回滚（探针失败与前向失败都算）。
 release lane 包括：无 `last_good_release` 可回滚（refusing pseudo-rollback）、镜像集较上次发布已变化
 而不支持回滚（rollback impossible）、回滚的 `deploy_group` 执行失败、回滚 compose 成功但
 `probe_release` 仍失败。无论来源是哪一项，`rc=4` 都表示生产可能不可用，不能按「未上线、无需处理」理解。
 
-但所有来源都受同一个前提约束：**本次发布必须已经实际执行过至少一次 `docker compose up -d`**
-（正向替换或回滚替换都算）。没碰过生产容器就绝不返回 `rc=4`——因为 `rc=4` 的紧急卡会 `@全员`
-说「生产可能不可用，必须立即上机」，而那时生产一动没动；这种误报会让这条唯一的强告警通道
-失去可信度，下次真的 `rc=4` 时反而被当噪音。
+对 `rollback_safety=safe` 的自动回滚路径，仍有前提：**本次发布必须已经实际执行过至少一次
+`docker compose up -d`**（正向替换或回滚替换都算）。没碰过生产容器、又没有 `prev_good` 可回滚时
+写 `deploy_failed` 并返回原 rc，不发 `rc=4` 紧急卡——那种误报会让这条唯一的强告警通道失去可信度。
 
-这个前提也决定了 `rc=4` 与 `rc=130` 的优先级：已经替换过容器、又未能自证健康时返回 `4`，
+`rollback_safety` 为 `unsafe`/`conditional` 时例外：守卫拒绝自动回滚，**故意**走 `rc=4` /
+`rollback_skipped_<safety>`，即使前向步骤在 compose 之前就失败。因为回滚被跳过，生产状态未证实，
+on-call 必须上机看，不能当成「未上线、无需处理」。
+
+`rollback_safety=safe` 时，`rc=4` 与 `rc=130` 的优先级仍按是否替换过容器：已经替换过、又未能自证健康时返回 `4`，
 因为生产状态的坏消息比「被中断」更需要人知道；而尚未替换过容器时收到信号，就老实返回 `130`。
 飞书通知分流为：`rc=3` 发不 `@全员` 的延期黄卡；`rc=4` 发 `@全员` 的紧急卡，明确提示「生产可能不可用，
 必须立即上机」；其余失败发普通 P0 卡，并按失败 step 处置。
@@ -395,7 +406,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
-| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup；判健康需 HTTP code 匹配且 curl rc=0），失败 → **自动回滚**；回滚本身同样受探针门约束，未通过则升级为 `rc=4` | `pull_and_deploy.sh` `health_probe()` |
+| **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup；判健康需 HTTP code 匹配且 curl rc=0），失败 → **自动回滚**；前向 pull/retag/compose up 失败且有 last_good 时走同一套回滚（日志 `rollback triggered by forward deploy failure`）；回滚本身同样受探针门约束，未通过则升级为 `rc=4`；`rollback_safety` 非 `safe` 时守卫跳过自动回滚 | `pull_and_deploy.sh` `health_probe()` / `rollback_to_prev_good()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账（持 host 锁，失败 rc=5） | `pull_and_deploy.sh` 对账函数 + `build-deploy.yml` 薄壳 |
 | **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
 | **A1** | registry **JSON Schema** + 唯一性约束 + **只存 DSN 引用** → CI fail fast | `registry.schema.json` / `validate_registry.py` |
@@ -417,7 +428,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | `monitor_slug` | GlitchTip cron monitor slug | **唯一**，kebab-case |
 | `heartbeat_url_secret` | （cron 服务才需）GlitchTip Heartbeat check-in URL 的 **secret 名**（如 `ZLX_HEARTBEAT_URL_FOO`） | `^[A-Z][A-Z0-9_]*$`，**绝不存 URL 明文**；运行时经 `ZLX_HEARTBEAT_URL` 注入 |
 | `tier` | 环境/爆炸半径分层（D7） | enum `dev`/`staging`/`prod` |
-| `rollback_safety` | 回滚是否安全 | enum `safe`/`unsafe`/`conditional` |
+| `rollback_safety` | 回滚是否安全。`safe`（默认）允许自动回滚；`unsafe`/`conditional` 时 `build-deploy.yml` 注入守卫，探针失败与前向部署失败都跳过回滚，结局 `rollback_skipped_<safety>` / `rc=4` | enum `safe`/`unsafe`/`conditional` |
 | `healthcheck_url` | （可选）覆盖默认探针 URL | — |
 
 校验本地跑：
@@ -448,7 +459,7 @@ python -m pytest -q
 ```
 
 - `test_registry_schema.py` —— 8 个坏 fixture（缺字段/重复 id/port/slug/路径、DSN 明文、heartbeat 明文、坏 enum）全部报错；好 registry 通过。
-- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、回滚后探针、`rc=4` 分流、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
+- `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、前向 pull/compose 失败且有 last_good 时同样回滚、回滚后探针、`rc=4` 分流、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
 - `test_release_deploy.py` —— release lane 多镜像发布与整组回滚、回滚后探针、`rc=4` 分流（docker/curl mock，无需真实守护进程）。
 - `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
