@@ -6,7 +6,7 @@
 #   - immutable SHA tag   : deploys ${ACR_IMAGE}:${GIT_SHA}, never :latest
 #   - last-good tracking  : records the last healthy tag for rollback
 #   - health probe gate   : warmup + retries + expected status
-#   - auto rollback       : probe failure -> redeploy previous good tag
+#   - auto rollback       : probe or deploy_tag failure -> redeploy previous good tag
 #   - busy-lock gate      : opt-in (BUSY_LOCK_FILE); exit codes: 0=healthy
 #                           (probe + image reconcile passed), 1=probe failed
 #                           (rolled back), 3=deferred (service busy, busy lock
@@ -532,13 +532,59 @@ reconcile_deployed_image() {
   return 0
 }
 
+# Shared rollback primitive for probe failure and forward deploy_tag failure.
+# Caller must only invoke this when prev_good is non-empty and != GIT_SHA.
+# last_good_tag is left unchanged. Sets DEPLOY_OUTCOME. Returns 1 or 4.
+rollback_to_prev_good() {
+  local prev_good="$1"
+  local prev_good_digest="$2"
+  local rollback_rc=0
+  local rollback_ref=""
+
+  log "rolling back to previous good tag ${prev_good}"
+  ROLLBACK_MODE=1
+  rollback_ref="$ACR_IMAGE:$prev_good"
+  if [ -n "$prev_good_digest" ]; then
+    rollback_ref="$ACR_IMAGE@$prev_good_digest"
+    log "rolling back by last good digest $prev_good_digest"
+  fi
+  if [ -n "$prev_good_digest" ]; then
+    deploy_tag "$rollback_ref" || rollback_rc=$?
+  else
+    deploy_tag "$prev_good" || rollback_rc=$?
+  fi
+  ROLLBACK_MODE=0
+  if [ "$rollback_rc" -ne 0 ]; then
+    log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
+    DEPLOY_OUTCOME="rollback_unhealthy"
+    event exit
+    return 4
+  fi
+  if health_probe; then
+    # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
+    DEPLOY_OUTCOME="rolled_back"
+    IMAGE_DIGEST="$prev_good_digest"
+    IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
+    log "rollback to ${prev_good} complete; old version passed the same-budget health probe"
+    event exit
+    return 1
+  fi
+  log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
+  oneshot_schema_hint
+  DEPLOY_OUTCOME="rollback_unhealthy"
+  IMAGE_DIGEST="$prev_good_digest"
+  IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
+  event exit
+  return 4
+}
+
 # --- critical section, serialized per host via flock -------------------------
 do_deploy() {
   event enter
   mkdir -p "$STATE_DIR"
 
-  local prev_good="" prev_good_digest="" rollback_ref="" deploy_rc=0
-  local compose_ps container_logs compose_ps_rc=0 container_logs_rc=0 rollback_rc=0
+  local prev_good="" prev_good_digest="" deploy_rc=0
+  local compose_ps container_logs compose_ps_rc=0 container_logs_rc=0
   [ -f "$GOOD_TAG_FILE" ] && prev_good="$(cat "$GOOD_TAG_FILE")"
   [ -f "$GOOD_DIGEST_FILE" ] && prev_good_digest="$(cat "$GOOD_DIGEST_FILE")"
 
@@ -563,88 +609,56 @@ do_deploy() {
   deploy_tag "$GIT_SHA" || deploy_rc=$?
   if [ "$deploy_rc" -ne 0 ]; then
     log "deploy of $GIT_SHA failed (rc=$deploy_rc)"
-    DEPLOY_OUTCOME="deploy_failed"
-    event exit
-    return "$deploy_rc"
-  fi
-
-  if health_probe; then
+  elif health_probe; then
     echo "$GIT_SHA" > "$GOOD_TAG_FILE"
     record_last_good_identity "$ACR_IMAGE:$GIT_SHA"
     DEPLOY_OUTCOME="deployed"
     log "deploy of ${GIT_SHA} healthy; recorded as last good"
     event exit
     return 0
+  else
+    log "health probe FAILED for ${GIT_SHA}"
+    echo "[deploy][evidence] compose-ps:"
+    compose_ps=""
+    compose_ps="$(
+      cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+        "$DOCKER_BIN" compose ps 2>&1
+    )" || compose_ps_rc=$?
+    if [ "$compose_ps_rc" -eq 124 ]; then
+      log "[deploy][evidence] compose-ps timed out after ${EVIDENCE_TIMEOUT}s"
+    elif [ "$compose_ps_rc" -ne 0 ]; then
+      log "[deploy][evidence] compose-ps failed (rc=${compose_ps_rc})"
+    fi
+    printf '%s\n' "$compose_ps" | sed 's/^/[deploy][evidence] /' || true
+    echo "[deploy][evidence] container-logs:"
+    container_logs=""
+    container_logs="$(
+      cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
+        "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1
+    )" || container_logs_rc=$?
+    if [ "$container_logs_rc" -eq 124 ]; then
+      log "[deploy][evidence] container-logs timed out after ${EVIDENCE_TIMEOUT}s"
+    elif [ "$container_logs_rc" -ne 0 ]; then
+      log "[deploy][evidence] container-logs failed (rc=${container_logs_rc})"
+    fi
+    printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   fi
 
-  log "health probe FAILED for ${GIT_SHA}"
-  echo "[deploy][evidence] compose-ps:"
-  compose_ps=""
-  compose_ps="$(
-    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
-      "$DOCKER_BIN" compose ps 2>&1
-  )" || compose_ps_rc=$?
-  if [ "$compose_ps_rc" -eq 124 ]; then
-    log "[deploy][evidence] compose-ps timed out after ${EVIDENCE_TIMEOUT}s"
-  elif [ "$compose_ps_rc" -ne 0 ]; then
-    log "[deploy][evidence] compose-ps failed (rc=${compose_ps_rc})"
-  fi
-  printf '%s\n' "$compose_ps" | sed 's/^/[deploy][evidence] /' || true
-  echo "[deploy][evidence] container-logs:"
-  container_logs=""
-  container_logs="$(
-    cd "$DEPLOY_DIR" && timeout --kill-after=1s "${EVIDENCE_TIMEOUT}s" \
-      "$DOCKER_BIN" compose logs --tail 100 --no-color 2>&1
-  )" || container_logs_rc=$?
-  if [ "$container_logs_rc" -eq 124 ]; then
-    log "[deploy][evidence] container-logs timed out after ${EVIDENCE_TIMEOUT}s"
-  elif [ "$container_logs_rc" -ne 0 ]; then
-    log "[deploy][evidence] container-logs failed (rc=${container_logs_rc})"
-  fi
-  printf '%s\n' "$container_logs" | sed 's/^/[deploy][evidence] /' || true
   if [ -n "$prev_good" ] && [ "$prev_good" != "$GIT_SHA" ]; then
-    log "rolling back to previous good tag ${prev_good}"
-    rollback_rc=0
-    ROLLBACK_MODE=1
-    rollback_ref="$ACR_IMAGE:$prev_good"
-    if [ -n "$prev_good_digest" ]; then
-      rollback_ref="$ACR_IMAGE@$prev_good_digest"
-      log "rolling back by last good digest $prev_good_digest"
+    if [ "$deploy_rc" -ne 0 ]; then
+      log "rollback triggered by forward deploy failure; last_good will not be updated to ${GIT_SHA}"
     fi
-    if [ -n "$prev_good_digest" ]; then
-      deploy_tag "$rollback_ref" || rollback_rc=$?
-    else
-      deploy_tag "$prev_good" || rollback_rc=$?
-    fi
-    ROLLBACK_MODE=0
-    if [ "$rollback_rc" -ne 0 ]; then
-      log "rollback to ${prev_good} failed (rc=${rollback_rc}); production state is uncertain"
-      DEPLOY_OUTCOME="rollback_unhealthy"
-      event exit
-      return 4
-    fi
-    if health_probe; then
-      # last_good_tag intentionally left at ${prev_good}; the bad tag is NOT promoted
-      DEPLOY_OUTCOME="rolled_back"
-      IMAGE_DIGEST="$prev_good_digest"
-      IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
-      log "rollback to ${prev_good} complete; old version passed the same-budget health probe"
-      event exit
-      return 1
-    fi
-    log "rollback health probe FAILED for ${prev_good}; production state is uncertain"
-    oneshot_schema_hint
-    DEPLOY_OUTCOME="rollback_unhealthy"
-    IMAGE_DIGEST="$prev_good_digest"
-    IMAGE_ID="$(image_id_for_ref "$rollback_ref")"
-    event exit
-    return 4
-  else
-    log "no previous good tag to roll back to"
-    DEPLOY_OUTCOME="rollback_unhealthy"
-    event exit
-    return 4
+    rollback_to_prev_good "$prev_good" "$prev_good_digest" || return $?
   fi
+  if [ "$deploy_rc" -ne 0 ]; then
+    DEPLOY_OUTCOME="deploy_failed"
+    event exit
+    return "$deploy_rc"
+  fi
+  log "no previous good tag to roll back to"
+  DEPLOY_OUTCOME="rollback_unhealthy"
+  event exit
+  return 4
 }
 
 # --- busy-lock deploy gate (opt-in; BUSY_LOCK_FILE empty = skip entirely) ----
