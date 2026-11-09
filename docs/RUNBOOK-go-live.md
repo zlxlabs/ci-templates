@@ -356,9 +356,13 @@ git push -f origin v1
 
 ### 4b. 配置文件随发布下发（`release_files_json`，opt-in）
 
-按[设计第 4 节「迁移顺序」](design/release-config-unit.md)执行。顺序反了会出事故：
-仓库 compose 的 `env_file` 若引用主机没有的变量源，第一次下发就会把生产
-`env_file` 改成未设置的变量，compose 直接起不来。
+按[设计第 4 节](design/release-config-unit.md)执行。**Compose 先对每个文件插值、后
+合并**：仓库 compose 里由主机提供值的变量（`${VAR}` / `${VAR:?}`，含 `env_file`
+路径）必须在主机 `.env`（部署经 `--env-file` 传入）里有值——主机 override 吸收不了
+插值差异（Compose v2.40.3 与 v5.5.0 双实测，见
+[研究文档 §3](sessions/261108-gate-triage/research/R-CT71D-recon.md)）。缺了这一
+步，下发仓库 compose 后主机所有 compose 命令在插值阶段直接拒绝，生产停摆于下一
+次部署。
 
 **主机前置**：声明文件的父目录必须对 `ssh_user` 可写（安装是同目录 `mv`，部署不
 chmod、不 sudo，不可写时 fail-loud 打 `result=not-writable`）。不满足时先改主机
@@ -369,30 +373,41 @@ denylist 里，声明它们会被 normalize 与主机双侧拒绝——凭据与
 
 **动作**（顺序不可换）：
 
-1. **先**在主机 `$DEPLOY_DIR/docker-compose.override.yml` 写入主机差异（部署用户
-   可写即可，不需要 root）：覆盖需要改的字段（如把服务的 `env_file` 改成主机
-   实际持有的 `.env`）。不要带 `build:`——仓库 override 里的本地构建配方**不要**
-   拷到主机。部署只读这个文件，永远不会写/删/改它。
-2. 手工在主机上 `docker compose config` 核对合并结果：被覆盖的字段是主机值、
-   `D3_RELEASE_TAG` 插值仍在。注意 override 给出的序列字段（如 `env_file`）会
-   **替换**基文件的序列，不是追加，不要在 override 里重复仓库基文件已有的条目。
-3. caller 的 `with:` 块加 `release_files_json`（严格 JSON 数组，非空时必须恰好
+1. 备份主机 `docker-compose.yml`、目标配置文件与 `.env`（`cp -a` 加时间戳后缀；
+   `.env` 只备份不读内容）。首份 `last_good_manifest` 没有 file 记录时回滚只回
+   镜像，配置回退靠这份手工备份。
+2. **补齐插值变量**（2026-11-09 修正：旧版第 1 步把主机 override 当插值前置，
+   已废止——override 救不了插值差异）：仓库 compose 中由主机提供值的变量必须在
+   主机 `.env` 里有值。以 web_transcibe_translate 为例：主机 `.env` 追加一行
+   `ISEC_ENV_FILE=.env`，此后仓库 compose 的插值结果与主机现行 env_file 语义一致，
+   该仓**不需要** override（机制保留给未来的主机结构差异，部署只读不写）。
+3. 只读预检（零写盘）：把仓库 compose 字节经 stdin 送主机 compose——
+   `docker compose -f - config --services` 应 exit 0 且服务齐全；再 `config`
+   全量核对 `env_file` 解析结果与 `D3_RELEASE_TAG` 插值仍在。
+4. caller 的 `with:` 块加 `release_files_json`（严格 JSON 数组，非空时必须恰好
    一个 compose + 它 bind 的配置文件，如
    `release_files_json: '["docker-compose.yml","nginx/nginx.conf"]'`；默认 `[]`
    = 不传输任何文件，这一步对未声明的服务零影响），`uses:` / `ci_templates_ref`
    仍钉 `@main` / `main` 观察。
-4. 推一次**只改注释**的发布验证下发：部署日志应有
+5. 推一次**新 SHA**、只改注释的发布验证下发：部署日志应有
+   `[release][config-install] ... result=replaced` 与
    `[release][config-verify] ... result=ok`，bind 了该文件的服务被
-   `--force-recreate`。然后把主机上该配置文件人为改错，重跑同一 SHA：同 SHA 本
-   会 skip-forward，但 live 文件与 manifest 哈希不符时 skip-forward **被禁止**
+   `--force-recreate`（容器 `StartedAt` 晚于部署起点）。注意：主机文件已与仓库
+   一致时（如 nginx.conf 已于 2026-10-21 手工同步到 main），首次下发前后哈希
+   不变，判据是 `result=replaced` + 容器重建，不是「哈希从旧变新」。然后把主机
+   上该配置文件人为改错，重跑同一 SHA：同 SHA 本会 skip-forward，但 live 文件与
+   manifest 哈希不符时 skip-forward **被禁止**
    （日志 `same-SHA live release files mismatched; skip-forward is forbidden`），
    必须完整重新下发把正确文件装回去。
-5. 验证通过后把 `uses:` / `ci_templates_ref` 拨回 `@v2` / `v2`。
+6. 验证通过后把 `uses:` / `ci_templates_ref` 拨回 `@v2` / `v2`。
 
-**验证点（4b）**：配置文件真到达主机且哈希一致（`result=ok`）；主机 override
-检测标记是 `detected-untouched` 且字节未被改动；人为改坏主机文件后重跑同 SHA，
-skip-forward 被拒绝、文件被装回正确版本；探针失败触发的整组回滚把配置文件与
-镜像**一起**带回旧版本（`[release][config-rollback] ... result=restored`）。
+**验证点（4b）**：配置文件真到达主机且哈希一致（`result=ok`）；bind 服务真被重建
+（容器 `StartedAt` 晚于部署起点）；主机若持有 override（本原型仓不需要），检测
+标记应为 `detected-untouched` 且字节未被改动；人为改坏主机文件后重跑同 SHA，
+skip-forward 被拒绝、文件被装回正确版本。生产**不**演练探针失败回滚
+（2026-11-09 决定）：整组回滚把配置文件与镜像一起带回旧版本
+（`[release][config-rollback] ... result=restored`）的路径由
+`tests/test_release_config_files.py` 覆盖，不在生产注入探针失败。
 
 **回滚点**：探针失败已触发脚本自动整组回滚（4b 开启后配置文件一并回滚），一般
 不需要人工介入；如需人工回退，把 caller 里的 `release_files_json` 改回 `'[]'`
