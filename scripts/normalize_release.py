@@ -20,9 +20,13 @@ Probe entries have ``url`` and optional ``expect_status`` (default 200).
 from __future__ import annotations
 
 import argparse
+import hashlib
+import io
 import json
 import re
+import stat
 import sys
+import tarfile
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -53,6 +57,23 @@ CONTROL_RE = re.compile(r"[\x00-\x1f\x7f]")
 FORBIDDEN_URL_RE = re.compile(r"[\s;|&$`(){}<>\[\]\\\"']")
 IMAGE_KEYS = frozenset({"image_name", "build_context", "dockerfile", "build_alias"})
 PROBE_KEYS = frozenset({"url", "expect_status"})
+COMPOSE_BASENAMES = frozenset(
+    {"docker-compose.yml", "docker-compose.yaml", "compose.yml", "compose.yaml"}
+)
+DENIED_BASENAMES = frozenset(
+    {
+        ".env",
+        "ops.env",
+        ".d3-release.env",
+        "docker-compose.override.yml",
+        "docker-compose.override.yaml",
+        "compose.override.yml",
+        "compose.override.yaml",
+    }
+)
+MAX_FILE_COUNT = 32
+MAX_FILE_SIZE = 1024 * 1024
+MAX_FILES_SIZE = 4 * 1024 * 1024
 
 
 class ValidationError(ValueError):
@@ -175,7 +196,80 @@ def normalize(images_raw: object, probes_raw: object) -> tuple[list[dict[str, st
     return images, probes, builds
 
 
-def _write_manifest(path: Path, images, probes) -> None:
+def _validate_files(files_raw: object, repo_root: Path | None) -> list[tuple[str, bytes]]:
+    if not isinstance(files_raw, list):
+        raise ValidationError("files_json must be an array")
+    if not files_raw:
+        return []
+    if len(files_raw) > MAX_FILE_COUNT:
+        raise ValidationError(f"files_json must contain at most {MAX_FILE_COUNT} files")
+
+    paths = [_relative_path(value, f"files_json[{index}]") for index, value in enumerate(files_raw)]
+    if len(paths) != len(set(paths)):
+        raise ValidationError("files_json paths must be unique")
+
+    for relpath in paths:
+        parts = relpath.split("/")
+        basename = parts[-1]
+        if basename in DENIED_BASENAMES or basename.endswith(".env"):
+            raise ValidationError(f"files_json path is forbidden: {relpath}")
+        if any(part in {".deploy-state", ".git"} for part in parts):
+            raise ValidationError(f"files_json path is forbidden: {relpath}")
+
+    compose_count = sum(path.rsplit("/", 1)[-1] in COMPOSE_BASENAMES for path in paths)
+    if compose_count != 1:
+        raise ValidationError("files_json must contain exactly one compose file")
+    if repo_root is None:
+        raise ValidationError("--repo-root is required when files_json is non-empty")
+
+    try:
+        root = repo_root.resolve(strict=True)
+    except (OSError, RuntimeError) as exc:
+        raise ValidationError(f"--repo-root is not an accessible directory: {exc}") from exc
+    if not root.is_dir():
+        raise ValidationError("--repo-root is not a directory")
+
+    total_size = 0
+    validated: list[tuple[str, bytes]] = []
+    for relpath in paths:
+        source = root
+        source_stat = None
+        try:
+            for part in relpath.split("/"):
+                source = source / part
+                source_stat = source.lstat()
+                if stat.S_ISLNK(source_stat.st_mode):
+                    raise ValidationError(f"files_json source must not be a symlink: {relpath}")
+        except FileNotFoundError as exc:
+            raise ValidationError(f"files_json source does not exist: {relpath}") from exc
+        except OSError as exc:
+            raise ValidationError(f"files_json source cannot be inspected: {relpath}: {exc}") from exc
+
+        if source_stat is None or not stat.S_ISREG(source_stat.st_mode):
+            raise ValidationError(f"files_json source must be a regular file: {relpath}")
+        if source_stat.st_size > MAX_FILE_SIZE:
+            raise ValidationError(f"files_json file exceeds 1 MiB: {relpath}")
+        try:
+            resolved = source.resolve(strict=True)
+            resolved.relative_to(root)
+        except ValueError as exc:
+            raise ValidationError(f"files_json source escapes --repo-root: {relpath}") from exc
+        except (OSError, RuntimeError) as exc:
+            raise ValidationError(f"files_json source cannot be resolved: {relpath}: {exc}") from exc
+        try:
+            content = source.read_bytes()
+        except OSError as exc:
+            raise ValidationError(f"files_json source cannot be read: {relpath}: {exc}") from exc
+        if len(content) > MAX_FILE_SIZE:
+            raise ValidationError(f"files_json file exceeds 1 MiB: {relpath}")
+        total_size += len(content)
+        if total_size > MAX_FILES_SIZE:
+            raise ValidationError("files_json total size exceeds 4 MiB")
+        validated.append((relpath, content))
+    return validated
+
+
+def _write_manifest(path: Path, images, probes, files=()) -> None:
     lines = ["D3_RELEASE_MANIFEST=1"]
     for image in images:
         # The registry path is completed in the workflow; image_name is kept
@@ -183,7 +277,30 @@ def _write_manifest(path: Path, images, probes) -> None:
         lines.append(f"image\t{image['image_name']}\t{image['image_name']}")
     for url, status in probes:
         lines.append(f"probe\t{url}\t{status}")
+    for relpath, content in files:
+        lines.append(f"file\t{relpath}\t{hashlib.sha256(content).hexdigest()}")
     _atomic_write(path, "\n".join(lines) + "\n")
+
+
+def _write_files_tar(path: Path, files: list[tuple[str, bytes]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temp = path.with_name(f".{path.name}.tmp")
+    with temp.open("wb") as output:
+        with tarfile.open(fileobj=output, mode="w", format=tarfile.USTAR_FORMAT) as archive:
+            for relpath, content in files:
+                member = tarfile.TarInfo(relpath)
+                member.size = len(content)
+                member.mode = 0o644
+                member.uid = 0
+                member.gid = 0
+                member.uname = ""
+                member.gname = ""
+                member.mtime = 0
+                member.devmajor = 0
+                member.devminor = 0
+                member.pax_headers = {}
+                archive.addfile(member, io.BytesIO(content))
+    temp.replace(path)
 
 
 def _write_builds(path: Path, builds) -> None:
@@ -204,16 +321,25 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--images-json", required=True)
     parser.add_argument("--probes-json", default="[]")
+    parser.add_argument("--files-json", default="[]")
+    parser.add_argument("--repo-root", type=Path)
+    parser.add_argument("--files-tar-out", type=Path)
     parser.add_argument("--manifest-out", required=True, type=Path)
     parser.add_argument("--builds-out", required=True, type=Path)
     args = parser.parse_args(argv)
     try:
         images_raw = json.loads(args.images_json)
         probes_raw = json.loads(args.probes_json)
+        files_raw = json.loads(args.files_json)
         images, probes, builds = normalize(images_raw, probes_raw)
-        _write_manifest(args.manifest_out, images, probes)
+        files = _validate_files(files_raw, args.repo_root)
+        if files:
+            if args.files_tar_out is None:
+                raise ValidationError("--files-tar-out is required when files_json is non-empty")
+            _write_files_tar(args.files_tar_out, files)
+        _write_manifest(args.manifest_out, images, probes, files)
         _write_builds(args.builds_out, builds)
-    except (json.JSONDecodeError, ValidationError, OSError) as exc:
+    except (json.JSONDecodeError, ValidationError, OSError, tarfile.TarError, ValueError) as exc:
         print(f"release input invalid: {exc}", file=sys.stderr)
         return 2
     print(f"validated {len(images)} image(s), {len(probes)} probe(s), {len(builds)} build(s)")

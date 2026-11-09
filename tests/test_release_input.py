@@ -287,11 +287,11 @@ def test_files_reject_missing_directories_and_symlinks(tmp_path):
 def test_files_reject_size_and_count_limits(tmp_path):
     (tmp_path / "docker-compose.yml").write_text("services: {}\n")
     (tmp_path / "large.bin").write_bytes(b"x" * (1024 * 1024 + 1))
-    (tmp_path / "a.bin").write_bytes(b"a" * (1024 * 1024))
-    (tmp_path / "b.bin").write_bytes(b"b" * (3 * 1024 * 1024 + 1))
+    for name in ("a.bin", "b.bin", "c.bin", "d.bin"):
+        (tmp_path / name).write_bytes(name.encode() * (1024 * 1024 // len(name)))
     for declared in (
         ["docker-compose.yml", "large.bin"],
-        ["docker-compose.yml", "a.bin", "b.bin"],
+        ["docker-compose.yml", "a.bin", "b.bin", "c.bin", "d.bin"],
         ["docker-compose.yml"] + [f"file-{index}.conf" for index in range(32)],
     ):
         result, _, _ = run_normalizer(
