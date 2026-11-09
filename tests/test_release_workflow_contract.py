@@ -303,21 +303,21 @@ def test_orphaned_remote_files_cleaned_up_on_scp_failure():
     # or reclaims a prior failed attempt's files. If either scp fails, the
     # remote script never gets a chance to run at all -- its own cleanup trap
     # never installs -- so nothing else will ever remove those /tmp paths.
-    # A best-effort ssh rm -f cleanup, covering both remote_manifest and
-    # remote_script, must be reachable from both scp failure points inside
-    # deploy_once().
+    # A best-effort ssh rm -f cleanup, covering the remote script, manifest,
+    # and optional files tar, must be reachable from all three scp failure
+    # points inside deploy_once().
     text = WORKFLOW.read_text()
     assert "cleanup_remote_cmd" in text, (
         "deploy_once() must build a reusable best-effort remote cleanup command"
     )
-    assert "rm -f -- %q %q" in text, (
+    assert "rm -f -- %q %q %q" in text, (
         "the cleanup command must %q-escape both remote paths, matching this "
         "function's existing printf %q discipline"
     )
-    assert text.count('"$cleanup_remote_cmd"') == 2, (
-        "the cleanup command must be invoked at exactly the two scp "
-        "transport-failure points inside deploy_once(): the first scp and "
-        "the second scp -- and nowhere else (see "
+    assert text.count('"$cleanup_remote_cmd"') == 3, (
+        "the cleanup command must be invoked at exactly the three scp "
+        "transport-failure points inside deploy_once(): script, manifest, "
+        "and optional files tar -- and nowhere else (see "
         "test_ssh_255_does_not_race_remote_rollback_cleanup for why the "
         "ssh_rc==255 branch must NOT also invoke it)"
     )
@@ -631,3 +631,44 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     )
     assert "oneshot_services covers every compose service" in script
     assert "only referenced by oneshot service(s)" not in script
+
+
+def test_release_files_input_is_opt_in_and_normalizer_receives_caller_checkout():
+    raw, trigger = load()
+    spec = trigger["workflow_call"]["inputs"]["release_files_json"]
+    assert spec["type"] == "string"
+    assert spec["required"] is False
+    assert spec["default"] == "[]"
+    assert "empty disables file transfer" in spec["description"]
+
+    steps = raw["jobs"]["release"]["steps"]
+    normalize = next(step for step in steps if step.get("name") == "Validate and normalize release declaration")
+    assert normalize["env"]["FILES_JSON"] == "${{ inputs.release_files_json }}"
+    assert '--files-json "$FILES_JSON"' in normalize["run"]
+    assert '--repo-root "$GITHUB_WORKSPACE"' in normalize["run"]
+    assert '--files-tar-out "$RUNNER_TEMP/d3-release.files.tar"' in normalize["run"]
+    assert normalize["run"].index('rm -f -- "$RUNNER_TEMP/d3-release.files.tar"') < normalize["run"].index("normalize_release.py")
+    assert '"${{ inputs.release_files_json }}"' not in normalize["run"]
+    for job in raw["jobs"].values():
+        for step in job.get("steps", []):
+            assert "${{ inputs.release_files_json }}" not in step.get("run", "")
+
+
+def test_release_files_tar_is_third_opt_in_transfer_and_exact_path_cleanup():
+    text = WORKFLOW.read_text()
+    deploy = next(
+        step for step in load()[0]["jobs"]["release"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    assert 'remote_files="/tmp/d3-release-${transport_nonce}.files.tar"' in run
+    assert 'if [[ -f "$RUNNER_TEMP/d3-release.files.tar" ]]; then' in run
+    assert 'scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.files.tar"' in run
+    assert run.count('scp "${SSH_OPTS[@]}"') == 3
+    assert '"${SSH_USER}@${DEPLOY_HOST}:${remote_files}"' in run
+    assert "RELEASE_FILES_TAR=%q" in run
+    assert "rm -f -- %q %q %q" in run
+    assert 'rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds" "$RUNNER_TEMP/d3-release.files.tar"' in run
+    assert "*files.tar" not in run
+    assert "${{ inputs.release_files_json }}" not in run
+    assert "remote_files" in text
