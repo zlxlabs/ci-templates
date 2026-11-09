@@ -108,6 +108,11 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 （标记 `result=detected-untouched` / `absent`），写、删、chmod 一律禁止。仓库里的
 override 与主机 override 同名不同义，denylist 保证前者永远进不了发布集。
 
+**override 吸收不了插值差异**：Compose 对每个文件先逐文件插值、后合并——仓库
+compose 里由主机提供值的变量（`${VAR}` / `${VAR:?}`，含 `env_file` 路径）必须在
+主机 `.env`（部署经 `--env-file` 传入）里有值，override 只能覆盖插值后的结构
+字段。首次接入的迁移步骤见[设计第 4 节](docs/design/release-config-unit.md)。
+
 安装与回滚由随每次发布一并 scp 的主机函数库 `scripts/release_files.sh` 执行（与
 `release_deploy.sh` 同一 nonce 路径下发；文件内容 tar 仅在声明非空时传输）：锁内逐文件
 同目录 `mv` 原子替换后 `docker compose up -d`。**bind 了被替换文件的服务会被
@@ -126,11 +131,18 @@ override 与主机 override 同名不同义，denylist 保证前者永远进不�
 [release][config-rollback] sha=<12hex> result=restored|skipped-no-file-records|missing-tar
 ```
 
-任一 mismatch（及不可写、符号链接目标）fail-loud：不碰 live、不提升 last-good。同一
-SHA 重跑时，live 文件与 manifest 不符则 **skip-forward 被禁止**，强制完整重新下发
-（防把漂移当成功）。探针失败触发的整组回滚把配置文件与镜像一起装回旧版本；上一份
-发布没有 file 记录（升级窗口）时跳过文件还原（`skipped-no-file-records`），镜像回滚
-不变。
+fail-loud，但「不碰 live」只对改 live 之前的失败成立，按失败点分阶段：
+
+- **staging 读回不一致**（解包后、改 live 前）：不碰主机文件，前向失败；有
+  last-good 则走既有整组回滚。
+- **安装被拒**（目标不可写 / 符号链接）：不写该文件，fail-loud
+  （`result=not-writable` / `symlink-refused`）。
+- **安装后 / 探针后读回不一致**：主机文件已被替换，整组回滚把配置文件与镜像
+  一起装回旧版本，且不提升 last-good。
+- 同一 SHA 重跑时，live 文件与 manifest 不符则 **skip-forward 被禁止**，强制
+  完整重新下发（防把漂移当成功）。
+- 上一份发布没有 file 记录（升级窗口）时跳过文件还原
+  （`skipped-no-file-records`），镜像回滚不变。
 
 **主机前置**：声明文件的父目录必须对 `ssh_user` 可写（安装是同目录 `mv`，不 chmod、
 不 sudo，不可写时 fail-loud 打 `result=not-writable`）。不满足就不要把该路径写进

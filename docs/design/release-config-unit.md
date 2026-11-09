@@ -4,13 +4,14 @@
 **取代**：无。issue 建议的「只回读哈希、不下发」已被否决。
 **范围**：只针对 `build-deploy-release.yml` / `scripts/release_deploy.sh`。普通模板同形态缺口见第 6 节，另议。
 
-## 已拍板（2026-11-08）
+## 已拍板（2026-11-08；2026-11-09 修正「插值先于合并」一条，见下表与第 4 节）
 
 | 决策点 | 结论 |
 | --- | --- |
 | 发布单元 | 镜像 + compose + 声明的配置文件，一起下发、一起回滚 |
 | 哈希 | 只作下发后的读回验证，不能代替下发 |
 | 主机差异 | 只能放在主机持有的显式 override；部署不覆盖它 |
+| 插值先于合并（2026-11-09 修正） | 逐文件插值发生在合并之前；override 只覆盖插值后的结构字段，合并前的插值报错（必需变量缺失、被引用文件不存在）它吸收不了——插值所需值必须由主机 `.env` 提供（证据：[研究文档 §3](../sessions/261108-gate-triage/research/R-CT71D-recon.md)，v2.40.3 / v5.5.0 双实测） |
 | `.env` / 凭据 | 永不由发布下发 |
 | 模板 | 只改 release lane；两模板刻意分叉，禁止把补丁搬到 `build-deploy.yml` |
 
@@ -143,11 +144,11 @@ D3 约定 `deploy_dir` 是 ssh_user 的项目根，但**没有**写成「live �
 
 ---
 
-## 4. 主机 override 机制
+## 4. 主机 override 机制与插值边界
 
 Compose V2 在**未传 `-f`** 时自动合并项目目录下的 `docker-compose.yml` + `docker-compose.override.yml`。今日 `compose_release` `:499` 正是无 `-f` 的 `compose_args=(compose)`，主机若已有 override，已经在生效。
 
-实现约束：
+实现约束（2026-11-09 修正后原样保留）：
 
 - **禁止**写成 `-f docker-compose.yml` 单独一项——那会丢掉 override，主机 `env_file` 差异立刻暴露为生产故障。
 - 允许显式 `-f docker-compose.yml -f docker-compose.override.yml`，但仅当后者存在；不存在时不要把 override 写进 `-f` 列表（compose 会找不到文件）。
@@ -155,25 +156,37 @@ Compose V2 在**未传 `-f`** 时自动合并项目目录下的 `docker-compose.
 - 脚本启动时 `unset COMPOSE_FILE`（推断：今日未 unset；若主机环境漏进该变量，会静默改搜索路径）。
 - denylist 保证仓库里的 `docker-compose.override.yml` 不能进发布集。该仓仓库内 override 是**本地 build:** 配方（远端文件：backend/worker/migrate/frontend 四段 `build.context`），一旦误发到主机，生产会改去现场 build，属 P1。
 
-### 把 web_transcibe_translate 主机差异迁入 override（只写步骤，不执行）
+### 插值先于合并：override 的能力边界（2026-11-09 修正）
 
-现状两端（2026-11-08 远端字节，不是本机可能过期的 checkout）：
+Compose 对每个文件**先逐文件插值、后合并**。仓库 compose 里由主机提供值的变量——`${VAR}` / `${VAR:?}`，含 `env_file` 的路径插值——在合并前的插值阶段就已求值：必需变量缺失在那一刻报错，`env_file` 指向的文件存在性检查同样早于合并；主机 override 只改写合并后的最终模型，救不了加载阶段。因此 override 机制之上有一条硬约束：这些变量必须在主机的插值来源（`release_deploy.sh` 注入的 `--env-file`：主机 `.env` / `.d3-release.env`，`scripts/release_deploy.sh:299-302`、`:391-394`）里有值，override **不能**替代；override 只适合覆盖插值后的结构字段（volumes、ports、environment 字面量等）。
 
-| | 仓库 `docker-compose.yml` | 主机（#71 正文） |
+证据（Compose v2.40.3 主机版 + v5.5.0 本地版双实测，[研究文档 §3](../sessions/261108-gate-triage/research/R-CT71D-recon.md)）：仓库 compose 的 `${ISEC_ENV_FILE:?}` 即使配有覆盖 `env_file` 的 override，compose 仍在插值阶段 `exit 1`（`required variable ISEC_ENV_FILE is missing a value`）；`env_file` 指向不存在路径时 `config --services` 能过、真正解析 env_file 的 `config` / `up` 拒绝；指向真实文件后仅 base、不带 override 也 `exit 0`。本文 2026-11-08 版曾把「主机 override 先行覆盖 `env_file`」当作下发安全前置，前提不成立，该迁移步骤已废止。
+
+### 把 web_transcibe_translate 主机差异接入下发（只写步骤，不执行）
+
+前提事实（[研究文档 §2、§3](../sessions/261108-gate-triage/research/R-CT71D-recon.md)，2026-11-09 只读取证）：
+
+| | 仓库 `docker-compose.yml`（main） | 主机现状 |
 | --- | --- | --- |
-| `env_file` | `${ISEC_ENV_FILE:?这份配置由 isec 提供，...}` | `.env` |
-| nginx bind | `./nginx/nginx.conf` | 同路径，但内容停在旧版 |
-| 仓库 `docker-compose.override.yml` | 本地 `build:`，**不要**拷到主机 | 应另写一份主机 override |
+| `env_file` | `${ISEC_ENV_FILE:?这份配置由 isec 提供，...}`（backend/worker/frontend 三处） | `[.env]`（backend/worker 另有 `ops.env` required: false） |
+| `worker.environment` | 多一行 `LOG_DIR=/app/data/logs` | 无（真实行为差异，另行显式确认） |
+| nginx bind | `./nginx/nginx.conf` | 同路径；内容已于 2026-10-21（与 #48 修复同日）手工同步，与 main 逐字节一致（§2.3） |
+| 主机 override | 仓库内 override 是本地 `build:` 配方，不拷主机 | 不存在（§2.2） |
 
-迁移顺序（顺序反了 = 第一次下发就把生产 `env_file` 改成未设置的 `ISEC_ENV_FILE`，compose 直接起不来）：
+仓库版相对主机**新增**的插值必需变量只有 `ISEC_ENV_FILE`（`D3_RELEASE_TAG` / `POSTGRES_PASSWORD` / `FRONTEND_API_KEY` 主机已在提供）。主机 `.env` 加一行 `ISEC_ENV_FILE=.env` 后，仓库 compose 的插值结果与主机现行 env_file 语义一致（研究文档 §3 末行实测：`env_file` 解析为 `[.env, ops.env]`）——**该仓在此方案下不需要 override**；override 机制保留给未来真正的主机结构差异。
 
-1. **先**在主机 `$DEPLOY_DIR/docker-compose.override.yml` 写入（部署用户可写、root 不需要），覆盖三个服务的 `env_file` 为 `.env`（及现有 `ops.env` required: false）。不要带 `build:`。
-2. 手工 `docker compose config` 确认合并结果里 `env_file` 是 `.env`，且仍有 `D3_RELEASE_TAG` 插值。
-3. ci-templates 实现落地后，该仓 `deploy.yml` 增加 `release_files_json: '["docker-compose.yml","nginx/nginx.conf"]'`。仍先钉 `@main` 观察（第 7 节），不要第一次 opt-in 就吃移动后的 `v2`。
-4. 推一次只动 nginx 注释的发布：部署必须把新 conf 送到主机、force-recreate nginx、读回哈希一致。再人为改错主机 nginx.conf 后重跑同一 SHA：skip-forward 不得放行（第 5 节）。
-5. 验证通过后再把该仓 `uses:` / `ci_templates_ref` 拨回 `@v2`。
+迁移顺序（顺序不可倒，依据见研究文档 §4 执行单）：
 
-Compose 合并语义：override 里给出的 `env_file` 序列**替换**基文件的序列，不是追加。不要在 override 里重复 `ISEC_ENV_FILE`。
+1. 备份主机 `docker-compose.yml`、`nginx/nginx.conf`、`.env`（`cp -a` 加时间戳后缀；`.env` 只备份不读内容）。首份 `last_good_manifest` 无 `file` 记录时回滚只回镜像（§3 回滚第 2 条、研究文档 B5），配置回退靠这份手工备份。
+2. 主机 `.env` 追加一行 `ISEC_ENV_FILE=.env`（plain `KEY=value`，无引号无 `$`；解除上述 P1 插值阻断——没有这一步，下发仓库 compose 后主机所有 compose 命令在插值阶段全部拒绝）。
+3. 只读预检（零写盘）：把仓库 main compose 字节经 stdin 送主机 compose——`docker compose -f - config --services` 期望 exit 0、6 服务；再 `config` 全量核对 `env_file` 解析与 `D3_RELEASE_TAG` 插值仍在。
+4. caller `deploy.yml` 仍钉 `@main`（第 7 节），加 `release_files_json: '["docker-compose.yml","nginx/nginx.conf"]'`。
+5. 新 SHA 验证：推一个只动 nginx 注释的 SHA（`last_good_sha` == main HEAD 时 skip-forward 生效，重跑同 SHA 不会下发文件）。**判据**：`[release][config-install] path=nginx/nginx.conf result=replaced` + nginx 容器 `StartedAt` 晚于部署起点（force-recreate 真发生）——**不是**「哈希从旧变新」，主机 nginx.conf 已与 main 一致（研究文档 §2.3、§4.5-3）。
+6. 改坏重跑：人为改坏主机 `nginx.conf` 一字节 → 重跑同一 SHA → skip-forward 必须被禁（第 5 节），日志出 `[release][config-verify] … result=mismatch` 并完整下发装回正确文件；然后恢复。
+
+生产**不**演练探针失败回滚（2026-11-09 用户决定）：整组回滚把配置文件与镜像一起装回旧版本的路径由 `tests/test_release_config_files.py` 覆盖（`result=restored` / `skipped-no-file-records` / `missing-tar` 均有断言）。
+
+将来主机真要写 override 时仍适用：override 给出的序列字段**替换**基文件的序列，不是追加。
 
 ---
 
@@ -239,7 +252,7 @@ README「版本与爆炸半径」：稳定 caller 钉 `@v2` + `ci_templates_ref:
 验证与回退：
 
 1. 实现合入 ci-templates `main`。**先不移动 `v2`。**
-2. `web_transcibe_translate` 临时把 `uses:` / `ci_templates_ref` 改为 `@main`，加上 `release_files_json`，主机已按第 4 节放好 override。真发一次 + 一次探针失败整组回滚（配置与镜像一起回去）。
+2. `web_transcibe_translate` 临时把 `uses:` / `ci_templates_ref` 改为 `@main`，加上 `release_files_json`，主机按第 4 节补齐插值变量（`.env` 追加 `ISEC_ENV_FILE=.env`）。生产验证 = 真发一次 + 改坏重跑（第 4 节步骤 5–6）；**不**在生产演练探针失败回滚（2026-11-09 用户决定），整组回滚路径由 `tests/test_release_config_files.py` 覆盖。
 3. 观察窗口过后再移动 `v2`（按 RUNBOOK：canary 绿 ≠ 已推广）。该仓拨回 `@v2`。
 4. **回退**：未移 `v2` 时，该仓拨回 `@v2` 即离开新代码；ci-templates `git revert` 那组实现 commit。已移 `v2` 则按 RUNBOOK 把 `v2` 移回上一锚点，而不是逐仓改文件。
 5. 空 `release_files_json` 的契约测试必须在实现卡锁死：旧 fixture manifest 无 `file` 行时 `release_deploy.sh` 不写 `$DEPLOY_DIR` 下任何 compose/配置。
