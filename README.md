@@ -79,6 +79,69 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 基镜像、锁定依赖，才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受
 支持——脚本会显式拒绝并保持容器现状，返回 `rc=4`，绝不做部分回滚，需要立即人工介入。
 
+### 随发布下发 compose 与配置文件（`release_files_json`，可选·opt-in）
+
+默认 `release_files_json: "[]"`：与没有这个输入时行为逐字节一致——compose 和配置文件
+仍只存在于主机，部署不传输任何文件。需要让仓库里的 compose 与它 bind 的配置文件
+（如 `nginx/nginx.conf`）随发布一起下发、一起回滚时才声明它：
+
+```yaml
+    with:
+      # ...其余 input 照常...
+      release_files_json: '["docker-compose.yml", "nginx/nginx.conf"]'
+```
+
+值为严格 JSON 数组，元素是仓库相对路径：字符集 `^[A-Za-z0-9._/-]+$`，禁止绝对路径、
+反斜杠、`.` / `..` / 空分量、以 `-` 开头；runner 上源必须是普通文件（符号链接、目录、
+缺失一律拒绝）。非空时**必须恰好包含一个 compose 文件**（basename ∈
+`docker-compose.yml` / `docker-compose.yaml` / `compose.yml` / `compose.yaml`）。全部校验
+在构建前由 `normalize_release.py`（`--files-json`）fail-loud，上限：单文件 ≤ 1 MiB、
+合计 ≤ 4 MiB、最多 32 个（`MAX_FILE_COUNT`）——这是防把 runner 凭据目录打进发布包，
+不是业务配额。
+
+**路径 denylist，永不随发布下发**：任何 `*.env`（`.env` / `ops.env` / `.d3-release.env`
+等——凭据由主机持有）；`docker-compose.override.yml` / `docker-compose.override.yaml` /
+`compose.override.yml` / `compose.override.yaml`（主机专属，见下）；任一分量为 `.git` /
+`.deploy-state` 的路径。声明这些路径在 normalize 与主机侧双侧被拒。
+
+主机 override（`docker-compose.override.yml`）由**主机持有**：部署只检测它是否存在
+（标记 `result=detected-untouched` / `absent`），写、删、chmod 一律禁止。仓库里的
+override 与主机 override 同名不同义，denylist 保证前者永远进不了发布集。
+
+安装与回滚由随每次发布一并 scp 的主机函数库 `scripts/release_files.sh` 执行（与
+`release_deploy.sh` 同一 nonce 路径下发；文件内容 tar 仅在声明非空时传输）：锁内逐文件
+同目录 `mv` 原子替换后 `docker compose up -d`。**bind 了被替换文件的服务会被
+`--force-recreate`**：容器按 inode 持有 bind 的旧文件，只换主机字节不重建容器会让容器
+继续吃旧配置（正是本特性要修的假绿）；bind 关系检测失败 fail-loud，不做「检测不到就
+当无 bind」的降级。
+
+替换后按 manifest 记录的 SHA-256 读回 live 文件字节验证，日志标记可 grep（`result=`
+取值封闭；mismatch 同时打 `::error::`）：
+
+```
+[release][config-verify] path=nginx/nginx.conf sha256=<64hex> result=ok
+[release][config-verify] path=nginx/nginx.conf expected=<64hex> actual=<64hex> result=mismatch
+[release][config-install] path=nginx/nginx.conf result=replaced|not-writable|symlink-refused
+[release][config-override] path=docker-compose.override.yml result=detected-untouched|absent
+[release][config-rollback] sha=<12hex> result=restored|skipped-no-file-records|missing-tar
+```
+
+任一 mismatch（及不可写、符号链接目标）fail-loud：不碰 live、不提升 last-good。同一
+SHA 重跑时，live 文件与 manifest 不符则 **skip-forward 被禁止**，强制完整重新下发
+（防把漂移当成功）。探针失败触发的整组回滚把配置文件与镜像一起装回旧版本；上一份
+发布没有 file 记录（升级窗口）时跳过文件还原（`skipped-no-file-records`），镜像回滚
+不变。
+
+**主机前置**：声明文件的父目录必须对 `ssh_user` 可写（安装是同目录 `mv`，不 chmod、
+不 sudo，不可写时 fail-loud 打 `result=not-writable`）。不满足就不要把该路径写进
+`release_files_json`。
+
+> ⚠️ **release 模板目前没有 canary**（普通模板的常驻 canary 是 url-parse-api；release
+> lane 唯一使用者 `web_transcibe_translate` 钉 `@v2`，没有钉 `@main` 的观察位）。因此
+> 本特性与 release lane 的一切新特性都必须 opt-in，且首次接入按
+> [RUNBOOK 阶段 4](docs/RUNBOOK-go-live.md) 先临时钉 `@main` 真机验证，通过后再随版本
+> 推广移 `@v2`，详见[设计第 7 节](docs/design/release-config-unit.md)。
+
 ## 调用方（每服务 ~10 行）
 
 把 `examples/caller-workflow.yml` 放进服务仓 `.github/workflows/deploy.yml`：

@@ -77,12 +77,13 @@ def _release_ship_with():
     return raw["jobs"]["ship"]["with"], raw["jobs"]["ship"]["secrets"]
 
 
-def test_release_example_uses_release_lane_pinned_to_v1():
+def test_release_example_uses_release_lane_pinned_to_v2():
     with_, _ = _release_ship_with()
     raw = yaml.safe_load((EXAMPLES / "release-caller-workflow.yml").read_text())
-    assert raw["jobs"]["ship"]["uses"].endswith("build-deploy-release.yml@v1"), (
-        "release example must call build-deploy-release.yml, pinned @v1 like the "
-        "single-image caller (only the canary rides @main)"
+    assert raw["jobs"]["ship"]["uses"].endswith("build-deploy-release.yml@v2"), (
+        "release example must call build-deploy-release.yml, pinned @v2 like the "
+        "single-image caller (release lane has no resident canary; new features "
+        "opt in and ride @main first per design section 7)"
     )
 
 

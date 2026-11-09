@@ -322,7 +322,12 @@ git push -f origin v1
 删掉（或留空）即可退回未开门禁前的行为，不影响其他服务；服务侧的挂载 / `LOCK_SH`
 改动如需回退，按该仓自己的部署流程走（不是 D3 流水线负责的范围）。
 
-## 阶段 4：web_transcibe_translate 接入 release lane（多镜像原子发布）
+## 阶段 4：接入 release lane（多镜像原子发布 + 随发布下发配置文件）
+
+以 web_transcibe_translate（当前唯一 release lane 使用者）为原型。分两段：先把多
+镜像原子发布本身跑通，再 opt-in 配置文件下发。每段做完再进下一段。
+
+### 4a. 多镜像原子发布接入
 
 **动作**：
 
@@ -332,11 +337,14 @@ git push -f origin v1
 2. 新增 `.github/workflows/deploy.yml`，内容照抄
    [`examples/release-caller-workflow.yml`](../examples/release-caller-workflow.yml)，
    按该服务真实的 `host` / `deploy_dir` 改 `with:` 块；`uses:` 先钉 `@main`
-   （和阶段 1 canary 同样的爆炸半径纪律，不要第一次接入就吃 `@v1` 的既有产线）。
+   ——**release 模板目前没有 canary**（见 README release 节与
+   [设计第 7 节](design/release-config-unit.md)），不要第一次接入就吃移动后的
+   `@v2`。
 3. 真实推一次发布，确认两个镜像一起 build、一起 push、一起原子切换。
 4. 人为制造一次探针失败（临时改错 `probes_json` 里某条 URL 或
    `expect_status`），确认**整组**回滚到旧版本（不是只回滚一个镜像）。
-5. 全部验证通过后，把 `uses:` 从 `@main` 改成 `@v1`，正式接入既有产线。
+5. 全部验证通过后，把 `uses:` / `ci_templates_ref` 从 `@main` / `main` 改成
+   `@v2` / `v2`，正式接入既有产线。
 
 **验证点**：正常发布时两个镜像的 tag 一致且都是本次 `GIT_SHA`；探针故意失败时
 `.deploy-state/release/last_good_release` 没有被更新，旧的两个镜像都还在跑，
@@ -345,6 +353,51 @@ git push -f origin v1
 **回滚点**：探针失败已经触发脚本自动整组回滚，一般不需要人工介入；如需人工
 回退到接入 release lane 之前的状态，把 `deploy.yml` 删掉、compose 的 `image:`
 字段改回接入前的写法即可，不影响该服务在此之前的运行方式。
+
+### 4b. 配置文件随发布下发（`release_files_json`，opt-in）
+
+按[设计第 4 节「迁移顺序」](design/release-config-unit.md)执行。顺序反了会出事故：
+仓库 compose 的 `env_file` 若引用主机没有的变量源，第一次下发就会把生产
+`env_file` 改成未设置的变量，compose 直接起不来。
+
+**主机前置**：声明文件的父目录必须对 `ssh_user` 可写（安装是同目录 `mv`，部署不
+chmod、不 sudo，不可写时 fail-loud 打 `result=not-writable`）。不满足时先改主机
+属主或把该文件移出发布集，**不要**把该路径写进 `release_files_json`。`.env` /
+任何 `*.env` / `docker-compose.override.yml` / `compose.override.yml` 等在路径
+denylist 里，声明它们会被 normalize 与主机双侧拒绝——凭据与主机差异**永不**随
+发布下发（详见 README release 节）。
+
+**动作**（顺序不可换）：
+
+1. **先**在主机 `$DEPLOY_DIR/docker-compose.override.yml` 写入主机差异（部署用户
+   可写即可，不需要 root）：覆盖需要改的字段（如把服务的 `env_file` 改成主机
+   实际持有的 `.env`）。不要带 `build:`——仓库 override 里的本地构建配方**不要**
+   拷到主机。部署只读这个文件，永远不会写/删/改它。
+2. 手工在主机上 `docker compose config` 核对合并结果：被覆盖的字段是主机值、
+   `D3_RELEASE_TAG` 插值仍在。注意 override 给出的序列字段（如 `env_file`）会
+   **替换**基文件的序列，不是追加，不要在 override 里重复仓库基文件已有的条目。
+3. caller 的 `with:` 块加 `release_files_json`（严格 JSON 数组，非空时必须恰好
+   一个 compose + 它 bind 的配置文件，如
+   `release_files_json: '["docker-compose.yml","nginx/nginx.conf"]'`；默认 `[]`
+   = 不传输任何文件，这一步对未声明的服务零影响），`uses:` / `ci_templates_ref`
+   仍钉 `@main` / `main` 观察。
+4. 推一次**只改注释**的发布验证下发：部署日志应有
+   `[release][config-verify] ... result=ok`，bind 了该文件的服务被
+   `--force-recreate`。然后把主机上该配置文件人为改错，重跑同一 SHA：同 SHA 本
+   会 skip-forward，但 live 文件与 manifest 哈希不符时 skip-forward **被禁止**
+   （日志 `same-SHA live release files mismatched; skip-forward is forbidden`），
+   必须完整重新下发把正确文件装回去。
+5. 验证通过后把 `uses:` / `ci_templates_ref` 拨回 `@v2` / `v2`。
+
+**验证点（4b）**：配置文件真到达主机且哈希一致（`result=ok`）；主机 override
+检测标记是 `detected-untouched` 且字节未被改动；人为改坏主机文件后重跑同 SHA，
+skip-forward 被拒绝、文件被装回正确版本；探针失败触发的整组回滚把配置文件与
+镜像**一起**带回旧版本（`[release][config-rollback] ... result=restored`）。
+
+**回滚点**：探针失败已触发脚本自动整组回滚（4b 开启后配置文件一并回滚），一般
+不需要人工介入；如需人工回退，把 caller 里的 `release_files_json` 改回 `'[]'`
+（或删掉该行）即可离开下发路径——主机上已装的正确文件留着无害（旧 compose 不
+再引用、回滚不删除），主机 override 始终保持主机持有、部署不碰。
 
 ## 阶段 5：收尾 —— BACKLOG 重评触发条件巡检
 

@@ -10,8 +10,9 @@
 # both images from the same immutable release tag.
 #
 # 首次接入建议先钉 @main 跑通一次真实发布(见 docs/RUNBOOK-go-live.md 阶段 4:
-# web_transcibe_translate 接 release lane),确认探针/回滚都正常之后再改回
-# @v1 —— 和单镜像 lane 一样的爆炸半径纪律,一个坏 commit 不该直接炸生产。
+# 接入 release lane),确认探针/回滚都正常之后再改回 @v2 —— release 模板目前
+# 没有 canary(普通模板的常驻 canary 是 url-parse-api),所以新特性(含配置文件
+# 下发)必须 opt-in 并先吃 @main,一个坏 commit 不该直接炸生产。
 name: deploy
 on:
   push:
@@ -19,7 +20,7 @@ on:
 
 jobs:
   ship:
-    uses: zlxlabs/ci-templates/.github/workflows/build-deploy-release.yml@v1
+    uses: zlxlabs/ci-templates/.github/workflows/build-deploy-release.yml@v2
     with:
       # 严格 JSON 数组:每项 image_name/build_context/dockerfile 必填,可选
       # build_alias(worker 别名复用同一次构建,这里两个镜像各自独立构建,不需要)。
@@ -36,10 +37,16 @@ jobs:
           {"url": "http://localhost:8080/", "expect_status": 200},
           {"url": "http://localhost:8001/healthz", "expect_status": 200}
         ]
+      # 可选·随发布下发 compose 与它 bind 的配置文件(opt-in,默认 [] = 不传输任何
+      # 文件,行为与没有这行完全一致)。非空时必须恰好一个 compose 文件(bind-mount
+      # 的配置文件用仓库相对路径);单文件 ≤ 1 MiB、合计 ≤ 4 MiB、最多 32 个。
+      # 主机差异放在主机自己的 docker-compose.override.yml 里:override 与 .env/
+      # 凭据永不随发布下发,部署对主机 override 只读不写。
+      # release_files_json: '["docker-compose.yml", "nginx/nginx.conf"]'
       host: <tailscale-ip>                                # Tailscale-reachable IP (runner has no ~/.ssh/config — NOT alias host-3)
       ssh_user: deploy                                     # SSH user on the target host
       deploy_dir: /srv/automation/web-transcribe-translate
-      ci_templates_ref: v1                              # fetch release scripts from @v1 too
+      ci_templates_ref: v2                              # fetch release scripts from @v2 too
       # 可选·部署门禁:服务忙时本次延期不替换,不加则行为不变(见 docs/design/d3-busy-lock-gate.md)
       # busy_lock_file: /srv/automation/web-transcribe-translate/.deploy-state/busy.lock
       # 可选·compose 一次性/迁移服务:只在回滚跳过,forward 仍全量 up(见 README oneshot_services);
