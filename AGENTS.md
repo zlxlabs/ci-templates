@@ -17,6 +17,10 @@ gate-hub 继承；「改动纪律」一节的爆炸半径要求对来自 gate-hu
 
 ## 风险等级：`internal`
 
+verify-remote: ci.yml
+
+verify-remote-main: ci.yml
+
 本仓按 **`internal`** 档评审。词汇与 CI gate 的 `GATE_TIER` 一致，但注意本仓的 pre-merge 门禁
 workflow 在 [`zlxlabs/gate`](https://github.com/zlxlabs/gate) 而不在本仓（见 README「门禁（pre-merge）在哪」），
 本仓自身的 CI 只跑 `ci.yml` 里的 pytest。所以这条声明的作用是**给 agent 评审定红线**，
