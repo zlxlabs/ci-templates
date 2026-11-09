@@ -2,7 +2,6 @@
 
 import json
 import os
-import stat
 import subprocess
 from pathlib import Path
 
@@ -144,8 +143,10 @@ def test_postprobe_live_mismatch_emits_error_and_restores_previous_file_tar(tmp_
         b"known good conf\n",
     )
     env.update(RELEASE_MANIFEST=str(first_manifest), RELEASE_FILES_TAR=str(first_tar))
-    _compose_env_log = tmp_path / "compose-env.log"
-    mock_file_install_docker(Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()), compose_file=_compose_env_log)
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()),
+        compose_file=tmp_path / "compose-env.log",
+    )
     first = run(env)
     assert first.returncode == 0, first.stdout + first.stderr
 
@@ -341,6 +342,45 @@ def test_rollback_requires_previous_cached_tar_and_returns_rc4(tmp_path):
     assert len([line for line in log.read_text().splitlines() if "up -d" in line]) == 2
 
 
+def test_missing_previous_tar_returns_rc4_even_when_current_staging_fails_before_live_mutation(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "nginx").mkdir()
+    live_conf = deploy / "nginx" / "nginx.conf"
+    first_manifest, first_tar = normalize_file_package(
+        tmp_path, "abc123456789",
+        b"services:\n  frontend: {}\n  backend: {}\n",
+        b"known good conf\n",
+    )
+    env.update(RELEASE_MANIFEST=str(first_manifest), RELEASE_FILES_TAR=str(first_tar))
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()),
+        compose_file=tmp_path / "compose-env.log",
+    )
+    first = run(env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    good_bytes = live_conf.read_bytes()
+    (Path(env["STATE_DIR"]) / "files" / "abc123456789.tar").unlink()
+
+    next_manifest, next_tar = normalize_file_package(
+        tmp_path, "def567890123",
+        b"services:\n  frontend: {}\n  backend: {}\n",
+        b"unreachable staging payload\n",
+    )
+    next_tar.write_bytes(b"not a tar archive")
+    env.update(D3_RELEASE_TAG="def567890123", RELEASE_MANIFEST=str(next_manifest), RELEASE_FILES_TAR=str(next_tar))
+    log.write_text("")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert result.returncode == 4, out
+    assert "release file staging failed before live mutation" in out
+    assert "[release][config-rollback] sha=abc123456789 result=missing-tar" in out
+    assert live_conf.read_bytes() == good_bytes
+    assert not any("up -d" in line for line in log.read_text().splitlines())
+
+
 def test_bind_mount_inspect_failure_is_not_treated_as_no_match(tmp_path):
     env, log = base(tmp_path)
     deploy = Path(env["DEPLOY_DIR"])
@@ -362,27 +402,54 @@ def test_bind_mount_inspect_failure_is_not_treated_as_no_match(tmp_path):
     assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 
-def test_exit_cleanup_removes_only_exact_remote_files_tar(tmp_path):
+def test_helper_source_has_no_load_time_actions(tmp_path):
+    helper = REPO_ROOT / "scripts" / "release_files.sh"
+    before = set(tmp_path.iterdir())
+    result = subprocess.run(
+        ["bash", "-c", 'source "$1"; declare -F release_files_init >/dev/null; printf loaded', "bash", str(helper)],
+        cwd=tmp_path, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "loaded"
+    assert set(tmp_path.iterdir()) == before
+
+
+def test_release_files_library_is_required_even_for_empty_file_manifest(tmp_path):
+    env, log = base(tmp_path)
+    env.pop("RELEASE_FILES_LIB")
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert "RELEASE_FILES_LIB required" in out
+    assert not log.exists() or "compose" not in log.read_text()
+
+
+def test_exit_cleanup_removes_only_exact_remote_release_files(tmp_path):
     env, _ = base(tmp_path)
     nonce = f"{os.getpid()}-41-7"
     remote_script = Path("/tmp") / f"d3-release-{nonce}.sh"
+    remote_lib = Path("/tmp") / f"d3-release-{nonce}.files.sh"
     remote_manifest = Path("/tmp") / f"d3-release-{nonce}.manifest"
     remote_tar = Path("/tmp") / f"d3-release-{nonce}.files.tar"
-    neighboring_tar = Path("/tmp") / f"d3-release-{os.getpid()}-41.files.tar"
+    neighboring_lib = Path("/tmp") / f"d3-release-{os.getpid()}-41.files.sh"
     remote_script.write_text("temporary")
+    remote_lib.write_text("temporary library")
     remote_manifest.write_text(Path(env["RELEASE_MANIFEST"]).read_text())
     remote_tar.write_bytes(b"temporary archive")
-    neighboring_tar.write_bytes(b"keep")
+    neighboring_lib.write_text("keep")
     env.update(
         RELEASE_MANIFEST=str(remote_manifest), RELEASE_TEMP_SCRIPT=str(remote_script),
-        RELEASE_FILES_TAR=str(remote_tar), DEPLOY_DIR="",
+        RELEASE_FILES_LIB=str(remote_lib), RELEASE_FILES_TAR=str(remote_tar), DEPLOY_DIR="",
     )
 
     result = run(env)
 
     assert result.returncode != 0
     assert not remote_script.exists()
+    assert not remote_lib.exists()
     assert not remote_manifest.exists()
     assert not remote_tar.exists()
-    assert neighboring_tar.read_bytes() == b"keep"
-    neighboring_tar.unlink()
+    assert neighboring_lib.read_text() == "keep"
+    neighboring_lib.unlink()
