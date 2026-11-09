@@ -406,7 +406,7 @@ def test_helper_source_has_no_load_time_actions(tmp_path):
     helper = REPO_ROOT / "scripts" / "release_files.sh"
     before = set(tmp_path.iterdir())
     result = subprocess.run(
-        ["bash", "-c", 'source "$1"; declare -F release_files_init >/dev/null; printf loaded', "bash", str(helper)],
+        ["bash", "-c", 'source "$1" && declare -F release_files_init >/dev/null && printf loaded', "bash", str(helper)],
         cwd=tmp_path, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stderr
