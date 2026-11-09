@@ -14,6 +14,11 @@ on:
         description: "Strict JSON array of release-level {url, expect_status} probes"
         required: true
         type: string
+      release_files_json:
+        description: "Strict JSON array of repo-relative paths to ship with the release; empty disables file transfer"
+        required: false
+        default: "[]"
+        type: string
       host:
         description: "Tailscale-reachable IP or MagicDNS name; also the concurrency key"
         required: true
@@ -141,11 +146,16 @@ jobs:
         env:
           IMAGES_JSON: ${{ inputs.images_json }}
           PROBES_JSON: ${{ inputs.probes_json }}
+          FILES_JSON: ${{ inputs.release_files_json }}
         run: |
           set -euo pipefail
+          rm -f -- "$RUNNER_TEMP/d3-release.files.tar"
           python3 "$RUNNER_TEMP/ci-templates/scripts/normalize_release.py" \
             --images-json "$IMAGES_JSON" \
             --probes-json "$PROBES_JSON" \
+            --files-json "$FILES_JSON" \
+            --repo-root "$GITHUB_WORKSPACE" \
+            --files-tar-out "$RUNNER_TEMP/d3-release.files.tar" \
             --manifest-out "$RUNNER_TEMP/d3-release.manifest" \
             --builds-out "$RUNNER_TEMP/d3-release.builds"
           # Deploy cleanup deletes the manifest; persist declared image names for
@@ -246,7 +256,7 @@ jobs:
           release_base="${repo_slug}-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           [[ "$release_base" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+$ ]] || { echo "invalid GitHub run metadata" >&2; exit 2; }
           cleanup_local() {
-            rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds"
+            rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds" "$RUNNER_TEMP/d3-release.files.tar"
           }
           trap cleanup_local EXIT
           deploy_once() {
@@ -255,10 +265,11 @@ jobs:
             [[ "$transport_nonce" =~ ^[A-Za-z0-9_-]+-[0-9]+-[0-9]+-[0-9]+$ ]] || return 2
             local remote_manifest="/tmp/d3-release-${transport_nonce}.manifest"
             local remote_script="/tmp/d3-release-${transport_nonce}.sh"
-            # P2-B (codex review round 5): best-effort remote cleanup for the
-            # case where the remote script never gets a chance to run at all
-            # (so its own cleanup trap never installs) -- i.e. either of the
-            # two scp calls below fails. remote_manifest/remote_script are
+            local remote_files_lib="/tmp/d3-release-${transport_nonce}.files.sh"
+            local remote_files_tar="/tmp/d3-release-${transport_nonce}.files.tar"
+            # Best-effort cleanup covers every scp failure before the remote
+            # script can install its EXIT trap. Each path is nonce-scoped and
+            # explicit; the remote temporary directory is never globbed.
             # local to this attempt (keyed by transport_nonce), so a later
             # retry uses a fresh path and never reclaims this one; nothing
             # else will ever remove it. rm -f on a path that was never
@@ -274,9 +285,14 @@ jobs:
             # below. It no longer does -- see the comment at that branch for
             # why running it there raced the remote script's own rollback.
             local cleanup_remote_cmd
-            printf -v cleanup_remote_cmd 'rm -f -- %q %q' "$remote_manifest" "$remote_script"
+            printf -v cleanup_remote_cmd 'rm -f -- %q %q %q %q' "$remote_manifest" "$remote_script" "$remote_files_lib" "$remote_files_tar"
             scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_deploy.sh" \
               "${SSH_USER}@${DEPLOY_HOST}:${remote_script}" || {
+                ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                return 255
+              }
+            scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_files.sh" \
+              "${SSH_USER}@${DEPLOY_HOST}:${remote_files_lib}" || {
                 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
                 return 255
               }
@@ -285,19 +301,28 @@ jobs:
                 ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
                 return 255
               }
+            local release_files_tar_path=""
+            if [[ -f "$RUNNER_TEMP/d3-release.files.tar" ]]; then
+              scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.files.tar" \
+                "${SSH_USER}@${DEPLOY_HOST}:${remote_files_tar}" || {
+                  ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$cleanup_remote_cmd" || true
+                  return 255
+                }
+              release_files_tar_path="$remote_files_tar"
+            fi
             # printf %q makes every input one shell word; no JSON or raw input
             # is ever concatenated into the remote command.
-            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q HEALTHCHECK_RETRIES=%q HEALTHCHECK_INTERVAL=%q HEALTHCHECK_WARMUP=%q ONESHOT_SERVICES=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q bash %q' \
+            printf -v remote_cmd 'ACR_REGISTRY=%q ACR_NAMESPACE=%q D3_RELEASE_TAG=%q DEPLOY_DIR=%q HOST_LOCK=%q BUSY_LOCK_FILE=%q BUSY_LOCK_TIMEOUT=%q HEALTHCHECK_RETRIES=%q HEALTHCHECK_INTERVAL=%q HEALTHCHECK_WARMUP=%q ONESHOT_SERVICES=%q RELEASE_MANIFEST=%q RELEASE_TEMP_SCRIPT=%q RELEASE_FILES_LIB=%q RELEASE_FILES_TAR=%q bash %q' \
               "$ACR_REGISTRY" "$ACR_NAMESPACE" "$D3_RELEASE_TAG" "$DEPLOY_DIR" \
               "$HOST_LOCK" "$BUSY_LOCK_FILE" "$BUSY_LOCK_TIMEOUT" \
               "$HEALTHCHECK_RETRIES" "$HEALTHCHECK_INTERVAL" "$HEALTHCHECK_WARMUP" \
               "$ONESHOT_SERVICES" \
-              "$remote_manifest" "$remote_script" "$remote_script"
+              "$remote_manifest" "$remote_script" "$remote_files_lib" "$release_files_tar_path" "$remote_script"
             ssh "${SSH_OPTS[@]}" "${SSH_USER}@${DEPLOY_HOST}" "$remote_cmd"
             local ssh_rc=$?
             # P2-B-2 (codex review round 7, fixing a bug in round 5/e1688ba):
             # deliberately NOT cleaning up remote_manifest/remote_script here,
-            # unlike the two scp failure points above. Both scp calls already
+            # unlike the scp failure points above. Every required transfer has
             # succeeded by the time we reach this line, so release_deploy.sh
             # has been shipped and its "ssh ... bash $remote_script" command
             # was launched; ssh_rc==255 only means *this* SSH connection lost
@@ -324,16 +349,18 @@ jobs:
             # been removed from this branch.
             #
             # release_deploy.sh's own EXIT trap (trap cleanup EXIT, which
-            # deletes REMOTE_SCRIPT_PATH/REMOTE_MANIFEST_PATH) is the only
-            # thing safe to rely on here once both scp calls above have
+            # deletes exact REMOTE_SCRIPT_PATH/REMOTE_MANIFEST_PATH,
+            # RELEASE_FILES_LIB, and optional RELEASE_FILES_TAR paths) is the
+            # only thing safe to
+            # rely on here once the required scp calls above have
             # confirmed the script was actually shipped: that trap runs
             # before the script truly exits no matter how it gets there --
             # normal completion, a probe-failure rollback, or a
             # pending-signal rollback after HUP -- so it is the sole owner of
-            # cleaning up these two /tmp paths from this point on. Accepted
-            # cost: if scp fully succeeded but this ssh invocation never
-            # actually reached the point of the remote trap installing at all
-            # (connection died at the very start), these two /tmp files leak
+            # cleaning up these exact /tmp paths from this point on. Accepted
+            # cost: if all required scp calls succeeded but this ssh invocation
+            # never actually reached the point of the remote trap installing
+            # (connection died at the very start), these exact /tmp files leak
             # until the host's own /tmp reaper or a manual pass clears them --
             # there is no reliable way for the CI side to tell that case apart
             # from "script is mid-flight and will clean up after itself"

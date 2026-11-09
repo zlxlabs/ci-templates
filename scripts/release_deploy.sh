@@ -3,11 +3,13 @@
 #
 # The CI job validates JSON and sends this script a restricted, tab-separated
 # manifest.  This host-side code intentionally has no jq/Python dependency.
-# Every image is pulled and retagged with D3_RELEASE_TAG before one compose up;
-# no mutable registry latest tag is ever used.  The previous manifest and SHA
-# are promoted only after all probes pass, and rollback uses one compose up for
-# the complete previous group.
+# Every image is pulled and retagged with D3_RELEASE_TAG before Compose applies
+# the release group; bound config services then receive a targeted forced
+# recreation. No mutable registry latest tag is ever used. The previous
+# manifest and SHA are promoted only after all probes pass, and rollback
+# restores the previous group before its probes.
 set -u -o pipefail
+unset COMPOSE_FILE
 
 # REMOTE_SCRIPT_PATH must be assigned before ANY validation below that can
 # exit the script (the first is RELEASE_MANIFEST's `:?` a few lines down).
@@ -19,6 +21,9 @@ set -u -o pipefail
 # cleanup()'s /tmp/d3-release-*.sh pattern, so behavior is unchanged; it just
 # guarantees the variable is always bound by the time cleanup() can run.
 REMOTE_SCRIPT_PATH="${RELEASE_TEMP_SCRIPT:-}"
+REMOTE_FILES_LIB="${RELEASE_FILES_LIB:-}"
+REMOTE_FILES_TAR="${RELEASE_FILES_TAR:-}"
+STAGING_DIRS=()
 
 log() { echo "[release] $*"; }
 die() { log "ERROR: $*" >&2; return 1; }
@@ -37,6 +42,8 @@ cleanup() {
   # not a behavior change, for every run that gets far enough to stage
   # anything real.
   rm -f -- "${STAGING_PREFIX:-}.manifest" "${STAGING_PREFIX:-}.env" "${STAGING_PREFIX:-}.sha" "${STAGING_PREFIX:-}.release" "${STAGING_PREFIX:-}.previous" 2>/dev/null || true
+  local staging_dir
+  for staging_dir in "${STAGING_DIRS[@]}"; do rm -rf -- "$staging_dir"; done
   # These are exact per-run paths supplied by the workflow; never glob /tmp.
   # The nonce now carries a repo-identity slug ahead of the numeric run fields
   # (P1-1: GITHUB_RUN_ID is only unique within a single repo, not across repos),
@@ -47,6 +54,9 @@ cleanup() {
   if [[ "$REMOTE_SCRIPT_PATH" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.sh$ ]]; then
     rm -f -- "$REMOTE_SCRIPT_PATH" 2>/dev/null || true
   fi
+  if [[ "$REMOTE_FILES_LIB" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.files\.sh$ ]]; then
+    rm -f -- "$REMOTE_FILES_LIB" 2>/dev/null || true
+  fi
   # REMOTE_MANIFEST_PATH is assigned immediately after RELEASE_MANIFEST's own
   # `:?` check below, so it is unset only if THAT specific check is what
   # fails. Guard with `:-` for the same reason as STAGING_PREFIX above: an
@@ -56,6 +66,9 @@ cleanup() {
   # pattern, so this changes nothing once RELEASE_MANIFEST has passed.
   if [[ "${REMOTE_MANIFEST_PATH:-}" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.manifest$ ]]; then
     rm -f -- "$REMOTE_MANIFEST_PATH" 2>/dev/null || true
+  fi
+  if [[ "$REMOTE_FILES_TAR" =~ ^/tmp/d3-release-[A-Za-z0-9_-]+\.files\.tar$ ]]; then
+    rm -f -- "$REMOTE_FILES_TAR" 2>/dev/null || true
   fi
   if [[ -n "${LOCK_HELD:-}" ]]; then
     flock -u 9 2>/dev/null || true
@@ -85,6 +98,13 @@ trap 'on_signal HUP' HUP
 REMOTE_MANIFEST_PATH="$RELEASE_MANIFEST"
 : "${D3_RELEASE_TAG:?D3_RELEASE_TAG required}"
 : "${DEPLOY_DIR:?DEPLOY_DIR required}"
+: "${RELEASE_FILES_LIB:?RELEASE_FILES_LIB required}"
+[[ -f "$RELEASE_FILES_LIB" && ! -L "$RELEASE_FILES_LIB" ]] || {
+  log "release files library missing or not a regular file: $RELEASE_FILES_LIB" >&2
+  exit 1
+}
+source "$RELEASE_FILES_LIB" || { log "could not load release files library" >&2; exit 1; }
+release_files_init
 
 STATE_DIR="${STATE_DIR:-${DEPLOY_DIR}/.deploy-state/release}"
 HOST_LOCK="${HOST_LOCK:-/var/lock/fleet-deploy.lock}"
@@ -166,9 +186,10 @@ PROBE_STATUS=()
 declare -A SEEN_IMAGE_NAMES=()
 
 load_manifest() {
-  local file="$1" line kind a b
+  local file="$1" line kind a b compose_count=0
   [[ -f "$file" ]] || { log "manifest not found: $file" >&2; return 1; }
   IMAGE_NAMES=(); IMAGE_REFS=(); PROBE_URLS=(); PROBE_STATUS=(); SEEN_IMAGE_NAMES=()
+  FILE_PATHS=(); FILE_HASHES=(); SEEN_FILE_PATHS=(); FILE_STAGE_DIR=""
   local header_seen=0
   while IFS=$'\t' read -r kind a b; do
     [[ -z "$kind" ]] && continue
@@ -197,11 +218,26 @@ load_manifest() {
         PROBE_URLS+=("$a")
         PROBE_STATUS+=("$b")
         ;;
+      file)
+        release_file_path_safe "$a" || { log "unsafe or forbidden file path in manifest: $a" >&2; return 1; }
+        [[ "$b" =~ ^[0-9a-f]{64}$ ]] || { log "invalid file sha256 in manifest: $a" >&2; return 1; }
+        [[ -z "${SEEN_FILE_PATHS[$a]+seen}" ]] || { log "duplicate file path in manifest: $a" >&2; return 1; }
+        SEEN_FILE_PATHS["$a"]=1
+        FILE_PATHS+=("$a")
+        FILE_HASHES+=("$b")
+        is_compose_file_path "$a" && compose_count=$((compose_count + 1))
+        ;;
       *) log "unknown manifest record: $kind" >&2; return 1 ;;
     esac
   done < "$file"
   [[ "$header_seen" -eq 1 && "${#IMAGE_NAMES[@]}" -gt 0 ]] || { log "manifest has no images" >&2; return 1; }
   [[ "${#PROBE_URLS[@]}" -gt 0 ]] || { log "manifest has no release probes" >&2; return 1; }
+  if [[ "${#FILE_PATHS[@]}" -gt 0 ]]; then
+    [[ "${#FILE_PATHS[@]}" -le 32 && "$compose_count" -eq 1 ]] || {
+      log "file records must contain at most 32 paths and exactly one compose file" >&2
+      return 1
+    }
+  fi
 }
 
 pull_and_retag() {
@@ -491,93 +527,6 @@ oneshot_schema_hint() {
   log "hint: this release may have run one-shot/migration services; the previous application version may be incompatible with the current database schema — manual verification required" >&2
 }
 
-compose_release() {
-  local tag="$1" env_tmp="${STAGING_PREFIX}.env"
-  check_pending || return 130
-  printf 'D3_RELEASE_TAG=%s\n' "$tag" > "$env_tmp" || return 1
-  mv -f -- "$env_tmp" "$ENV_FILE" || return 1
-  local compose_args=(compose)
-  # Compose does not load the project .env when --env-file is supplied.  Keep
-  # the caller's variables and overlay only D3_RELEASE_TAG afterwards.
-  if [[ -f "$DEPLOY_DIR/.env" ]]; then
-    compose_args+=(--env-file "$DEPLOY_DIR/.env")
-  fi
-  compose_args+=(--env-file "$ENV_FILE")
-  local rendered_images config_rc=0 image_ref found_any line
-  # Docker Compose resolves ${VAR} interpolation from the shell environment
-  # BEFORE --env-file. D3_RELEASE_TAG is exported into this whole script's
-  # process environment by the SSH invocation and is never reassigned, so a
-  # bare `docker compose ...` call here would keep resolving whichever tag the
-  # script started with — wrong during rollback, when this function is asked
-  # to deploy a DIFFERENT (older) tag than the one still sitting in the
-  # process environment. Pin D3_RELEASE_TAG="$tag" explicitly on every compose
-  # invocation so it always reflects what THIS call is actually deploying,
-  # regardless of what leaked in from the process environment.
-  rendered_images="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}" config --images 2>&1)" || config_rc=$?
-  if (( config_rc != 0 )); then
-    log "compose config --images failed; compose up will not run" >&2
-    return 1
-  fi
-  # A declared image name can appear more than once in `compose config --images`
-  # when multiple services reference it. Requiring only ONE occurrence to match
-  # the expected <name>:<tag> is not enough: a second service left on `latest` or
-  # a stale SHA (e.g. a missed env-var interpolation) would slip through as long
-  # as some other service got the tag right — exactly the "half new, half old"
-  # image group this atomic-release gate exists to block. Every occurrence of a
-  # declared image name must match the expected ref; any stray occurrence fails
-  # the gate immediately. Non-declared images (e.g. nginx) are unconstrained.
-  for image_name in "${IMAGE_NAMES[@]}"; do
-    image_ref="${image_name}:${tag}"
-    found_any=0
-    while IFS= read -r line; do
-      [[ -n "$line" ]] || continue
-      # Exact-prefix match on "<image_name>:" so e.g. declared name "frontend"
-      # never matches an unrelated "frontend-worker:xxx" line.
-      if [[ "$line" == "${image_name}:"* ]]; then
-        found_any=1
-        if [[ "$line" != "$image_ref" ]]; then
-          log "compose identity gate: ${image_name} has a stray reference (${line}), expected ${image_ref}; compose up will not run" >&2
-          return 1
-        fi
-      fi
-    done <<< "$rendered_images"
-    if (( found_any == 0 )); then
-      log "compose identity gate missing ${image_ref}; compose up will not run" >&2
-      return 1
-    fi
-  done
-  # A signal (INT/TERM/HUP) could have landed while we were blocked inside
-  # `config --images` or walking the identity-gate loop above — on_signal()
-  # only records PENDING_SIGNAL, it doesn't abort anything, and this whole
-  # gate check makes no docker calls to naturally surface it. Without this
-  # recheck, a cancellation recorded here would fall straight through into
-  # `compose up -d` regardless. On a first deploy (no previous good release)
-  # that is unrecoverable: the cancelled release's containers get switched
-  # in, are never promoted, and there is nothing to roll back to.
-  check_pending || return 130
-  if [[ "$ROLLBACK_MODE" -eq 0 ]]; then
-    validate_oneshot_services "$tag" || return 1
-  fi
-  if [[ "$ROLLBACK_MODE" -eq 1 && -n "$ONESHOT_SERVICES" ]]; then
-    local rollback_services=() _svc_list="" _list_rc=0
-    _svc_list="$(rollback_compose_services "$tag")" || _list_rc=$?
-    if (( _list_rc != 0 )); then
-      return 1
-    fi
-    readarray -t rollback_services <<< "$_svc_list"
-    compose_args+=(up -d "${rollback_services[@]}")
-  else
-    compose_args+=(up -d)
-  fi
-  local compose_rc=0
-  # 200 is outside Docker/Compose's documented 0-125 process exit range, so
-  # reserve it as a private sentinel for a failed cd before docker is called.
-  (cd "$DEPLOY_DIR" || exit 200; D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
-  (( compose_rc != 200 )) && MUTATED=1
-  check_pending || return 130
-  return "$compose_rc"
-}
-
 probe_release() {
   local i attempt code curl_rc attempt_sequence
   (( ${#PROBE_URLS[@]} == 0 )) && { log "no release probes declared"; return 0; }
@@ -645,25 +594,6 @@ promote() {
   return 0
 }
 
-deploy_group() {
-  local sha="$1" manifest="$2" staged="${3:-0}" prefer_local="${4:-0}"
-  load_manifest "$manifest" || return 1
-  check_pending || return 130
-  if [[ "$staged" -eq 0 ]]; then
-    pull_and_retag "$sha" "$prefer_local" || return 1
-  fi
-  compose_release "$sha" || return 1
-}
-
-stage_current_release() {
-  check_pending || return 130
-  load_manifest "$RELEASE_MANIFEST" || return 1
-  check_pending || return 130
-  pull_and_retag "$D3_RELEASE_TAG" 0 || return 1
-  check_pending || return 130
-  CURRENT_STAGED=1
-}
-
 do_release() {
   local previous_sha="" previous_manifest="" current_rc=0 rollback_rc=0 rollback_healthy=0 first_line=1 line
   mkdir -p "$STATE_DIR" || return 1
@@ -690,16 +620,16 @@ do_release() {
     [[ "$previous_sha" =~ ^[0-9a-f]{12}$ ]] || previous_sha=""
   fi
 
-  if [[ "$previous_sha" == "$D3_RELEASE_TAG" ]]; then
+  if [[ "$previous_sha" == "$D3_RELEASE_TAG" ]] && release_files_skip_forward; then
     log "this SHA already in last_good_release; skip forward deploy; reconcile only"
     return 0
   fi
 
-  deploy_group "$D3_RELEASE_TAG" "$RELEASE_MANIFEST" "$CURRENT_STAGED" || current_rc=$?
+  release_files_deploy_current || current_rc=$?
   if (( current_rc != 0 )) || [[ -n "$PENDING_SIGNAL" ]]; then
     log "new release failed before health gate"
   else
-    if probe_release && check_pending; then
+    if probe_release && release_files_post_probe && check_pending; then
       # Ignore a second signal for the short canonical commit: once promotion
       # starts, both SHA and manifest move as one protected release decision.
       trap ':' INT TERM HUP
@@ -815,7 +745,7 @@ do_release() {
   else
     log "no previous good release available; refusing pseudo-rollback" >&2
   fi
-  if (( MUTATED == 1 && rollback_healthy == 0 )); then
+  if (( ROLLBACK_CONFIG_FAILED == 1 )) || (( MUTATED == 1 && rollback_healthy == 0 )); then
     return 4
   fi
   [[ -n "$PENDING_SIGNAL" ]] && return 130

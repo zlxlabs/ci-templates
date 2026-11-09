@@ -115,7 +115,7 @@ def base(tmp_path, *, status="200", compose_rc=0, fail_pull=False, fail_tag=Fals
     manifest(mf)
     env = dict(os.environ)
     env.update(
-        RELEASE_MANIFEST=str(mf),
+        RELEASE_MANIFEST=str(mf), RELEASE_FILES_LIB=str(SCRIPT.with_name("release_files.sh")),
         D3_RELEASE_TAG="abc123456789",
         ACR_REGISTRY="registry",
         ACR_NAMESPACE="ns",

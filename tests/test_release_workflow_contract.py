@@ -303,21 +303,20 @@ def test_orphaned_remote_files_cleaned_up_on_scp_failure():
     # or reclaims a prior failed attempt's files. If either scp fails, the
     # remote script never gets a chance to run at all -- its own cleanup trap
     # never installs -- so nothing else will ever remove those /tmp paths.
-    # A best-effort ssh rm -f cleanup, covering both remote_manifest and
-    # remote_script, must be reachable from both scp failure points inside
-    # deploy_once().
+    # A best-effort ssh rm -f cleanup, covering the remote script, always-sent
+    # library, manifest and optional tar, must cover each possible scp failure.
     text = WORKFLOW.read_text()
     assert "cleanup_remote_cmd" in text, (
         "deploy_once() must build a reusable best-effort remote cleanup command"
     )
-    assert "rm -f -- %q %q" in text, (
-        "the cleanup command must %q-escape both remote paths, matching this "
+    assert "rm -f -- %q %q %q %q" in text, (
+        "the cleanup command must %q-escape every exact remote path, matching this "
         "function's existing printf %q discipline"
     )
-    assert text.count('"$cleanup_remote_cmd"') == 2, (
-        "the cleanup command must be invoked at exactly the two scp "
-        "transport-failure points inside deploy_once(): the first scp and "
-        "the second scp -- and nowhere else (see "
+    assert text.count('"$cleanup_remote_cmd"') == 4, (
+        "the cleanup command must be invoked at exactly the four possible scp "
+        "transport-failure points inside deploy_once(): script, library, "
+        "manifest, and optional files tar -- and nowhere else (see "
         "test_ssh_255_does_not_race_remote_rollback_cleanup for why the "
         "ssh_rc==255 branch must NOT also invoke it)"
     )
@@ -327,8 +326,8 @@ def test_ssh_255_does_not_race_remote_rollback_cleanup():
     # Codex review round 7 (P2-B-2): round 5's fix (e1688ba) also invoked
     # cleanup_remote_cmd from the ssh_rc==255 branch, reasoning that ssh
     # transport failure meant the remote script "never got a chance to run".
-    # That premise is wrong for this branch specifically: both scp calls
-    # already succeeded by the time ssh_rc is checked, so release_deploy.sh
+    # That premise is wrong for this branch specifically: all required scp
+    # transfers already succeeded by the time ssh_rc is checked, so release_deploy.sh
     # was shipped and launched. rc=255 only means this SSH connection lost
     # the transport before the remote exit status made it back -- if that
     # happens while the remote script is mid-flight, OpenSSH sends it SIGHUP,
@@ -341,7 +340,7 @@ def test_ssh_255_does_not_race_remote_rollback_cleanup():
     # remote script refuses to roll back at all -- worse than the orphaned
     # /tmp file this cleanup was meant to prevent. So this branch must NOT
     # invoke the cleanup; only release_deploy.sh's own EXIT trap may remove
-    # these two files once the script has actually been shipped.
+    # the shipped script/library/manifest/tar paths after launch.
     text = WORKFLOW.read_text()
     start = text.index('local ssh_rc=$?')
     end = text.index('return "$ssh_rc"\n          }', start)
@@ -612,7 +611,7 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     assert "oneshot_svc" in script and "matched_running" in script and "::notice::" in script
     assert "release image reconcile values:" in script
     assert "expected_id=" in script and "running_ids=" in script and "rc=5" in after_do_release
-    assert script.index("skip forward deploy") < script.index('deploy_group "$D3_RELEASE_TAG"')
+    assert script.index("skip forward deploy") < script.index("release_files_deploy_current")
     assert "::error::release image reconcile mismatch" in script
     assert "::error::release image reconcile no running container" in script
     assert "last_good_release has already been promoted to this SHA" in script
@@ -631,3 +630,54 @@ def test_release_image_reconciliation_uses_per_image_two_stage_contract():
     )
     assert "oneshot_services covers every compose service" in script
     assert "only referenced by oneshot service(s)" not in script
+
+
+def test_release_files_input_is_opt_in_and_normalizer_receives_caller_checkout():
+    raw, trigger = load()
+    spec = trigger["workflow_call"]["inputs"]["release_files_json"]
+    assert spec["type"] == "string"
+    assert spec["required"] is False
+    assert spec["default"] == "[]"
+    assert "empty disables file transfer" in spec["description"]
+
+    steps = raw["jobs"]["release"]["steps"]
+    normalize = next(step for step in steps if step.get("name") == "Validate and normalize release declaration")
+    assert normalize["env"]["FILES_JSON"] == "${{ inputs.release_files_json }}"
+    assert '--files-json "$FILES_JSON"' in normalize["run"]
+    assert '--repo-root "$GITHUB_WORKSPACE"' in normalize["run"]
+    assert '--files-tar-out "$RUNNER_TEMP/d3-release.files.tar"' in normalize["run"]
+    assert normalize["run"].index('rm -f -- "$RUNNER_TEMP/d3-release.files.tar"') < normalize["run"].index("normalize_release.py")
+    assert '"${{ inputs.release_files_json }}"' not in normalize["run"]
+    for job in raw["jobs"].values():
+        for step in job.get("steps", []):
+            assert "${{ inputs.release_files_json }}" not in step.get("run", "")
+
+
+def test_release_files_tar_is_optional_fourth_transfer_after_always_sent_library():
+    # 主脑本反馈（2026-11-09）裁决覆盖设计第 7 节第 5 条：即使
+    # release_files_json 为 []，也 scp 脚本 + release_files.sh + manifest；只不产生、不传 tar。
+    text = WORKFLOW.read_text()
+    deploy = next(
+        step for step in load()[0]["jobs"]["release"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    run = deploy["run"]
+    assert 'remote_files_lib="/tmp/d3-release-${transport_nonce}.files.sh"' in run
+    assert 'remote_files_tar="/tmp/d3-release-${transport_nonce}.files.tar"' in run
+    deploy_script_scp = run.index('scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_deploy.sh"')
+    library_scp = run.index('scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/ci-templates/scripts/release_files.sh"')
+    manifest_scp = run.index('scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.manifest"')
+    tar_branch = run.index('if [[ -f "$RUNNER_TEMP/d3-release.files.tar" ]]; then')
+    assert deploy_script_scp < library_scp < manifest_scp < tar_branch
+    assert 'if [[ -f "$RUNNER_TEMP/d3-release.files.tar" ]]; then' in run
+    assert 'scp "${SSH_OPTS[@]}" "$RUNNER_TEMP/d3-release.files.tar"' in run
+    assert run.count('scp "${SSH_OPTS[@]}"') == 4
+    assert '"${SSH_USER}@${DEPLOY_HOST}:${remote_files_lib}"' in run
+    assert '"${SSH_USER}@${DEPLOY_HOST}:${remote_files_tar}"' in run
+    assert "RELEASE_FILES_LIB=%q" in run
+    assert "RELEASE_FILES_TAR=%q" in run
+    assert "rm -f -- %q %q %q %q" in run
+    assert 'rm -f -- "$RUNNER_TEMP/d3-release.manifest" "$RUNNER_TEMP/d3-release.builds" "$RUNNER_TEMP/d3-release.files.tar"' in run
+    assert "*files.tar" not in run
+    assert "${{ inputs.release_files_json }}" not in run
+    assert "remote_files" in text
