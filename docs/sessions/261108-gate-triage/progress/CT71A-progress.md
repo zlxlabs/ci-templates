@@ -11,3 +11,9 @@
 - 本段结论：新增 `--files-json`、`--repo-root`、`--files-tar-out`；按声明顺序校验普通文件和额度、追加 SHA-256 file 记录，并生成可复现的原子 USTAR。`python -m pytest -q tests/test_release_input.py` 当前为 17 passed。
 - 关键决策与已否决方案：空文件集直接走旧输出路径，不读取 repo-root、不创建 tar；文件路径校验继续调用 `_relative_path`，不新增路径语法。
 - 下一步唯一动作：提交实现后运行完整 `python -m pytest -q` 并核对范围与验收契约。
+
+## 里程碑 3：本地验收
+- 当前阶段：本地验收通过，待发布分支并开 draft PR
+- 本段结论：`python -m pytest -q` 全仓 310 passed；卡面范围检查通过，变更仅含授权的三个文件。派发时主干基线作业读取失败（HTTP 404），继承红状态无法判定。
+- 关键决策与已否决方案：维持单卡范围，不触碰 workflow 或主机侧消费逻辑；超出 Diff-Lines-Target 但未超 Hard 上限，保留覆盖校验失败面的测试。
+- 下一步唯一动作：提交进度后推送卡分支并创建正文含 `Refs #71` 的 draft PR。
