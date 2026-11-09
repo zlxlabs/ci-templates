@@ -11,3 +11,15 @@
 - 本段结论：提交预检拒绝向 2,076 行的 `tests/test_release_deploy.py` 追加测试；范围申请 seq=1 获批新增 `tests/test_release_config_files.py`，新增部署行为测试已迁入该文件，原测试文件恢复未修改。
 - 关键决策与已否决方案：不绕过文件大小闸、不压缩断言；按批准范围把新文件行为测试单独放入同级模块，复用现有部署测试夹具。
 - 下一步唯一动作：提交测试与进度里程碑，然后提交实现和报告主体。
+
+## 里程碑 3：实现完成、提交前验收
+- 当前阶段：实现完成，待提交与全量验证
+- 本段结论：workflow opt-in tar 传输与主机 staging/install/read-back/rollback 已实现；真实 normalize→真实脚本的跨进程测试和 workflow 合同测试共 52 项通过，`bash -n` 与 `git diff --check` 通过。
+- 关键决策与已否决方案：只对 Mount.Source 命中的服务做 `--no-deps --force-recreate`；完整 image 组先普通 up，避免 service operands 漏部署其他 image，也避免全局强制重建数据库。
+- 下一步唯一动作：提交实现、进度与报告主体，然后执行提交后的完整 pytest 和范围检查。
+
+## 里程碑 4：生产脚本体积闸阻断
+- 当前阶段：blocked，等待主脑拆分后续任务
+- 本段结论：实现提交被 `file_size_gate_block` 拒绝：`scripts/release_deploy.sh` 从 base 的 912 行增长到 1,210 行，限制 800；守卫明确要求超限生产文件交由主脑拆分卡。本地重点测试已通过，但实现未入 commit。
+- 关键决策与已否决方案：不压行、不删测试、不跳过提交钩子，也不擅自增加远端 helper 脚本/额外 scp 路径绕过该闸；等拆分任务明确授权。
+- 下一步唯一动作：由主脑拆分生产脚本任务后继续本卡实现与交付。
