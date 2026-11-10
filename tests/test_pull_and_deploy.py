@@ -771,7 +771,7 @@ exit 97
 
 RESULT_KEYS = {
     "schema_version", "deploy_id", "git_sha", "tag", "image_id",
-    "image_digest", "outcome", "probe", "finished_at",
+    "image_digest", "image_source", "outcome", "probe", "finished_at",
 }
 PROBE_KEYS = {"status", "final_code", "attempts", "elapsed_s"}
 
