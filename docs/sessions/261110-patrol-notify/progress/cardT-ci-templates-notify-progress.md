@@ -10,3 +10,10 @@
   - @全员标记全部移除：企微 markdown 不支持 mention，gate action 无对应输入；唤醒强度由 heading 的 P0 级别词承担。已在模板注释与报告留痕。
   - 原卡 body 尾部「点按钮看详情。/Run:」行移到 links 输出（企微渲染为链接行、飞书渲染为按钮）。
 - **下一步唯一动作**：commit + push + draft PR，写 report.md 并跑 scope check 与 report contract。
+
+## 2026-11-10 里程碑 2：提交、PR、报告完成
+
+- **当前阶段**：implementing 完成（待验收）
+- **本段结论**：commit f9af47c 已推送，draft PR #84 已开；report.md 写完且 delegate_report_contract.py check 退出码 0。
+- **关键决策与已否决方案**：file-size ratchet 闸拦下 test_release_workflow_contract.py（683→835 超 800），按闸指引拆 tests/test_release_notify_contract.py，scope-request seq=1 已批准；card_scope_check 不知批准记录仍标记该文件，已在报告登记。
+- **下一步唯一动作**：无（等验收；远程 CI 不在执行器进程内等待）。
