@@ -174,23 +174,14 @@ def test_toolchain_fingerprint_is_logged_before_build(tmp_path):
          "-f", f"{tmp_path}/Dockerfile", "-t", "registry.example/namespace/service:abc123", str(tmp_path)]
     )
 
-
-def test_toolchain_fingerprint_unknown_is_fail_open(tmp_path):
     (tmp_path / "toolchain-unavailable").touch()
-    docker = _write_fake_docker(
-        tmp_path,
-        '''if [ "$1" = build ] || [ "$1" = push ]; then exit 0; fi
-''',
-    )
-
-    result = subprocess.run(
+    unavailable = subprocess.run(
         ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
         text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
-
-    assert result.returncode == 0, result.stdout
-    assert "[push] toolchain: docker_client=unknown docker_server=unknown buildx=unknown storage_driver=unknown" in result.stdout
-    assert [call[0] for call in _all_recorded_argv(tmp_path)] == ["version", "buildx", "info", "manifest", "build", "push"]
+    assert unavailable.returncode == 0, unavailable.stdout
+    assert "[push] toolchain: docker_client=unknown docker_server=unknown buildx=unknown storage_driver=unknown" in unavailable.stdout
+    assert [call[0] for call in _all_recorded_argv(tmp_path)[len(calls):]] == ["version", "buildx", "info", "manifest", "build", "push"]
 
 
 def test_push_retries_a_transient_failure_without_rebuilding(tmp_path):
