@@ -613,6 +613,17 @@ do_deploy() {
         return "$deploy_rc"
       fi
     fi
+    # deploy_tag() normally creates the "${IMAGE_NAME}:latest" alias before
+    # reconcile; restore it here so reconcile's latest==expected assertion
+    # does not false-red when latest was pruned on the host.
+    local tag_rc=0
+    "$DOCKER_BIN" tag "$expected_ref" "${IMAGE_NAME}:latest" || tag_rc=$?
+    if [ "$tag_rc" -ne 0 ]; then
+      log "deploy of $GIT_SHA failed (rc=$tag_rc)"
+      DEPLOY_OUTCOME=deploy_failed
+      event exit
+      return "$tag_rc"
+    fi
     record_last_good_identity "$expected_ref"
     DEPLOY_OUTCOME="skipped_already_deployed"
     event exit
