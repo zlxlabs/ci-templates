@@ -2167,7 +2167,7 @@ if [ "$1" = image ] && [ "$2" = inspect ]; then
     exit 0
   fi
 fi
-if [ "$1" = pull ] && [ "$2" = "$expected_ref" ]; then
+if {{ [ "$1" = pull ] && [ "$2" = "$expected_ref" ]; }} || {{ [ "$1" = tag ] && [ "$#" -eq 3 ]; }}; then #89 reconcile-only retag
   {pull_result}
 fi
 if [ "$1" = inspect ] && [ "$2" = cid-app ] && [ "$3" = --format ]; then
