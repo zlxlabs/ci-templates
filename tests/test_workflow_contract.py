@@ -852,7 +852,7 @@ def test_feishu_notifications_warn_on_each_delivery_failure_mode():
         "Feishu 部署延期卡 (deferred, fail-open)": (
             "Feishu 部署延期卡",
             "failure() && steps.deploy.outputs.deferred == 'true'",
-            "7892e7a0a4bfc79cc66d81f5c976aefcfe97dc2e0acfd3da7c47d53fe9b525a4",
+            "76329a3803cbff3406bc8154614807ad00e0bd1baffca852e94a416c9062b018",
         ),
     }
     assert set(steps) == set(expected)
