@@ -4,14 +4,11 @@ eng-review A4 (codex#5): the workflow must declare secrets EXPLICITLY and must
 NOT use `secrets: inherit`, so a compromised ci-templates can never reach
 unrelated org secrets. Also asserts the per-host concurrency group (A3).
 """
-import hashlib
 import json
 import os
 from pathlib import Path
 import shlex
 import subprocess
-import sys
-
 import pytest
 import yaml
 
@@ -27,7 +24,7 @@ REQUIRED_SECRETS = {
 # 长期可选(#46,不是过渡期):webhook 2026-09-06 从 vars 迁到 secrets——vars 不被 Actions
 # 打码,当时每次部署都把完整 URL 写进日志。之所以不设成必需:shoplazza-capabilities
 # 合法地没有 webhook,它的 caller 传的表达式求值为空串,必需会让那个仓卡在 workflow 校验上。
-# 取不到值时通知层打印 `skip notify` 跳过,不影响部署结论。
+# 取不到值时由 gate notify action 打 `notify-skipped` warning 跳过,不影响部署结论。
 OPTIONAL_SECRETS = {"FEISHU_CI_WEBHOOK"}
 EXPECTED_SECRETS = REQUIRED_SECRETS | OPTIONAL_SECRETS
 
@@ -42,6 +39,90 @@ def _load():
     raw = yaml.safe_load(WORKFLOW.read_text())
     trigger = raw.get("on", raw.get(True))
     return raw, trigger
+
+
+# ── 通知层:跨仓契约(gate 共用 notify action)──────────────────────────────────
+# zlxlabs/gate 的 .github/actions/notify(gate PR #401;@v2 指向
+# 425222feeacd56662a8ede9b01d8beea83433cf1)声明的 inputs 键清单,作为跨仓边界
+# fixture 保留在此:模板 with: 只允许落在该集合内;gate 侧增删 input 时同步本 fixture。
+NOTIFY_ACTION = "zlxlabs/gate/.github/actions/notify@v2"
+NOTIFY_ACTION_INPUTS = {"webhook", "title_prefix", "severity", "title", "body", "links"}
+
+# 通知 step 名 -> (组装 step id, 触发条件[与 base 逐字一致], severity 映射)
+# severity 按原卡颜色映射:green(成功回执)->info;red(失败/回滚健康未证)->P0;
+# yellow(延期)->P2。
+NOTIFY_STEPS = {
+    "部署成功回执通知 (opt-in, fail-open)": (
+        "assemble_success_receipt",
+        "success() && inputs.notify_on_success == true",
+        "info",
+    ),
+    "部署失败通知 (P0, fail-open)": (
+        "assemble_deploy_failure",
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true'",
+        "P0",
+    ),
+    "回滚健康未证紧急通知 (P0, fail-open)": (
+        "assemble_rollback_unhealthy",
+        "failure() && steps.deploy.outputs.deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy == 'true'",
+        "P0",
+    ),
+    "部署延期通知 (deferred, fail-open)": (
+        "assemble_deploy_deferred",
+        "failure() && steps.deploy.outputs.deferred == 'true'",
+        "P2",
+    ),
+}
+
+
+def _steps_by_name(raw):
+    return {step.get("name"): step for step in raw["jobs"]["build-deploy"]["steps"]}
+
+
+def _step_by_id(raw, step_id):
+    return next(
+        step
+        for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == step_id
+    )
+
+
+def _parse_github_output(text):
+    # GitHub 输出文件格式:name=value 单行,或 name<<DELIM ... DELIM 多行。
+    result = {}
+    lines = text.splitlines()
+    i = 0
+    while i < len(lines):
+        line = lines[i]
+        if "<<" in line:
+            name, delim = line.split("<<", 1)
+            buf = []
+            i += 1
+            while i < len(lines) and lines[i] != delim:
+                buf.append(lines[i])
+                i += 1
+            result[name] = "\n".join(buf)
+        else:
+            name, _, value = line.partition("=")
+            result[name] = value
+        i += 1
+    return result
+
+
+def _run_assemble_step(step, env, output_path):
+    completed = subprocess.run(
+        ["bash", "-c", step["run"]],
+        text=True,
+        capture_output=True,
+        env=os.environ | env | {"GITHUB_OUTPUT": str(output_path)},
+        check=False,
+    )
+    parsed = (
+        _parse_github_output(output_path.read_text()) if output_path.exists() else {}
+    )
+    return completed, parsed
 
 
 def test_workflow_is_workflow_call():
@@ -337,64 +418,53 @@ exit 97
     ] == ["compose up -d"], "unsafe probe failure must not run a second compose up"
 
 
-def test_rc4_emergency_card_payload_distinguishes_skipped_and_unproven_rollback(tmp_path):
+def test_rc4_emergency_notification_distinguishes_skipped_and_unproven_rollback(tmp_path):
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
     deploy = next(step for step in steps if step.get("id") == "deploy")
-    notification = next(step for step in steps if "回滚健康未证紧急卡" in step.get("name", ""))
+    assemble = _step_by_id(raw, "assemble_rollback_unhealthy")
 
     assert 'echo "rollback_skipped=true"' in deploy["run"]
     assert 'echo "rollback_skipped=false"' in deploy["run"]
-    assert notification["if"] == (
+    assert assemble["if"] == (
         "failure() && steps.deploy.outputs.deferred != 'true' && "
         "steps.deploy.outputs.rollback_unhealthy == 'true'"
-    ), "both rc=4 cases must continue to send exactly one emergency card"
-    assert notification["env"]["ROLLBACK_SKIPPED"] == "${{ steps.deploy.outputs.rollback_skipped }}"
+    ), "both rc=4 cases must continue to send exactly one emergency notification"
+    assert assemble["env"]["ROLLBACK_SKIPPED"] == "${{ steps.deploy.outputs.rollback_skipped }}"
 
-    curl = tmp_path / "curl"
-    curl.write_text(
-        "#!/usr/bin/env python3\n"
-        "import os, sys\n"
-        "open(os.environ['FEISHU_PAYLOAD'], 'wb').write(sys.stdin.buffer.read())\n"
-        "print('{\\\"code\\\":0}')\n"
-    )
-    curl.chmod(0o755)
-    payloads = {}
+    bodies = {}
+    titles = {}
     for skipped in ("true", "false"):
-        payload_path = tmp_path / f"card-{skipped}.json"
-        result = subprocess.run(
-            ["bash", "-c", notification["run"]],
-            text=True,
-            capture_output=True,
-            env=os.environ | {
-                "FEISHU_WEBHOOK": "https://example.invalid/webhook",
-                "FEISHU_TITLE_PREFIX": "[test]",
+        completed, outputs = _run_assemble_step(
+            assemble,
+            {
                 "SVC": "demo",
                 "HOST": "host.example",
                 "REPO": "zlxlabs/ci-templates",
                 "SHA": "abc1234",
                 "RUN_URL": "https://example.invalid/run/1",
                 "ROLLBACK_SKIPPED": skipped,
-                "FEISHU_PAYLOAD": str(payload_path),
-                "PATH": f"{tmp_path}:{os.environ['PATH']}",
             },
-            check=False,
+            tmp_path / f"out-{skipped}",
         )
-        assert result.returncode == 0, result.stdout + result.stderr
-        payloads[skipped] = json.loads(payload_path.read_text())
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert outputs["severity"] == "P0"
+        bodies[skipped] = outputs["body"]
+        titles[skipped] = outputs["title"]
+        assert json.loads(outputs["links"])[0]["url"] == "https://example.invalid/run/1"
 
-    skipped_body = payloads["true"]["card"]["elements"][0]["text"]["content"]
-    unproven_body = payloads["false"]["card"]["elements"][0]["text"]["content"]
     skipped_phrase = "自动回滚未执行；不健康的新版本仍在运行。"
     unproven_phrase = "新版本健康探针失败,且回滚未能用同预算探针证明旧版本在应答。"
-    assert skipped_phrase in skipped_body
-    assert unproven_phrase not in skipped_body
-    assert "决定是否手动回滚" in skipped_body
-    assert "决定是否手动回滚" not in unproven_body
-    assert unproven_phrase in unproven_body
-    assert skipped_phrase not in unproven_body
-    assert "查看回滚前现场证据" in unproven_body
-    assert "查看回滚前现场证据" not in skipped_body
+    assert skipped_phrase in bodies["true"]
+    assert unproven_phrase not in bodies["true"]
+    assert "决定是否手动回滚" in bodies["true"]
+    assert "决定是否手动回滚" not in bodies["false"]
+    assert unproven_phrase in bodies["false"]
+    assert skipped_phrase not in bodies["false"]
+    assert "查看回滚前现场证据" in bodies["false"]
+    assert "查看回滚前现场证据" not in bodies["true"]
+    assert titles["true"] == "自动回滚未执行 · demo"
+    assert titles["false"] == "回滚健康未证 · demo"
 
 
 def test_deploy_result_evidence_is_parsed_into_step_outputs():
@@ -614,11 +684,11 @@ exit 97
     success = next(
         step
         for step in _load()[0]["jobs"]["build-deploy"]["steps"]
-        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
+        if step.get("id") == "assemble_success_receipt"
     )
+    # webhook 与标题前缀不再经 env 进组装 step:webhook 只作为 action 输入
+    # (secret 自动打码),标题前缀由 action 渲染进 heading。
     assert success["env"] == {
-        "FEISHU_WEBHOOK": "${{ secrets.FEISHU_CI_WEBHOOK }}",
-        "FEISHU_TITLE_PREFIX": "${{ vars.FEISHU_CI_TITLE_PREFIX }}",
         "SVC": "${{ inputs.image_name }}",
         "HOST": "${{ inputs.host }}",
         "REPO": "${{ github.repository }}",
@@ -633,18 +703,23 @@ exit 97
     }
 
 
-def test_success_receipt_card_is_opt_in_fail_open_and_complete():
+def test_success_receipt_notify_is_opt_in_fail_open_and_complete():
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
     reconcile_index = next(
         i for i, step in enumerate(steps)
         if step.get("name", "").startswith("Reconcile deployed image")
     )
-    success = steps[reconcile_index + 1]
-    assert success["name"] == "Feishu 部署成功回执卡 (opt-in, fail-open)"
-    assert success["if"] == "success() && inputs.notify_on_success == true"
-    assert success["continue-on-error"] is True
-    run = success["run"]
+    assemble = steps[reconcile_index + 1]
+    notify = steps[reconcile_index + 2]
+    assert assemble["id"] == "assemble_success_receipt"
+    assert assemble["if"] == "success() && inputs.notify_on_success == true"
+    assert assemble["continue-on-error"] is True
+    assert notify["name"] == "部署成功回执通知 (opt-in, fail-open)"
+    assert notify["if"] == "success() && inputs.notify_on_success == true"
+    assert notify["continue-on-error"] is True
+    assert notify["uses"] == NOTIFY_ACTION
+    run = assemble["run"]
     assert "success receipt skipped:" in run
     assert "image_digest" in run
     assert "probe_status" in run
@@ -653,89 +728,14 @@ def test_success_receipt_card_is_opt_in_fail_open_and_complete():
         "IMAGE_DIGEST", "OUTCOME", "RUN_URL",
     ):
         assert field in run
-    assert "FEISHU_WEBHOOK" in run
-    assert "FEISHU_TITLE_PREFIX" in run
-    assert "curl -fsS --max-time 10 -X POST" in run
     assert "部署成功" in run
     assert "镜像对账已通过" in run
 
 
-def test_success_receipt_diagnostics_do_not_echo_response_body():
-    success = next(
-        step
-        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
-        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
-    )
-    run = success["run"]
-
-    assert "response_file" in run
-    assert "curl_rc=" in run
-    assert "http_status=" in run
-    assert "response={raw" not in run
-    assert "response:-no response" not in run
-    assert "response parser failed" in run
-
-
-def test_success_receipt_request_failure_reports_status_without_body(tmp_path):
-    success = next(
-        step
-        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
-        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
-    )
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text(
-        """#!/bin/bash
-output=""
-while [ "$#" -gt 0 ]; do
-  if [ "$1" = "-o" ]; then output="$2"; shift 2; else shift; fi
-done
-printf '%s' '{"code":13,"msg":"sensitive response body"}' > "$output"
-printf '%s' '502'
-exit 22
-"""
-    )
-    fake_curl.chmod(0o755)
-    env = os.environ | {
-        "FEISHU_WEBHOOK": "https://example.test/webhook",
-        "FEISHU_TITLE_PREFIX": "[contract]",
-        "SVC": "contract-service",
-        "HOST": "contract-host",
-        "REPO": "zlxlabs/ci-templates",
-        "SHA": "0123456789ab",
-        "IMAGE_DIGEST": "sha256:contract",
-        "PROBE_STATUS": "ok",
-        "PROBE_FINAL_CODE": "200",
-        "PROBE_ATTEMPTS": "1",
-        "PROBE_ELAPSED_S": "3",
-        "OUTCOME": "deployed",
-        "RUN_URL": "https://example.test/actions/runs/123",
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
-    }
-
-    completed = subprocess.run(
-        ["bash", "-c", success["run"]],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-
-    assert completed.returncode == 0, completed.stdout + completed.stderr
-    output = completed.stdout + completed.stderr
-    assert "curl_rc=22" in output
-    assert "http_status=502" in output
-    assert "sensitive response body" not in output
-    assert '"code":13' not in output
-
-
-def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
+def test_success_receipt_assemble_emits_all_receipt_fields(tmp_path):
     raw, _ = _load()
-    success = next(
-        step for step in raw["jobs"]["build-deploy"]["steps"]
-        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
-    )
-    env = os.environ | {
-        "FEISHU_TITLE_PREFIX": "[contract]",
+    assemble = _step_by_id(raw, "assemble_success_receipt")
+    env = {
         "SVC": "contract-service",
         "HOST": "contract-host",
         "REPO": "zlxlabs/ci-templates",
@@ -748,47 +748,29 @@ def test_success_receipt_card_producer_emits_payload_with_receipt_fields():
         "OUTCOME": "deployed",
         "RUN_URL": "https://example.test/actions/runs/123",
     }
-    run = success["run"]
-    producer_start = run.index("\n", run.index("python3 - <<'PY'")) + 1
-    producer_end = run.index("\nPY", producer_start)
-    producer = run[producer_start:producer_end]
-    completed = subprocess.run(
-        [sys.executable, "-"],
-        input=producer,
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stderr
-    payload = json.loads(completed.stdout)
-    content = payload["card"]["elements"][0]["text"]["content"]
-    assert payload["msg_type"] == "interactive"
-    assert payload["card"]["header"]["template"] == "green"
+    completed, outputs = _run_assemble_step(assemble, env, tmp_path / "out")
+    assert completed.returncode == 0, completed.stdout + completed.stderr
+    assert outputs["severity"] == "info"
+    assert outputs["title"] == "部署成功 · contract-service"
     for value in (
         "contract-service", "contract-host", "zlxlabs/ci-templates",
         "0123456789ab", "sha256:contract", "status=ok",
         "final_code=200", "attempts=1", "elapsed_s=3",
         "outcome=deployed",
     ):
-        assert value in content
-    assert payload["card"]["elements"][1]["actions"][0]["url"] == env["RUN_URL"]
+        assert value in outputs["body"]
+    assert json.loads(outputs["links"]) == [
+        {"text": "查看部署 Run", "url": "https://example.test/actions/runs/123"}
+    ]
 
 
-def test_success_receipt_skips_without_digest_and_does_not_call_curl(tmp_path):
+def test_success_receipt_skips_without_digest_and_emits_no_severity(tmp_path):
+    # 回执证据缺失时宁可不发:组装 step 打 warning 并失败,severity 不写出,
+    # 下游 notify step 因 severity 为空被 action 拒绝(notify-invalid-severity,
+    # 被 continue-on-error 吸收)——不会发出缺字段的假回执。
     raw, _ = _load()
-    success = next(
-        step for step in raw["jobs"]["build-deploy"]["steps"]
-        if step.get("name") == "Feishu 部署成功回执卡 (opt-in, fail-open)"
-    )
-    curl_called = tmp_path / "curl-called"
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text(f"#!/bin/bash\\ntouch '{curl_called}'\\n")
-    fake_curl.chmod(0o755)
-    output = tmp_path / "github-output"
-    env = os.environ | {
-        "FEISHU_WEBHOOK": "https://example.test/webhook",
-        "FEISHU_TITLE_PREFIX": "[contract]",
+    assemble = _step_by_id(raw, "assemble_success_receipt")
+    env = {
         "SVC": "contract-service",
         "HOST": "contract-host",
         "REPO": "zlxlabs/ci-templates",
@@ -800,112 +782,85 @@ def test_success_receipt_skips_without_digest_and_does_not_call_curl(tmp_path):
         "PROBE_ELAPSED_S": "3",
         "OUTCOME": "deployed",
         "RUN_URL": "https://example.test/actions/runs/123",
-        "GITHUB_OUTPUT": str(output),
-        "PATH": f"{tmp_path}:{os.environ['PATH']}",
     }
-    completed = subprocess.run(
-        ["bash", "-c", success["run"]],
-        text=True,
-        capture_output=True,
-        env=env,
-        check=False,
-    )
-    assert completed.returncode == 0, completed.stdout + completed.stderr
+    completed, outputs = _run_assemble_step(assemble, env, tmp_path / "out")
+    assert completed.returncode != 0, completed.stdout + completed.stderr
     assert "::warning::success receipt skipped: image_digest" in completed.stdout
-    assert not curl_called.exists()
+    assert "severity" not in outputs
 
 
 def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     text = WORKFLOW.read_text()
 
-    assert "FEISHU_TITLE_PREFIX" in text
+    # 标题前缀不再经 env 进组装 step,而是 4 处 notify step 统一作为 action 输入;
+    # 默认值 [zlxlabs·CI] 由 gate notify action 承担(模板注释说明)。
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
+    assert "FEISHU_TITLE_PREFIX" not in text
     assert "[zlxlabs·CI]" in text
-    assert "f\"🔴 {title_prefix} P0 部署失败" in text
+    assert text.count("title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}") == 4
 
 
-def test_feishu_notifications_warn_on_each_delivery_failure_mode():
+def test_notify_steps_call_gate_notify_action_with_contract_inputs():
+    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。7 处通知(本文件 4 处,
+    # release lane 3 处见 test_release_workflow_contract.py)的 if 必须与 base 逐字一致,
+    # with: 键集合必须是 action.yml 声明 inputs 的子集且含 webhook/title/body,
+    # webhook 只能来自 secrets.FEISHU_CI_WEBHOOK(#46:vars 不打码会进日志)。
     raw, _ = _load()
-    steps = {
-        step["name"]: step
-        for step in raw["jobs"]["build-deploy"]["steps"]
-        if step.get("name")
-        in {
-            "Feishu 部署失败卡 (P0, fail-open)",
-            "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
-            "Feishu 部署延期卡 (deferred, fail-open)",
-        }
-    }
-    expected = {
-        "Feishu 部署失败卡 (P0, fail-open)": (
-            "Feishu 部署失败卡",
-            "failure() && steps.deploy.outputs.deferred != 'true' && "
-            "steps.deploy.outputs.rollback_unhealthy != 'true'",
-            "e27bf0a179d22114c8f5e150a130e6364f8dddd3fd21f4743ff57b6048dc2d40",
-        ),
-        "Feishu 回滚健康未证紧急卡 (P0, fail-open)": (
-            "Feishu 回滚健康未证紧急卡",
-            "failure() && steps.deploy.outputs.deferred != 'true' && "
-            "steps.deploy.outputs.rollback_unhealthy == 'true'",
-            "5caf77ff8da0d5e5a6554038124d0e50a2a86e73fd7b84332a30c3f98ac37ff9",
-        ),
-        "Feishu 部署延期卡 (deferred, fail-open)": (
-            "Feishu 部署延期卡",
-            "failure() && steps.deploy.outputs.deferred == 'true'",
-            "76329a3803cbff3406bc8154614807ad00e0bd1baffca852e94a416c9062b018",
-        ),
-    }
-    assert set(steps) == set(expected)
-
-    for step_name, (label, condition, body_digest) in expected.items():
-        step = steps[step_name]
-        run = step["run"]
-        assert step["if"] == condition
+    steps = _steps_by_name(raw)
+    assert set(NOTIFY_STEPS) <= set(steps)
+    for name, (assemble_id, condition, _severity) in NOTIFY_STEPS.items():
+        step = steps[name]
+        assert step["uses"] == NOTIFY_ACTION
         assert step["continue-on-error"] is True
+        assert step["if"] == condition, f"{name} 触发条件必须与 base 逐字一致"
+        with_inputs = step["with"]
+        assert set(with_inputs) <= NOTIFY_ACTION_INPUTS, (
+            f"{name} with: 超出 action 声明的 inputs: "
+            f"{set(with_inputs) - NOTIFY_ACTION_INPUTS}"
+        )
+        assert {"webhook", "title_prefix", "severity", "title", "body", "links"} <= set(with_inputs)
+        assert with_inputs["webhook"] == "${{ secrets.FEISHU_CI_WEBHOOK }}"
+        assert with_inputs["title_prefix"] == "${{ vars.FEISHU_CI_TITLE_PREFIX }}"
+        for field in ("severity", "title", "body", "links"):
+            assert with_inputs[field] == (
+                f"${{{{ steps.{assemble_id}.outputs.{field} }}}}"
+            )
+        # 组装 step 与 notify step 同条件、同 fail-open,且 run 内不内联 ${{ }} 用户可控字段。
+        assemble = _step_by_id(raw, assemble_id)
+        assert assemble["if"] == condition
+        assert assemble["continue-on-error"] is True
+        assert "${{ secrets." not in assemble["run"]
+        assert "${{ inputs." not in assemble["run"]
 
-        # Each channel is independently visible in the Actions annotation UI:
-        # missing webhook, transport failure, response without code, and
-        # non-zero Feishu business code.
-        assert "set -u -o pipefail" in run
-        assert 'webhook="${FEISHU_WEBHOOK:-}"' in run
-        assert (
-            f'echo "::warning::{label} not sent: '
-            'FEISHU_WEBHOOK is not configured"'
-        ) in run
-        assert (
-            "if ! response=\"$(python3 - <<'PY' | curl -fsS "
-            '--max-time 10 -X POST -H \'Content-Type: application/json\' '
-            '--data-binary @- "$webhook" 2>&1'
-        ) in run
-        assert f'::warning::{label} request failed or timed out:' in run
-        assert f'python3 - "{label}" "$response" <<\'PY\'' in run
-        assert 'result["code"]' in run
-        assert (
-            f'::warning::{{label}} response parse failed:'
-        ) in run
-        assert 'if str(code) != "0":' in run
-        assert f'::warning::{{label}} business error: code=' in run
-        assert f'::warning::{label} response parser failed' in run
 
-        body_start = run.index("body = (")
-        body_end = run.index("card = {", body_start)
-        body = run[body_start:body_end]
-        assert hashlib.sha256(body.encode()).hexdigest() == body_digest
-
+def test_no_direct_channel_posting_remains_in_template():
+    # 发送逻辑全部收拢进 gate notify action:模板内不得残留直连 webhook 的代码。
     text = WORKFLOW.read_text()
+    assert text.count(f"uses: {NOTIFY_ACTION}") == 4
+    assert "open.feishu.cn" not in text
+    assert "open.larksuite.com" not in text
+    assert "vars.FEISHU_CI_WEBHOOK" not in text
+    assert '"$webhook"' not in text
+    assert "FEISHU_WEBHOOK" not in text
+    assert "msg_type" not in text
+    assert "interactive" not in text
+
+
+def test_deploy_notifications_delegate_delivery_failures_to_notify_action():
+    # 投递失败的可见性(缺地址 notify-skipped、发送失败 ::error)由 gate notify action
+    # 承担(gate tests/test_notify_action.py 锁定);模板内不再内联判空/curl/响应解析,
+    # fail-open 由两个 step 各自的 continue-on-error 维持。
+    text = WORKFLOW.read_text()
+    assert "is not configured" not in text
+    assert "response parse failed" not in text
+    assert "request failed or timed out" not in text
     assert "swallowed" not in text
     assert "skip notify" not in text
 
 
-def test_feishu_notification_producers_emit_json_payload_for_curl():
+def test_failure_side_notify_assembles_emit_expected_fields(tmp_path):
     raw, _ = _load()
-    names = {
-        "Feishu 部署失败卡 (P0, fail-open)",
-        "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
-        "Feishu 部署延期卡 (deferred, fail-open)",
-    }
-    env = os.environ | {
-        "FEISHU_TITLE_PREFIX": "[contract]",
+    env = {
         "SVC": "contract-service",
         "HOST": "contract-host",
         "REPO": "zlxlabs/ci-templates",
@@ -913,28 +868,27 @@ def test_feishu_notification_producers_emit_json_payload_for_curl():
         "RUN_URL": "https://example.test/actions/runs/123",
         "ROLLBACK_SKIPPED": "false",
     }
-
-    for step in raw["jobs"]["build-deploy"]["steps"]:
-        if step.get("name") not in names:
-            continue
-        run = step["run"]
-        producer_start = run.index("\n", run.index("python3 - <<'PY'")) + 1
-        producer_end = run.index("\nPY", producer_start)
-        producer = run[producer_start:producer_end]
-        completed = subprocess.run(
-            [sys.executable, "-"],
-            input=producer,
-            text=True,
-            capture_output=True,
-            env=env,
-            check=False,
+    expectations = {
+        "assemble_deploy_failure": ("P0", "部署失败 · contract-service", "查看部署 Run"),
+        "assemble_rollback_unhealthy": ("P0", "回滚健康未证 · contract-service", "立即上机处置"),
+        "assemble_deploy_deferred": ("P2", "部署延期 · contract-service", "重跑部署"),
+    }
+    for assemble_id, (severity, title, link_text) in expectations.items():
+        assemble = _step_by_id(raw, assemble_id)
+        completed, outputs = _run_assemble_step(
+            assemble, env, tmp_path / f"out-{assemble_id}"
         )
-        assert completed.returncode == 0, completed.stderr
-        payload = json.loads(completed.stdout)
-        assert payload["msg_type"] == "interactive"
-        content = payload["card"]["elements"][0]["text"]["content"]
-        assert "contract-service" in content
-        assert payload["card"]["elements"][1]["actions"][0]["url"] == env["RUN_URL"]
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert outputs["severity"] == severity
+        assert outputs["title"] == title
+        for value in (
+            "contract-service", "contract-host",
+            "zlxlabs/ci-templates", "0123456789ab",
+        ):
+            assert value in outputs["body"], f"{assemble_id} body 缺 {value}"
+        assert json.loads(outputs["links"]) == [
+            {"text": link_text, "url": "https://example.test/actions/runs/123"}
+        ]
 
 
 # --- busy-lock gate: inputs 透传 + rc=3 deferred 分流 + 双卡通知 --------------
@@ -1012,8 +966,8 @@ def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
         "steps.deploy.outputs.rollback_unhealthy != 'true'"
     ) in text
 
-    urgent_idx = text.index("回滚健康未证紧急卡")
-    yellow_idx = text.index("Feishu 部署延期卡")
+    urgent_idx = text.index("回滚健康未证紧急通知")
+    yellow_idx = text.index("部署延期通知 (deferred, fail-open)")
     urgent_section = text[urgent_idx:yellow_idx]
     assert "生产可能不可用，必须立即上机" in urgent_section
     assert "不需要紧急上机" not in urgent_section
@@ -1180,34 +1134,19 @@ def test_red_card_step_skips_when_deferred():
     assert "rollback_unhealthy != 'true'" in text
 
 
-def test_yellow_card_step_exists_for_deferred_without_at_all():
+def test_deferred_notification_is_p2_and_no_at_all_markup_remains():
+    # 原黄卡「不 @全员」的语义在企微侧由 severity 承担:延期 P2,失败/回滚未证 P0;
+    # 企微 markdown 不支持 @全员(gate notify action 无 mention 输入),模板内不得残留 at 标记。
+    text = WORKFLOW.read_text()
+    assert "<at id=all>" not in text
+    assert '<at user_id="all">' not in text
     raw, _ = _load()
-    steps = raw["jobs"]["build-deploy"]["steps"]
-    cards = {
-        step["name"]: step
-        for step in steps
-        if step.get("name") in {
-            "Feishu 部署延期卡 (deferred, fail-open)",
-            "Feishu 部署失败卡 (P0, fail-open)",
-            "Feishu 回滚健康未证紧急卡 (P0, fail-open)",
-        }
-    }
-
-    def at_all_payload_lines(step):
-        return [
-            line.strip()
-            for line in step["run"].splitlines()
-            if line.strip().startswith('f"<at id=all></at>')
-        ]
-
-    yellow = cards["Feishu 部署延期卡 (deferred, fail-open)"]
-    ordinary = cards["Feishu 部署失败卡 (P0, fail-open)"]
-    urgent = cards["Feishu 回滚健康未证紧急卡 (P0, fail-open)"]
-    assert yellow["if"] == "failure() && steps.deploy.outputs.deferred == 'true'"
-    assert "部署延期" in yellow["name"]
-    assert not at_all_payload_lines(yellow)
-    assert at_all_payload_lines(ordinary)
-    assert at_all_payload_lines(urgent)
+    assert "severity=info" in _step_by_id(raw, "assemble_success_receipt")["run"]
+    assert "severity=P0" in _step_by_id(raw, "assemble_deploy_failure")["run"]
+    assert "severity=P0" in _step_by_id(raw, "assemble_rollback_unhealthy")["run"]
+    assert "severity=P2" in _step_by_id(raw, "assemble_deploy_deferred")["run"]
+    deferred = _steps_by_name(raw)["部署延期通知 (deferred, fail-open)"]
+    assert deferred["if"] == "failure() && steps.deploy.outputs.deferred == 'true'"
 
 
 def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
