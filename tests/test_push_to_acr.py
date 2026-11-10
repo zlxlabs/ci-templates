@@ -161,10 +161,10 @@ def test_toolchain_fingerprint_is_logged_before_build(tmp_path):
 
     result = subprocess.run(
         ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
-        text=True, capture_output=True,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout
     fingerprint = "[push] toolchain: docker_client=27.3 docker_server=27.3 buildx=github.com/docker/buildx v0.19.0 storage_driver=overlay2"
     assert fingerprint in result.stdout
     assert result.stdout.index(fingerprint) < result.stdout.index("[push] building")
@@ -185,10 +185,10 @@ def test_toolchain_fingerprint_unknown_is_fail_open(tmp_path):
 
     result = subprocess.run(
         ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
-        text=True, capture_output=True,
+        text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode == 0, result.stdout
     assert "[push] toolchain: docker_client=unknown docker_server=unknown buildx=unknown storage_driver=unknown" in result.stdout
     assert [call[0] for call in _all_recorded_argv(tmp_path)] == ["version", "buildx", "info", "manifest", "build", "push"]
 

@@ -11,3 +11,10 @@
 - 本段结论：脚本现先打印可观测性指纹、用 `docker manifest inspect` 的明确 not-found 输出分流三态，存在时 pull 复用且不重推 ACR；两条构建命令显式关闭 provenance/SBOM，ACR push 失败无论本地结果均致命。目标测试文件 24 项通过。
 - 关键决策与已否决方案：仅输出含精确 SHA 引用的 `no such manifest: <ref>` 判为不存在；鉴权、网络等其他非零响应输出 `ACR-SHA-PROBE-FAILED` 并停止，不回退重建。
 - 下一步唯一动作：提交实现与报告主体，再执行整套验收和范围检查。
+
+## 里程碑 3：保持成功路径 stdout 契约
+
+- 当前阶段：implementing
+- 本段结论：工具链指纹改写到 stderr 日志流，仍与构建/pull 前顺序一致，但不改变原有成功路径 stdout 收尾契约；新增 fail-open 测试同样通过。
+- 关键决策与已否决方案：不扩改 workflow 输入说明行（卡面只授权 DEFERRED 提示字符串），通过将诊断指纹写入 stderr 保持 stdout 约定。
+- 下一步唯一动作：提交这处调整，写入完整报告主体。

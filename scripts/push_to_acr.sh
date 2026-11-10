@@ -139,7 +139,7 @@ print_toolchain_fingerprint() {
     storage_driver=unknown
   fi
 
-  echo "[push] toolchain: docker_client=${docker_client} docker_server=${docker_server} buildx=${buildx_version} storage_driver=${storage_driver}"
+  echo "[push] toolchain: docker_client=${docker_client} docker_server=${docker_server} buildx=${buildx_version} storage_driver=${storage_driver}" >&2
 }
 
 # docker manifest inspect exits non-zero both for an absent tag and for registry
