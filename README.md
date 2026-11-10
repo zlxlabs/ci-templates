@@ -258,10 +258,8 @@ opt-in 用法，在 caller 的 `with:` 块加两个 input（不加则行为与�
       busy_lock_timeout: "600"   # 可选，默认 600s（10 分钟）
 ```
 
-延期时的表现：GitHub job 仍是**失败态**（标红，诚实反映"新 SHA 未上线"），但通知
-分流成**延期通知（P2，非 P0）**——因为这是正常的延期，不是故障。
-新镜像已经推到 ACR（不可变 SHA tag），空闲后点通知里的 **Re-run** 链接重跑该
-workflow 即可补上线；重跑会从 ACR 拉取并复用已有的 SHA 成品，不再重新构建或重推该 tag。
+延期时 GitHub job 仍是**失败态**（标红，诚实反映"新 SHA 未上线"），但不再发通知——这是正常延期，Agent 从 GitHub run 处理即可。
+新镜像已经推到 ACR（不可变 SHA tag），空闲后重跑该 workflow 即可补上线；重跑会从 ACR 拉取并复用已有的 SHA 成品，不再重新构建或重推该 tag。
 
 > ⚠️ **上线顺序**：必须先让服务侧完成持锁实现并挂载好 `.deploy-state` 目录，
 > 用现有 D3 流程验证过一次正常部署之后，再给 caller 打开 `busy_lock_file`。
@@ -295,7 +293,7 @@ workflow 即可补上线；重跑会从 ACR 拉取并复用已有的 SHA 成品�
 |---|---|---|---|---|
 | `rc=0` | 新版本已上线、通过健康探针**且通过三段镜像对账** | `deployed`（已部署）或 `skipped_already_deployed`（已是 last-good） | 新版本，已验证在应答 | 无需动作 |
 | `rc=1` | 新版本探针失败，**或**前向 pull/retag/compose up 失败；已回滚到 last_good，且**回滚后的同预算探针已通过** | `rolled_back` | `last_good` 且已验证 | 不需要紧急上机。前向失败触发时日志含 `rollback triggered by forward deploy failure` |
-| `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | 空闲后点黄卡按钮重跑 |
+| `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | Agent 从 GitHub run 处理，空闲后重跑 |
 | `rc=4` | 新版本探针失败或前向部署失败之后：`rollback_safety=safe` 时已回滚但同预算探针未证实旧版应答（或回滚动作本身失败）；非 `safe` 时自动回滚未执行（守卫同时覆盖探针失败与前向失败） | `rollback_unhealthy`（safe）/ `rollback_skipped_<safety>`（非 safe） | safe：旧版是否应答未证实；非 safe：生产状态未证实 | safe：先确认生产是否应答；非 safe：确认生产状态并决定是否手动回滚 |
 | `rc=5` | 探针已过、`last_good` 已推进、镜像对账失败 | `reconcile_failed` | 新版本在跑但身份未证明 | **立即上机核对**，不自动回滚，不要重跑 |
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | —（仅 release lane 定义） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
@@ -344,8 +342,7 @@ on-call 必须上机看，不能当成「未上线、无需处理」。
 
 `rollback_safety=safe` 时，`rc=4` 与 `rc=130` 的优先级仍按是否替换过容器：已经替换过、又未能自证健康时返回 `4`，
 因为生产状态的坏消息比「被中断」更需要人知道；而尚未替换过容器时收到信号，就老实返回 `130`。
-通知分流为：`rc=3` 发 P2 延期通知；`rc=4` 发 P0 紧急通知，明确提示「生产可能不可用，
-必须立即上机」；其余失败发普通 P0 通知，并按失败 step 处置。
+通知仅用于生产状态未证实：单镜像 lane 的 `rc=4` 回滚健康未证与 `rc=5` 镜像身份未证分别发 P0；release lane 的回滚健康未证、Reconcile 失败，以及远端状态未证（远端 rc 缺失或不等于 `1`）发 P0。已健康回滚（`rc=1`）、构建等普通失败、`rc=3` 延期和 busy defer 不发通知，由 Agent 从 GitHub run 处理。
 
 ### 回滚前现场取证
 
@@ -457,7 +454,7 @@ running 全景；错误信息同时说明 `last_good_release` **已经**被推�
 传输耗尽不会执行对账。
 
 部署通知经 `zlxlabs/gate` 的共用 action `.github/actions/notify@v2` 发送，按 webhook
-主机名分派企业微信 markdown / 飞书卡。读取调用方配置:
+主机名分派企业微信 markdown / 飞书卡。只在回滚健康未证、镜像 Reconcile 失败或 release 远端状态未证时发送；成功回执仍由 `notify_on_success` opt-in 控制，普通失败、部署延期与 busy defer 不发。读取调用方配置:
 - `FEISHU_CI_WEBHOOK`（secret）: 通知 webhook 地址（名字沿旧约定，值可为企微或飞书机器人地址）。
 - `FEISHU_CI_TITLE_PREFIX`（repo variable）: 标题前缀；未配置时默认 `[zlxlabs·CI]`。
 

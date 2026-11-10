@@ -429,30 +429,48 @@ jobs:
 
       # 通知发送统一走 zlxlabs/gate/.github/actions/notify@v2(按 webhook 主机分派
       # 企微 markdown / 飞书卡);本模板只组装 severity/title/body/links 四个字段。
-      - name: 组装 release busy defer 通知字段
-        id: assemble_busy_defer
-        if: failure() && steps.deploy.outputs.busy_deferred == 'true'
+      - name: 组装 release reconcile 失败通知字段
+        id: assemble_reconcile_failed
+        if: failure() && steps.deploy.outputs.reconcile_failed == 'true'
         continue-on-error: true
+        env:
+          SVC: ${{ github.event.repository.name }}
+          HOST: ${{ inputs.host }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ steps.sha.outputs.git_sha }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
-          {
-            echo "severity=P2"
-            echo "title=D3 release deferred: service busy"
-            echo "body="
-            echo "links=[]"
-          } >> "$GITHUB_OUTPUT"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          svc = os.environ.get("SVC", "") or "?"
+          host = os.environ.get("HOST", "") or "?"
+          repo = os.environ.get("REPO", "") or "?"
+          sha = os.environ.get("SHA", "") or "?"
+          run_url = os.environ.get("RUN_URL", "") or "?"
+          body = (f"服务: {svc} · 目标机: {host}\n"
+                  f"仓库: {repo} · 本次 SHA: {sha}\n"
+                  f"部署后镜像 Reconcile 失败，生产运行中容器的镜像身份未证，生产可能正在运行未验证的镜像。\n"
+                  f"现在立即上机核对运行中容器镜像 SHA，并确认生产状态。")
+          print("severity=P0")
+          print("title=D3 release production image identity unverified")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "立即上机核验", "url": run_url},], ensure_ascii=False))
+          PY
 
-      - name: release busy defer 通知 (deferred, fail-open)
-        if: failure() && steps.deploy.outputs.busy_deferred == 'true'
+      - name: release reconcile 失败通知 (P0, fail-open)
+        if: failure() && steps.deploy.outputs.reconcile_failed == 'true'
         continue-on-error: true
         uses: zlxlabs/gate/.github/actions/notify@v2
         with:
           webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
           title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
-          severity: ${{ steps.assemble_busy_defer.outputs.severity }}
-          title: ${{ steps.assemble_busy_defer.outputs.title }}
-          body: ${{ steps.assemble_busy_defer.outputs.body }}
-          links: ${{ steps.assemble_busy_defer.outputs.links }}
+          severity: ${{ steps.assemble_reconcile_failed.outputs.severity }}
+          title: ${{ steps.assemble_reconcile_failed.outputs.title }}
+          body: ${{ steps.assemble_reconcile_failed.outputs.body }}
+          links: ${{ steps.assemble_reconcile_failed.outputs.links }}
 
       - name: 组装 release rollback unhealthy 通知字段
         id: assemble_rollback_unhealthy
@@ -501,7 +519,7 @@ jobs:
 
       - name: 组装 release failure 通知字段
         id: assemble_release_failure
-        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true' && steps.deploy.outputs.reconcile_failed != 'true' && steps.deploy.outputs.deploy_rc != '1'
         continue-on-error: true
         env:
           SVC: ${{ github.event.repository.name }}
@@ -550,7 +568,7 @@ jobs:
           PY
 
       - name: release failure 通知 (P0, fail-open)
-        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
+        if: failure() && steps.deploy.outputs.busy_deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true' && steps.deploy.outputs.reconcile_failed != 'true' && steps.deploy.outputs.deploy_rc != '1'
         continue-on-error: true
         uses: zlxlabs/gate/.github/actions/notify@v2
         with:

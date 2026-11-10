@@ -416,10 +416,10 @@ def test_release_rc4_output_and_notification_routing_contract():
     assert idx_non255 < idx_output < idx_exit
     assert text.count(output) == 1
 
-    # 三张通知卡(rc=3 延期 / rc=4 回滚未证 / 其余失败)的路由 if 与字段契约
-    # 在 tests/test_release_notify_contract.py。
+    # release notify 路由条件与字段契约在 tests/test_release_notify_contract.py。
     names = {step.get("name") for step in steps}
-    assert "release busy defer 通知 (deferred, fail-open)" in names
+    assert "release busy defer 通知 (deferred, fail-open)" not in names
+    assert "release reconcile 失败通知 (P0, fail-open)" in names
     assert "release rollback unhealthy 通知 (P0, fail-open)" in names
     assert "release failure 通知 (P0, fail-open)" in names
 

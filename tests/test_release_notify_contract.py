@@ -28,12 +28,12 @@ NOTIFY_ACTION = "zlxlabs/gate/.github/actions/notify@v2"
 NOTIFY_ACTION_INPUTS = {"webhook", "title_prefix", "severity", "title", "body", "links"}
 
 # 通知 step 名 -> (组装 step id, 触发条件[与 base 逐字一致], severity 映射)
-# severity 按原卡颜色映射:yellow(busy defer)->P2;urgent/P0(回滚未证/失败)->P0。
+# P0 仅用于回滚健康未证、镜像身份未证与远端状态未证。
 NOTIFY_STEPS = {
-    "release busy defer 通知 (deferred, fail-open)": (
-        "assemble_busy_defer",
-        "failure() && steps.deploy.outputs.busy_deferred == 'true'",
-        "P2",
+    "release reconcile 失败通知 (P0, fail-open)": (
+        "assemble_reconcile_failed",
+        "failure() && steps.deploy.outputs.reconcile_failed == 'true'",
+        "P0",
     ),
     "release rollback unhealthy 通知 (P0, fail-open)": (
         "assemble_rollback_unhealthy",
@@ -44,7 +44,9 @@ NOTIFY_STEPS = {
     "release failure 通知 (P0, fail-open)": (
         "assemble_release_failure",
         "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
-        "steps.deploy.outputs.rollback_unhealthy != 'true'",
+        "steps.deploy.outputs.rollback_unhealthy != 'true' && "
+        "steps.deploy.outputs.reconcile_failed != 'true' && "
+        "steps.deploy.outputs.deploy_rc != '1'",
         "P0",
     ),
 }
@@ -103,7 +105,12 @@ def test_release_notify_steps_call_gate_notify_action_with_contract_inputs():
     # (#46:vars 不打码会进日志)。
     raw, _ = load()
     steps = _steps_by_name(raw)
-    assert set(NOTIFY_STEPS) <= set(steps)
+    notify_names = {
+        step.get("name")
+        for step in raw["jobs"]["release"]["steps"]
+        if step.get("uses") == NOTIFY_ACTION
+    }
+    assert notify_names == set(NOTIFY_STEPS), "release notify action steps 必须穷举且仅含允许通知"
     for name, (assemble_id, condition, _severity) in NOTIFY_STEPS.items():
         step = steps[name]
         assert step["uses"] == NOTIFY_ACTION
@@ -129,7 +136,24 @@ def test_release_notify_steps_call_gate_notify_action_with_contract_inputs():
         assert "${{ inputs." not in assemble["run"]
 
 
-def test_release_no_direct_channel_posting_remains():
+def test_release_failure_notify_only_when_remote_state_is_unverified():
+    raw, _ = load()
+    failure = _steps_by_name(raw)["release failure 通知 (P0, fail-open)"]
+    assemble = _step_by_id(raw, "assemble_release_failure")
+    assert failure["if"] == (
+        "failure() && steps.deploy.outputs.busy_deferred != 'true' && "
+        "steps.deploy.outputs.rollback_unhealthy != 'true' && "
+        "steps.deploy.outputs.reconcile_failed != 'true' && "
+        "steps.deploy.outputs.deploy_rc != '1'"
+    )
+    assert failure["continue-on-error"] is True
+    assert assemble["if"] == failure["if"]
+    assert assemble["env"]["REMOTE_RC"] == "${{ steps.deploy.outputs.deploy_rc }}"
+    names = set(_steps_by_name(raw))
+    assert "release busy defer 通知 (deferred, fail-open)" not in names
+
+
+def test_release_no_direct_channel_posting_remains()
     # 发送逻辑全部收拢进 gate notify action:模板内不得残留直连 webhook 的代码;
     # 缺地址 notify-skipped、发送失败 ::error 均由 action 承担(被 continue-on-error 吸收)。
     text = WORKFLOW.read_text()
@@ -144,15 +168,27 @@ def test_release_no_direct_channel_posting_remains():
     assert "response parse failed" not in text
 
 
-def test_release_busy_defer_notification_is_p2_with_fixed_content(tmp_path):
+def test_release_reconcile_failure_is_p0_and_requests_running_sha_check(tmp_path):
     raw, _ = load()
-    assemble = _step_by_id(raw, "assemble_busy_defer")
-    completed, outputs = _run_assemble_step(assemble, {}, tmp_path / "out")
+    step = _steps_by_name(raw)["release reconcile 失败通知 (P0, fail-open)"]
+    assemble = _step_by_id(raw, "assemble_reconcile_failed")
+    assert step["if"] == "failure() && steps.deploy.outputs.reconcile_failed == 'true'"
+    assert step["continue-on-error"] is True
+    completed, outputs = _run_assemble_step(
+        assemble,
+        {
+            "SVC": "contract-service",
+            "HOST": "contract-host",
+            "REPO": "zlxlabs/ci-templates",
+            "SHA": "0123456789ab",
+            "RUN_URL": "https://example.test/actions/runs/123",
+        },
+        tmp_path / "reconcile-out",
+    )
     assert completed.returncode == 0, completed.stdout + completed.stderr
-    assert outputs["severity"] == "P2"
-    assert outputs["title"] == "D3 release deferred: service busy"
-    assert outputs["body"] == ""
-    assert json.loads(outputs["links"]) == []
+    assert outputs["severity"] == "P0"
+    for phrase in ("Reconcile 失败", "生产运行中容器", "镜像身份未证", "立即上机核对运行中容器镜像 SHA"):
+        assert phrase in outputs["body"]
 
 
 def test_release_rollback_unhealthy_notification_fields(tmp_path):
