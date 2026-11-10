@@ -34,6 +34,20 @@ def _write_fake_docker(tmp_path: Path, body: str) -> Path:
         "set -euo pipefail\n"
         "{ printf 'CALL'; printf ' %q' \"$@\"; printf '\\n'; } >> "
         f"\"{argv_log}\"\n"
+        '''if [ "$1" = version ]; then echo "client=27.3 server=27.3"; exit 0; fi
+if [ "$1" = info ]; then echo overlay2; exit 0; fi
+if [ "$1" = buildx ] && [ "$2" = version ]; then echo "github.com/docker/buildx v0.19.0"; exit 0; fi
+if [ "$1" = manifest ] && [ "$2" = inspect ]; then
+  if [ -f "'''
+        + str(tmp_path / "manifest-error")
+        + '''" ]; then echo "unauthorized" >&2; exit 17; fi
+  if [ -f "'''
+        + str(tmp_path / "manifest-present")
+        + '''" ]; then echo "manifest exists"; exit 0; fi
+  echo "no such manifest: $3" >&2
+  exit 1
+fi
+'''
         + body
     )
     docker.chmod(0o755)
@@ -41,8 +55,109 @@ def _write_fake_docker(tmp_path: Path, body: str) -> Path:
     return docker
 
 
-def _recorded_argv(tmp_path: Path) -> list[list[str]]:
+def _all_recorded_argv(tmp_path: Path) -> list[list[str]]:
     return [shlex.split(line)[1:] for line in (tmp_path / "docker-argv.log").read_text().splitlines()]
+
+
+def _recorded_argv(tmp_path: Path) -> list[list[str]]:
+    metadata = {"version", "info"}
+    return [
+        call for call in _all_recorded_argv(tmp_path)
+        if call[0] not in metadata and call[:2] != ["buildx", "version"]
+        and call[:2] != ["manifest", "inspect"]
+    ]
+
+
+def test_existing_sha_is_pulled_without_build_or_acr_push(tmp_path):
+    (tmp_path / "manifest-present").touch()
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = pull ] || [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
+if [ "$1" = build ] || ([ "$1" = buildx ] && [ "$2" = build ]); then exit 99; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(tmp_path, docker, LOCAL_REGISTRY="local.example:5001", PUSH_MAX_ATTEMPTS="1"),
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "already exists → reuse" in result.stdout
+    assert _all_recorded_argv(tmp_path) == [
+        ["version", "--format", "client={{.Client.Version}} server={{.Server.Version}}"],
+        ["buildx", "version"],
+        ["info", "--format", "{{.Driver}}"],
+        ["manifest", "inspect", "registry.example/namespace/service:abc123"],
+        ["pull", "registry.example/namespace/service:abc123"],
+        ["tag", "registry.example/namespace/service:abc123", "local.example:5001/namespace/service:abc123"],
+        ["push", "local.example:5001/namespace/service:abc123"],
+    ]
+    assert not any(call[0] in {"build", "push"} and (call[0] == "build" or call[1].startswith("registry.example/"))
+                   for call in _all_recorded_argv(tmp_path))
+
+
+def test_missing_sha_builds_with_explicit_artifact_shape_then_pushes(tmp_path):
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ] || [ "$1" = push ]; then exit 0; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert _all_recorded_argv(tmp_path) == [
+        ["version", "--format", "client={{.Client.Version}} server={{.Server.Version}}"],
+        ["buildx", "version"],
+        ["info", "--format", "{{.Driver}}"],
+        ["manifest", "inspect", "registry.example/namespace/service:abc123"],
+        ["build", "--provenance=false", "--sbom=false", "--build-arg", "GIT_SHA=abc123",
+         "-f", f"{tmp_path}/Dockerfile", "-t", "registry.example/namespace/service:abc123", str(tmp_path)],
+        ["push", "registry.example/namespace/service:abc123"],
+    ]
+
+
+def test_sha_probe_error_fails_without_build_or_pull(tmp_path):
+    (tmp_path / "manifest-error").touch()
+    docker = _write_fake_docker(tmp_path, "exit 0\\n")
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker), text=True, capture_output=True,
+    )
+
+    assert result.returncode != 0
+    assert "::error::ACR-SHA-PROBE-FAILED" in result.stdout
+    assert [call[:2] for call in _all_recorded_argv(tmp_path)] == [
+        ["version", "--format"], ["buildx", "version"], ["info", "--format"], ["manifest", "inspect"],
+    ]
+
+
+def test_toolchain_fingerprint_is_logged_before_build(tmp_path):
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ] || [ "$1" = push ]; then exit 0; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    fingerprint = "[push] toolchain: docker_client=27.3 docker_server=27.3 buildx=github.com/docker/buildx v0.19.0 storage_driver=overlay2"
+    assert fingerprint in result.stdout
+    assert result.stdout.index(fingerprint) < result.stdout.index("[push] building")
+    calls = _all_recorded_argv(tmp_path)
+    assert calls.index(["manifest", "inspect", "registry.example/namespace/service:abc123"]) < calls.index(
+        ["build", "--provenance=false", "--sbom=false", "--build-arg", "GIT_SHA=abc123",
+         "-f", f"{tmp_path}/Dockerfile", "-t", "registry.example/namespace/service:abc123", str(tmp_path)]
+    )
 
 
 def test_push_retries_a_transient_failure_without_rebuilding(tmp_path):
@@ -72,6 +187,8 @@ fi
     assert _recorded_argv(tmp_path) == [
         [
             "build",
+            "--provenance=false",
+            "--sbom=false",
             "--build-arg",
             "GIT_SHA=abc123",
             "-f",
@@ -178,6 +295,8 @@ if [ "$1" = push ]; then echo "push $2" >> "{calls}"; exit 0; fi
         "build",
         "--builder",
         "ci-templates-registry-cache",
+        "--provenance=false",
+        "--sbom=false",
         "--build-arg",
         "GIT_SHA=abc123",
         "-f",
@@ -244,6 +363,8 @@ if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
         ],
         [
             "build",
+            "--provenance=false",
+            "--sbom=false",
             "--build-arg",
             "GIT_SHA=abc123",
             "-f",
@@ -288,6 +409,8 @@ if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
             "build",
             "--builder",
             "ci-templates-registry-cache",
+            "--provenance=false",
+            "--sbom=false",
             "--build-arg",
             "GIT_SHA=abc123",
             "-f",
@@ -303,6 +426,8 @@ if [ "$1" = tag ] || [ "$1" = push ]; then exit 0; fi
         ],
         [
             "build",
+            "--provenance=false",
+            "--sbom=false",
             "--build-arg",
             "GIT_SHA=abc123",
             "-f",
@@ -385,9 +510,8 @@ fi
     assert "push registry.example/namespace/service:abc123" in calls.read_text()
 
 
-def test_acr_push_failure_with_local_registry_ok_is_non_fatal(tmp_path):
-    """本地 push 成功、ACR 失败 → ACR 是 fallback,fallback 失效必须可见但不阻塞部署
-    (部署关键路径本地已经拿到镜像了),打醒目 warning 而不是静默放行。"""
+def test_acr_push_failure_with_local_registry_ok_is_fatal(tmp_path):
+    """本地 push 成功也不能掩盖 ACR push 失败：ACR 归档失败必须致命。"""
     docker = _write_fake_docker(
         tmp_path,
         '''if [ "$1" = build ] || [ "$1" = tag ]; then exit 0; fi
@@ -406,9 +530,8 @@ fi
         text=True, capture_output=True,
     )
 
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert "ACR push failed" in result.stdout
-    assert "offsite archive/fallback unavailable" in result.stdout
+    assert result.returncode != 0
+    assert "::error::push failed for abc123 to every configured registry — image not available anywhere" in result.stdout
 
 
 def test_local_registry_and_acr_both_failing_is_fatal(tmp_path):
