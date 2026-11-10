@@ -66,6 +66,11 @@ RESULT_FILE="${STATE_DIR}/last_deploy_result.json"
 DEPLOY_OUTCOME=""
 IMAGE_ID=""
 IMAGE_DIGEST=""
+# 本地 registry 回退可见性(issue #87):本次回执描述的镜像,最近一次 pull_image()
+# 实际从哪条链路拿到——local=本地拉取并 retag 成功;acr=未走本地路径(未配
+# LOCAL_IMAGE / ref 带 digest);acr-fallback=配了本地但拉取失败改走 ACR。发生
+# 回滚时回执描述的是回滚镜像,故取回滚那一次 pull 的来源。
+IMAGE_SOURCE="acr"
 PROBE_STATUS="skipped"
 PROBE_FINAL_CODE=""
 PROBE_ATTEMPTS=0
@@ -125,12 +130,13 @@ json_quote() {
 write_deploy_result() {
   local outcome="$1" finished_at result result_tmp
   finished_at="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
-  printf -v result '{"schema_version":1,"deploy_id":%s,"git_sha":%s,"tag":%s,"image_id":%s,"image_digest":%s,"outcome":%s,"probe":{"status":%s,"final_code":%s,"attempts":%d,"elapsed_s":%d},"finished_at":%s}' \
+  printf -v result '{"schema_version":1,"deploy_id":%s,"git_sha":%s,"tag":%s,"image_id":%s,"image_digest":%s,"image_source":%s,"outcome":%s,"probe":{"status":%s,"final_code":%s,"attempts":%d,"elapsed_s":%d},"finished_at":%s}' \
     "$(json_quote "$DEPLOY_ID")" \
     "$(json_quote "$GIT_SHA")" \
     "$(json_quote "$GIT_SHA")" \
     "$(json_quote "$IMAGE_ID")" \
     "$(json_quote "$IMAGE_DIGEST")" \
+    "$(json_quote "$IMAGE_SOURCE")" \
     "$(json_quote "$outcome")" \
     "$(json_quote "$PROBE_STATUS")" \
     "$(json_quote "$PROBE_FINAL_CODE")" \
@@ -247,6 +253,7 @@ pull_from_local_registry() {
         return 0
       fi
       log "local registry pull succeeded but retag to ${ACR_IMAGE}:${tag} failed — falling back to ACR"
+      echo "::warning::local registry pull failed, fell back to ACR (retag-failed)" >&2
       return 1
     fi
     log "local registry pull attempt ${attempt}/${LOCAL_PULL_RETRIES} failed for ${LOCAL_IMAGE}:${tag}"
@@ -254,14 +261,20 @@ pull_from_local_registry() {
     attempt=$((attempt + 1))
   done
   log "local registry unreachable after ${LOCAL_PULL_RETRIES} attempts — falling back to ACR"
+  echo "::warning::local registry pull failed, fell back to ACR (pull-failed)" >&2
   return 1
 }
 
 pull_image() {
   local ref="$1" attempt=1
   local tag="${ref##*:}"
-  if [[ "$ref" != *@* ]] && [ -n "$LOCAL_IMAGE" ] && pull_from_local_registry "$tag"; then
-    return 0
+  IMAGE_SOURCE="acr"
+  if [[ "$ref" != *@* ]] && [ -n "$LOCAL_IMAGE" ]; then
+    if pull_from_local_registry "$tag"; then
+      IMAGE_SOURCE="local"
+      return 0
+    fi
+    IMAGE_SOURCE="acr-fallback"
   fi
   while [ "$attempt" -le "$PULL_RETRIES" ]; do
     if "$DOCKER_BIN" pull "$ref"; then return 0; fi

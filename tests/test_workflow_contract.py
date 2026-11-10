@@ -470,7 +470,7 @@ def test_deploy_result_evidence_is_parsed_into_step_outputs():
     assert "capture_deploy_result" in run
     assert "result_prefix='[deploy][evidence] result-json: '" in run
     for output in (
-        "image_digest", "probe_status", "probe_attempts",
+        "image_digest", "image_source", "probe_status", "probe_attempts",
         "probe_elapsed_s", "outcome",
     ):
         assert f'(\"{output}\",' in run
@@ -655,7 +655,7 @@ exit 97
         "probe_final_code": receipt["probe"]["final_code"],
         "probe_attempts": receipt["probe"]["attempts"],
         "probe_elapsed_s": receipt["probe"]["elapsed_s"],
-        "outcome": receipt["outcome"],
+        "outcome": receipt["outcome"], "image_source": receipt["image_source"],
     }
     assert outputs == {
         "image_digest": "sha256:image",
@@ -663,7 +663,7 @@ exit 97
         "probe_final_code": "200",
         "probe_attempts": 1,
         "probe_elapsed_s": 0,
-        "outcome": "deployed",
+        "outcome": "deployed", "image_source": "acr",
     }
     deploy_run = next(
         step["run"]

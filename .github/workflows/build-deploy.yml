@@ -358,6 +358,9 @@ jobs:
           probe = result["probe"]
           for key, value in (
               ("image_digest", result["image_digest"]),
+              # issue #87:老远端脚本写的回执没有 image_source 字段,get 缺省
+              # "unknown",旧结果照样解析、照样进 summary,不因缺键整体判死。
+              ("image_source", result.get("image_source", "unknown")),
               ("probe_status", probe["status"]),
               ("probe_final_code", probe["final_code"]),
               ("probe_attempts", probe["attempts"]),
@@ -369,10 +372,17 @@ jobs:
               echo "::warning::deploy result evidence JSON parse failed"
               return 0
             fi
+            image_source="unknown"
             while IFS= read -r line; do
               [[ -n "$line" ]] || continue
+              case "$line" in
+                image_source=*) image_source="${line#image_source=}" ;;
+              esac
               echo "$line" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deploy result output"
             done <<< "$parsed"
+            # issue #87:镜像来源写进 Step Summary,本地 registry 回退
+            # (acr-fallback)一眼可见;老远端回执无此字段时显示 unknown。
+            echo "image source: ${image_source}" >> "$GITHUB_STEP_SUMMARY" || echo "::warning::failed to write image source to step summary"
           }
 
           deploy_once() {
