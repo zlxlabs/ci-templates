@@ -49,18 +49,16 @@ NOTIFY_ACTION = "zlxlabs/gate/.github/actions/notify@v2"
 NOTIFY_ACTION_INPUTS = {"webhook", "title_prefix", "severity", "title", "body", "links"}
 
 # 通知 step 名 -> (组装 step id, 触发条件[与 base 逐字一致], severity 映射)
-# severity 按原卡颜色映射:green(成功回执)->info;red(失败/回滚健康未证)->P0;
-# yellow(延期)->P2。
+# 保留成功回执 opt-in;失败通知只覆盖回滚健康未证与镜像身份未证。
 NOTIFY_STEPS = {
     "部署成功回执通知 (opt-in, fail-open)": (
         "assemble_success_receipt",
         "success() && inputs.notify_on_success == true",
         "info",
     ),
-    "部署失败通知 (P0, fail-open)": (
-        "assemble_deploy_failure",
-        "failure() && steps.deploy.outputs.deferred != 'true' && "
-        "steps.deploy.outputs.rollback_unhealthy != 'true'",
+    "生产镜像身份未证通知 (P0, fail-open)": (
+        "assemble_reconcile_failed",
+        "failure() && steps.deploy.outputs.reconcile_failed == 'true'",
         "P0",
     ),
     "回滚健康未证紧急通知 (P0, fail-open)": (
@@ -68,11 +66,6 @@ NOTIFY_STEPS = {
         "failure() && steps.deploy.outputs.deferred != 'true' && "
         "steps.deploy.outputs.rollback_unhealthy == 'true'",
         "P0",
-    ),
-    "部署延期通知 (deferred, fail-open)": (
-        "assemble_deploy_deferred",
-        "failure() && steps.deploy.outputs.deferred == 'true'",
-        "P2",
     ),
 }
 
@@ -792,22 +785,27 @@ def test_success_receipt_skips_without_digest_and_emits_no_severity(tmp_path):
 def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     text = WORKFLOW.read_text()
 
-    # 标题前缀不再经 env 进组装 step,而是 4 处 notify step 统一作为 action 输入;
+    # 标题前缀不再经 env 进组装 step,而是 3 处 notify step 统一作为 action 输入;
     # 默认值 [zlxlabs·CI] 由 gate notify action 承担(模板注释说明)。
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "FEISHU_TITLE_PREFIX" not in text
     assert "[zlxlabs·CI]" in text
-    assert text.count("title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}") == 4
+    assert text.count("title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}") == 3
 
 
 def test_notify_steps_call_gate_notify_action_with_contract_inputs():
-    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。7 处通知(本文件 4 处,
+    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。6 处通知(本文件 3 处,
     # release lane 3 处见 test_release_workflow_contract.py)的 if 必须与 base 逐字一致,
     # with: 键集合必须是 action.yml 声明 inputs 的子集且含 webhook/title/body,
     # webhook 只能来自 secrets.FEISHU_CI_WEBHOOK(#46:vars 不打码会进日志)。
     raw, _ = _load()
     steps = _steps_by_name(raw)
-    assert set(NOTIFY_STEPS) <= set(steps)
+    notify_names = {
+        step.get("name")
+        for step in raw["jobs"]["build-deploy"]["steps"]
+        if step.get("uses") == NOTIFY_ACTION
+    }
+    assert notify_names == set(NOTIFY_STEPS), "notify action steps 必须穷举且仅含允许的通知"
     for name, (assemble_id, condition, _severity) in NOTIFY_STEPS.items():
         step = steps[name]
         assert step["uses"] == NOTIFY_ACTION
@@ -836,7 +834,7 @@ def test_notify_steps_call_gate_notify_action_with_contract_inputs():
 def test_no_direct_channel_posting_remains_in_template():
     # 发送逻辑全部收拢进 gate notify action:模板内不得残留直连 webhook 的代码。
     text = WORKFLOW.read_text()
-    assert text.count(f"uses: {NOTIFY_ACTION}") == 4
+    assert text.count(f"uses: {NOTIFY_ACTION}") == 3
     assert "open.feishu.cn" not in text
     assert "open.larksuite.com" not in text
     assert "vars.FEISHU_CI_WEBHOOK" not in text
@@ -869,9 +867,8 @@ def test_failure_side_notify_assembles_emit_expected_fields(tmp_path):
         "ROLLBACK_SKIPPED": "false",
     }
     expectations = {
-        "assemble_deploy_failure": ("P0", "部署失败 · contract-service", "查看部署 Run"),
+        "assemble_reconcile_failed": ("P0", "生产镜像身份未证 · contract-service", "查看部署 Run"),
         "assemble_rollback_unhealthy": ("P0", "回滚健康未证 · contract-service", "立即上机处置"),
-        "assemble_deploy_deferred": ("P2", "部署延期 · contract-service", "重跑部署"),
     }
     for assemble_id, (severity, title, link_text) in expectations.items():
         assemble = _step_by_id(raw, assemble_id)
@@ -952,25 +949,6 @@ def test_deferred_output_write_failure_does_not_skip_rc3_exit():
     output = 'echo "deferred=true" >> "$GITHUB_OUTPUT"'
     assert f'{output} || echo "::warning::' in branch
     assert branch.index("::warning::deploy DEFERRED") < branch.index("exit 3")
-
-
-def test_deploy_failure_notifications_are_mutually_exclusive_and_exhaustive():
-    text = WORKFLOW.read_text()
-    assert "failure() && steps.deploy.outputs.deferred == 'true'" in text
-    assert (
-        "failure() && steps.deploy.outputs.deferred != 'true' && "
-        "steps.deploy.outputs.rollback_unhealthy == 'true'"
-    ) in text
-    assert (
-        "failure() && steps.deploy.outputs.deferred != 'true' && "
-        "steps.deploy.outputs.rollback_unhealthy != 'true'"
-    ) in text
-
-    urgent_idx = text.index("回滚健康未证紧急通知")
-    yellow_idx = text.index("部署延期通知 (deferred, fail-open)")
-    urgent_section = text[urgent_idx:yellow_idx]
-    assert "生产可能不可用，必须立即上机" in urgent_section
-    assert "不需要紧急上机" not in urgent_section
 
 
 def test_red_card_distinguishes_deploy_only_from_rc5_double_red():
@@ -1128,25 +1106,19 @@ def test_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
     assert "deferred=true" in text, "rc=3 must still fall through to deferred"
 
 
-def test_red_card_step_skips_when_deferred():
-    text = WORKFLOW.read_text()
-    assert "deferred != 'true'" in text
-    assert "rollback_unhealthy != 'true'" in text
-
-
-def test_deferred_notification_is_p2_and_no_at_all_markup_remains():
-    # 原黄卡「不 @全员」的语义在企微侧由 severity 承担:延期 P2,失败/回滚未证 P0;
-    # 企微 markdown 不支持 @全员(gate notify action 无 mention 输入),模板内不得残留 at 标记。
+def test_deferred_and_ordinary_failure_do_not_send_notifications():
+    raw, _ = _load()
+    steps = raw["jobs"]["build-deploy"]["steps"]
+    notify_names = {
+        step.get("name") for step in steps if step.get("uses") == NOTIFY_ACTION
+    }
+    assert notify_names == set(NOTIFY_STEPS)
+    assert "部署失败通知 (P0, fail-open)" not in notify_names
+    assert "部署延期通知 (deferred, fail-open)" not in notify_names
     text = WORKFLOW.read_text()
     assert "<at id=all>" not in text
     assert '<at user_id="all">' not in text
-    raw, _ = _load()
-    assert "severity=info" in _step_by_id(raw, "assemble_success_receipt")["run"]
-    assert "severity=P0" in _step_by_id(raw, "assemble_deploy_failure")["run"]
-    assert "severity=P0" in _step_by_id(raw, "assemble_rollback_unhealthy")["run"]
-    assert "severity=P2" in _step_by_id(raw, "assemble_deploy_deferred")["run"]
-    deferred = _steps_by_name(raw)["部署延期通知 (deferred, fail-open)"]
-    assert deferred["if"] == "failure() && steps.deploy.outputs.deferred == 'true'"
+    assert "failure() && steps.deploy.outputs.deferred == 'true'" not in text
 
 
 def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():
