@@ -153,7 +153,7 @@ def test_release_failure_notify_only_when_remote_state_is_unverified():
     assert "release busy defer 通知 (deferred, fail-open)" not in names
 
 
-def test_release_no_direct_channel_posting_remains()
+def test_release_no_direct_channel_posting_remains():
     # 发送逻辑全部收拢进 gate notify action:模板内不得残留直连 webhook 的代码;
     # 缺地址 notify-skipped、发送失败 ::error 均由 action 承担(被 continue-on-error 吸收)。
     text = WORKFLOW.read_text()
