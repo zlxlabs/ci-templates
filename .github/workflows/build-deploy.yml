@@ -505,12 +505,14 @@ jobs:
           echo "::error::image reconcile assertion failed (rc=5); deployment may have succeeded, but production image identity is not proven"
           exit 1
 
-      - name: Feishu 部署成功回执卡 (opt-in, fail-open)
+      # 通知发送统一走 zlxlabs/gate/.github/actions/notify@v2(按 webhook 主机分派
+      # 企微 markdown / 飞书卡);本模板只组装 severity/title/body/links 四个字段。
+      # emoji、标题前缀、级别词由 action 渲染进 heading,title 只带业务文本。
+      - name: 组装部署成功回执通知字段
+        id: assemble_success_receipt
         if: success() && inputs.notify_on_success == true
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
-          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
@@ -532,24 +534,17 @@ jobs:
           [ -n "$PROBE_ELAPSED_S" ] || missing="${missing:+$missing,}probe_elapsed_s"
           [ -n "$OUTCOME" ] || missing="${missing:+$missing,}outcome"
           if [ -n "$missing" ]; then
+            # 回执证据不完整时宁可不发(成功回执的全部价值是"证据齐全的部署成功"),
+            # 也不发缺字段的假回执。本 step 失败被 continue-on-error 吸收;下游 notify
+            # step 拿不到 severity 输出,会被 action 以 notify-invalid-severity 拒绝并
+            # 同样被吸收——两 step 都不改变部署结论,且都在 run 界面可见。
             echo "::warning::success receipt skipped: ${missing}"
-            exit 0
+            exit 1
           fi
-          webhook="${FEISHU_WEBHOOK:-}"
-          if [ -z "$webhook" ]; then
-            echo "::warning::success receipt skipped: FEISHU_WEBHOOK is not configured"
-            exit 0
-          fi
-          response_file="$(mktemp)"
-          curl_stderr="${response_file}.stderr"
-          trap 'rm -f -- "$response_file" "$curl_stderr"' EXIT
-          http_status=""
-          curl_rc=0
-          http_status="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- -o "$response_file" -w '%{http_code}' "$webhook" 2>"$curl_stderr"
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json
           import os
 
-          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc = os.environ["SVC"]
           host = os.environ["HOST"]
           repo = os.environ["REPO"]
@@ -567,69 +562,43 @@ jobs:
                   f"探针 status={probe_status} · final_code={probe_final_code} · "
                   f"attempts={probe_attempts} · elapsed_s={probe_elapsed_s} · "
                   f"outcome={outcome}\n"
-                  f"部署成功，镜像对账已通过。\n"
-                  f"Run: {run_url}")
-          card = {
-              "msg_type": "interactive",
-              "card": {
-                  "config": {"wide_screen_mode": True},
-                  "header": {
-                      "template": "green",
-                      "title": {
-                          "tag": "plain_text",
-                          "content": f"✅ {title_prefix} 部署成功 · {svc}",
-                      },
-                  },
-                  "elements": [
-                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                      {"tag": "action", "actions": [
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
-                           "type": "primary", "url": run_url},
-                      ]},
-                  ],
-              },
-          }
-          print(json.dumps(card))
+                  f"部署成功，镜像对账已通过。")
+          print("severity=info")
+          print(f"title=部署成功 · {svc}")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "查看部署 Run", "url": run_url}], ensure_ascii=False))
           PY
-          )" || curl_rc=$?
-          if [ "$curl_rc" -ne 0 ]; then
-            echo "::warning::Feishu 部署成功回执卡 request failed or timed out: curl_rc=${curl_rc}, http_status=${http_status:-unknown}"
-            exit 0
-          fi
-          if ! python3 - "Feishu 部署成功回执卡" "$response_file" "$http_status" <<'PY'
-          import json
-          import sys
 
-          label, response_file, http_status = sys.argv[1:4]
-          try:
-              with open(response_file, encoding="utf-8") as response:
-                  result = json.load(response)
-              code = result["code"]
-          except (OSError, ValueError, KeyError, TypeError):
-              print(f"::warning::{label} response parse failed; http_status={http_status or 'unknown'}")
-          else:
-              if str(code) != "0":
-                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
-                  print(f"::warning::{label} business error: code={code}, msg={msg}")
-          PY
-          then
-            echo "::warning::Feishu 部署成功回执卡 response parser failed"
-          fi
+      - name: 部署成功回执通知 (opt-in, fail-open)
+        if: success() && inputs.notify_on_success == true
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/notify@v2
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: ${{ steps.assemble_success_receipt.outputs.severity }}
+          title: ${{ steps.assemble_success_receipt.outputs.title }}
+          body: ${{ steps.assemble_success_receipt.outputs.body }}
+          links: ${{ steps.assemble_success_receipt.outputs.links }}
 
       # ── 通知层(Phase 1 / Approach A)──────────────────────────────────────────
       # 补上本仓此前完全缺失的 notify:部署失败(build / ACR push / tailscale / SSH / 探针失败+
-      # 自动回滚,任一)→ P0 飞书红卡 + @全员唤醒。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
-      # fail-open 靠三层:if:failure + continue-on-error + 通知失败只打 warning 且仍 exit 0。
-      # 第三层 2026-09-06(#46) 从「吞异常」改成「打 warning」:两者都不改变部署结论,
-      # 区别是前者在界面上完全看不见——发成功和发失败长得一模一样。
+      # 自动回滚,任一)→ P0 通知。此前生产回滚只靠 GitHub 邮件冒泡,是最大缺口。
+      # 2026-11 起发送逻辑收拢到 zlxlabs/gate/.github/actions/notify@v2(按 webhook 主机
+      # 分派企微 markdown / 飞书卡,缺地址打 ::warning notify-skipped,发送失败打 ::error);
+      # 本模板只组装字段。fail-open 靠两层:if:failure + 两个 step 各自 continue-on-error——
+      # 通知链路任何失败都不改变部署结论,但在 run 界面可见(2026-09-06 #46 起不再吞异常:
+      # 吞掉的话发成功和发失败长得一模一样)。
       # 凭据 = 调用方传入的 secrets.FEISHU_CI_WEBHOOK(#46 起不再读 vars,vars 不打码会进日志);
-      # 标题关键词 = vars.FEISHU_CI_TITLE_PREFIX。未配置时默认 [zlxlabs·CI],兼容 Phase 1 仓库。
-      - name: Feishu 部署失败卡 (P0, fail-open)
+      # 标题前缀 = vars.FEISHU_CI_TITLE_PREFIX,未配置时 action 默认 [zlxlabs·CI],兼容 Phase 1 仓库。
+      # 企微 markdown 不支持 @全员,P0 的唤醒强度由 heading 级别词承担。
+      - name: 组装部署失败通知字段
+        id: assemble_deploy_failure
         if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
-          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
@@ -637,22 +606,13 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
-          webhook="${FEISHU_WEBHOOK:-}"
-          if [[ -z "$webhook" ]]; then
-            echo "::warning::Feishu 部署失败卡 not sent: FEISHU_WEBHOOK is not configured"
-            exit 0
-          fi
-          response=""
-          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
           repo    = os.environ["REPO"]
           sha     = os.environ.get("SHA", "") or "?"
           run_url = os.environ["RUN_URL"]
-          # 关键词模式:机器人关键词由标题前缀保证命中,与 repo 路径解耦
-          # (2026-07-08 canary 抓到:非 zlxlabs 仓靠 repo 路径会静默丢卡 code:19024)。<at id=all> 唤醒本群。
           # 三条处置分流必须并列写全:对账失败是第五种失败源,它既不是「已回滚」也不是「未上线」
           # ——deploy 已 rc=0 过了探针门、last_good 标记已推进,新镜像很可能已经在跑。
           # 只写前两种时 on-call 最坏会读成「未上线,不用管」,而生产正跑着未验证的镜像
@@ -668,54 +628,34 @@ jobs:
                   f"· Deploy 与 Reconcile **同时**红 = 对账失败（rc=5），按 Reconcile 那条处置，**不要**按已回滚处置。\n"
                   f"· 更早的步骤(checkout / Tailscale / SSH 准备 / build / ACR push)红:"
                   f"本次未上线,生产仍是上一版本。\n"
-                  f"点按钮看详情。\n"
-                  f"<at id=all></at>")
-          card = {
-              "msg_type": "interactive",
-              "card": {
-                  "config": {"wide_screen_mode": True},
-                  "header": {"template": "red",
-                             "title": {"tag": "plain_text", "content": f"🔴 {title_prefix} P0 部署失败 · {svc}"}},
-                  "elements": [
-                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                      {"tag": "action", "actions": [
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "查看部署 Run"},
-                           "type": "primary", "url": run_url},
-                      ]},
-                  ],
-              },
-          }
-          print(json.dumps(card))
+                  f"详情见下方 Run 链接。")
+          print("severity=P0")
+          print(f"title=部署失败 · {svc}")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "查看部署 Run", "url": run_url}], ensure_ascii=False))
           PY
-          )"; then
-            echo "::warning::Feishu 部署失败卡 request failed or timed out: ${response:-no response}"
-            exit 0
-          fi
-          if ! python3 - "Feishu 部署失败卡" "$response" <<'PY'
-          import json, sys
-          label, raw = sys.argv[1:3]
-          try:
-              result = json.loads(raw)
-              code = result["code"]
-          except (ValueError, KeyError, TypeError) as exc:
-              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
-          else:
-              if str(code) != "0":
-                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
-                  print(f"::warning::{label} business error: code={code}, msg={msg}")
-          PY
-          then
-            echo "::warning::Feishu 部署失败卡 response parser failed"
-          fi
+
+      - name: 部署失败通知 (P0, fail-open)
+        if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy != 'true'
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/notify@v2
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: ${{ steps.assemble_deploy_failure.outputs.severity }}
+          title: ${{ steps.assemble_deploy_failure.outputs.title }}
+          body: ${{ steps.assemble_deploy_failure.outputs.body }}
+          links: ${{ steps.assemble_deploy_failure.outputs.links }}
 
       # rollback_unhealthy=true(rc=4):新版本不健康,且主机未能证明生产停在健康版本。
       # 这是独立的紧急卡,不能与 rc=1 的普通红卡共用「不需要紧急上机」文案。
-      - name: Feishu 回滚健康未证紧急卡 (P0, fail-open)
+      - name: 组装回滚健康未证紧急通知字段
+        id: assemble_rollback_unhealthy
         if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
-          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
@@ -724,15 +664,8 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
-          webhook="${FEISHU_WEBHOOK:-}"
-          if [[ -z "$webhook" ]]; then
-            echo "::warning::Feishu 回滚健康未证紧急卡 not sent: FEISHU_WEBHOOK is not configured"
-            exit 0
-          fi
-          response=""
-          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
           repo    = os.environ["REPO"]
@@ -751,55 +684,35 @@ jobs:
                   f"仓库 {repo} · SHA {sha}\n"
                   f"{rollback_status}\n"
                   f"{next_action}\n"
-                  f"点按钮看详情。\n"
-                  f"<at id=all></at>")
-          card = {
-              "msg_type": "interactive",
-              "card": {
-                  "config": {"wide_screen_mode": True},
-                  "header": {"template": "red",
-                             "title": {"tag": "plain_text", "content": f"🚨 {title_prefix} P0 {title_status} · {svc}"}},
-                  "elements": [
-                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                      {"tag": "action", "actions": [
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "立即上机处置"},
-                           "type": "danger", "url": run_url},
-                      ]},
-                  ],
-              },
-          }
-          print(json.dumps(card))
+                  f"详情见下方 Run 链接。")
+          print("severity=P0")
+          print(f"title={title_status} · {svc}")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "立即上机处置", "url": run_url}], ensure_ascii=False))
           PY
-          )"; then
-            echo "::warning::Feishu 回滚健康未证紧急卡 request failed or timed out: ${response:-no response}"
-            exit 0
-          fi
-          if ! python3 - "Feishu 回滚健康未证紧急卡" "$response" <<'PY'
-          import json, sys
-          label, raw = sys.argv[1:3]
-          try:
-              result = json.loads(raw)
-              code = result["code"]
-          except (ValueError, KeyError, TypeError) as exc:
-              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
-          else:
-              if str(code) != "0":
-                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
-                  print(f"::warning::{label} business error: code={code}, msg={msg}")
-          PY
-          then
-            echo "::warning::Feishu 回滚健康未证紧急卡 response parser failed"
-          fi
+
+      - name: 回滚健康未证紧急通知 (P0, fail-open)
+        if: failure() && steps.deploy.outputs.deferred != 'true' && steps.deploy.outputs.rollback_unhealthy == 'true'
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/notify@v2
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: ${{ steps.assemble_rollback_unhealthy.outputs.severity }}
+          title: ${{ steps.assemble_rollback_unhealthy.outputs.title }}
+          body: ${{ steps.assemble_rollback_unhealthy.outputs.body }}
+          links: ${{ steps.assemble_rollback_unhealthy.outputs.links }}
 
       # deferred(rc=3):busy-lock 门禁(opt-in)超时未等到,服务忙,不是故障。
       # job 仍标红(诚实反映"新 SHA 未上线"),但通知分流成黄卡:不 @全员,
       # 语义是"正常延期,构建已在库,空闲后点按钮 re-run"——与红卡的"真实故障"分开。
-      - name: Feishu 部署延期卡 (deferred, fail-open)
+      - name: 组装部署延期通知字段
+        id: assemble_deploy_deferred
         if: failure() && steps.deploy.outputs.deferred == 'true'
         continue-on-error: true
         env:
-          FEISHU_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
-          FEISHU_TITLE_PREFIX: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
           SVC:     ${{ inputs.image_name }}
           HOST:    ${{ inputs.host }}
           REPO:    ${{ github.repository }}
@@ -807,60 +720,35 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
-          webhook="${FEISHU_WEBHOOK:-}"
-          if [[ -z "$webhook" ]]; then
-            echo "::warning::Feishu 部署延期卡 not sent: FEISHU_WEBHOOK is not configured"
-            exit 0
-          fi
-          response=""
-          if ! response="$(python3 - <<'PY' | curl -fsS --max-time 10 -X POST -H 'Content-Type: application/json' --data-binary @- "$webhook" 2>&1
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
           import json, os
-          title_prefix = os.environ.get("FEISHU_TITLE_PREFIX", "").strip() or "[zlxlabs·CI]"
           svc     = os.environ.get("SVC", "") or "?"
           host    = os.environ.get("HOST", "") or "?"
           repo    = os.environ["REPO"]
           sha     = os.environ.get("SHA", "") or "?"
           run_url = os.environ["RUN_URL"]
-          # 黄卡:不 @全员——这是正常延期,不是故障,不该打扰全群。
+          # 延期是正常排队不是故障:P2 而非 P0,不靠级别词惊动全群。
           body = (f"**服务** `{svc}`  ·  **目标机** `{host}`\n"
                   f"**仓库** `{repo}`  ·  **SHA** `{sha}`\n"
                   f"服务忙(长任务进行中),本次**部署延期,未替换**——旧版本继续运行,生产不受影响。\n"
-                  f"镜像 `{sha}` 已构建并推送 ACR;空闲后点按钮 **重跑部署**即可上线"
+                  f"镜像 `{sha}` 已构建并推送 ACR;空闲后点链接 **重跑部署**即可上线"
                   f"(重跑会从 ACR 拉取并复用已有的 SHA 成品,不再重建)。")
-          card = {
-              "msg_type": "interactive",
-              "card": {
-                  "config": {"wide_screen_mode": True},
-                  "header": {"template": "yellow",
-                             "title": {"tag": "plain_text", "content": f"⏸️ {title_prefix} 部署延期 · {svc}"}},
-                  "elements": [
-                      {"tag": "div", "text": {"tag": "lark_md", "content": body}},
-                      {"tag": "action", "actions": [
-                          {"tag": "button", "text": {"tag": "plain_text", "content": "重跑部署"},
-                           "type": "primary", "url": run_url},
-                      ]},
-                  ],
-              },
-          }
-          print(json.dumps(card))
+          print("severity=P2")
+          print(f"title=部署延期 · {svc}")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "重跑部署", "url": run_url}], ensure_ascii=False))
           PY
-          )"; then
-            echo "::warning::Feishu 部署延期卡 request failed or timed out: ${response:-no response}"
-            exit 0
-          fi
-          if ! python3 - "Feishu 部署延期卡" "$response" <<'PY'
-          import json, sys
-          label, raw = sys.argv[1:3]
-          try:
-              result = json.loads(raw)
-              code = result["code"]
-          except (ValueError, KeyError, TypeError) as exc:
-              print(f"::warning::{label} response parse failed: {exc}; response={raw[:300]!r}")
-          else:
-              if str(code) != "0":
-                  msg = str(result.get("msg", "?"))[:300].replace("\n", " ")
-                  print(f"::warning::{label} business error: code={code}, msg={msg}")
-          PY
-          then
-            echo "::warning::Feishu 部署延期卡 response parser failed"
-          fi
+
+      - name: 部署延期通知 (deferred, fail-open)
+        if: failure() && steps.deploy.outputs.deferred == 'true'
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/notify@v2
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: ${{ steps.assemble_deploy_deferred.outputs.severity }}
+          title: ${{ steps.assemble_deploy_deferred.outputs.title }}
+          body: ${{ steps.assemble_deploy_deferred.outputs.body }}
+          links: ${{ steps.assemble_deploy_deferred.outputs.links }}

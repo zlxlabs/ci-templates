@@ -259,8 +259,8 @@ opt-in 用法，在 caller 的 `with:` 块加两个 input（不加则行为与�
 ```
 
 延期时的表现：GitHub job 仍是**失败态**（标红，诚实反映"新 SHA 未上线"），但通知
-分流成**飞书黄卡**（非红色 P0 卡、不 `@全员`）——因为这是正常的延期，不是故障。
-新镜像已经推到 ACR（不可变 SHA tag），空闲后点黄卡上的按钮手动 **Re-run** 该
+分流成**延期通知（P2，非 P0）**——因为这是正常的延期，不是故障。
+新镜像已经推到 ACR（不可变 SHA tag），空闲后点通知里的 **Re-run** 链接重跑该
 workflow 即可补上线；重跑会从 ACR 拉取并复用已有的 SHA 成品，不再重新构建或重推该 tag。
 
 > ⚠️ **上线顺序**：必须先让服务侧完成持锁实现并挂载好 `.deploy-state` 目录，
@@ -344,8 +344,8 @@ on-call 必须上机看，不能当成「未上线、无需处理」。
 
 `rollback_safety=safe` 时，`rc=4` 与 `rc=130` 的优先级仍按是否替换过容器：已经替换过、又未能自证健康时返回 `4`，
 因为生产状态的坏消息比「被中断」更需要人知道；而尚未替换过容器时收到信号，就老实返回 `130`。
-飞书通知分流为：`rc=3` 发不 `@全员` 的延期黄卡；`rc=4` 发 `@全员` 的紧急卡，明确提示「生产可能不可用，
-必须立即上机」；其余失败发普通 P0 卡，并按失败 step 处置。
+通知分流为：`rc=3` 发 P2 延期通知；`rc=4` 发 P0 紧急通知，明确提示「生产可能不可用，
+必须立即上机」；其余失败发普通 P0 通知，并按失败 step 处置。
 
 ### 回滚前现场取证
 
@@ -456,9 +456,10 @@ running 全景；错误信息同时说明 `last_good_release` **已经**被推�
 连接只对传输层 `rc=255` 做有限重试。`busy_deferred`（rc=3）、`rc=1`/`rc=4` 部署失败和
 传输耗尽不会执行对账。
 
-部署失败通知读取调用方 repo variables:
-- `FEISHU_CI_WEBHOOK`: 目标飞书自定义机器人 webhook。
-- `FEISHU_CI_TITLE_PREFIX`: 机器人关键词标题前缀；未配置时默认 `[zlxlabs·CI]`。
+部署通知经 `zlxlabs/gate` 的共用 action `.github/actions/notify@v2` 发送，按 webhook
+主机名分派企业微信 markdown / 飞书卡。读取调用方配置:
+- `FEISHU_CI_WEBHOOK`（secret）: 通知 webhook 地址（名字沿旧约定，值可为企微或飞书机器人地址）。
+- `FEISHU_CI_TITLE_PREFIX`（repo variable）: 标题前缀；未配置时默认 `[zlxlabs·CI]`。
 
 这两个变量通常由 `zlxlabs/gate-hub` 的 `scripts/onboard-repo.sh` 按 `registry.yaml`
 里的 `notify_category` 写入，避免个人 / fordeal / 合伙人项目的 CI 卡混到同一群。
