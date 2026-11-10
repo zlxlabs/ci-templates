@@ -75,8 +75,8 @@ rename 保证原子性）；`last_good_sha` / `last_good_manifest` 是提交后�
 供人工排查读取，可能滞后于（甚至在极端情况下缺失于）canonical 文件——排查以
 `last_good_release` 为准。失败时按旧 manifest 整组回滚；回滚 compose 后还必须用同预算的
 `probe_release` 证明旧版本在应答，证明通过才返回 `rc=1`。首次发布没有旧版本时拒绝伪回滚，
-直接返回 `rc=4`，不会伪造 last-good。同一 commit 重跑会在新 runner 上重建镜像，Dockerfile 应钉死
-基镜像、锁定依赖，才能保证同 SHA 产物可复现；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受
+直接返回 `rc=4`，不会伪造 last-good。同一 commit 重跑会从 ACR 拉取并复用已有的 SHA 成品，不再重新构建；新 SHA 首次构建仍建议 Dockerfile 钉死
+基镜像、锁定依赖；两次发布之间新增/删除/改名了镜像后，旧版本回滚不受
 支持——脚本会显式拒绝并保持容器现状，返回 `rc=4`，绝不做部分回滚，需要立即人工介入。
 
 ### 随发布下发 compose 与配置文件（`release_files_json`，可选·opt-in）
@@ -229,10 +229,9 @@ opt-in 用法，在 caller 的 `with:` 块加一个 input（不加则行为与�
 ```
 
 开启后：
-- **构建阶段**双推:本地 registry(部署关键路径)+ ACR(异地存档 + 拉取回退)。只有
-  **两处都推失败**才判致命(镜像哪都不在,必须报错);单边失败允许降级继续,并打
-  醒目 `::warning::`——本地失败会退化为"这次纯 ACR",ACR 失败会警示"这次没有异地
-  备份/拉取回退",但不会静默放行。
+- **构建阶段**双推:本地 registry(部署关键路径)+ ACR(异地存档 + 拉取回退)。本地
+  registry 推送失败会打醒目 `::warning::` 并降级为纯 ACR；ACR 推送失败则始终致命，
+  即使本地 registry 已成功也会让部署判红，避免静默丢失异地归档。
 - **部署阶段**拉取时先试本地 registry(默认 2 次快速失败,基础延迟 1 秒,总预算
   ~3 秒——同网段链路真出问题大概率是"整个不可达",给它套 ACR 的 150 秒预算纯属
   浪费),不通就无缝回退到未改动的 ACR 拉取预算(`PULL_RETRIES`,默认 6 次、线性
@@ -262,8 +261,7 @@ opt-in 用法，在 caller 的 `with:` 块加两个 input（不加则行为与�
 延期时的表现：GitHub job 仍是**失败态**（标红，诚实反映"新 SHA 未上线"），但通知
 分流成**飞书黄卡**（非红色 P0 卡、不 `@全员`）——因为这是正常的延期，不是故障。
 新镜像已经推到 ACR（不可变 SHA tag），空闲后点黄卡上的按钮手动 **Re-run** 该
-workflow 即可补上线；re-run 会在新 runner 上完整重建同一 SHA 镜像（产物逐字节相同、
-push 幂等极快），代价是多花几分钟构建时间，不是"跳过 build"。
+workflow 即可补上线；重跑会从 ACR 拉取并复用已有的 SHA 成品，不再重新构建或重推该 tag。
 
 > ⚠️ **上线顺序**：必须先让服务侧完成持锁实现并挂载好 `.deploy-state` 目录，
 > 用现有 D3 流程验证过一次正常部署之后，再给 caller 打开 `busy_lock_file`。
@@ -480,7 +478,7 @@ pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁�
 | 爆炸半径 | 稳定 caller 钉 `@v2`；canary 先吃 `@main`，验证后手动推广 v2 | `examples/*` / [go-live runbook](docs/RUNBOOK-go-live.md) |
 | **A3** | 每主机 **flock** 串行化 + GitHub **concurrency group** `deploy-<host>` | `pull_and_deploy.sh` + `build-deploy.yml` |
 | **A3** | git SHA **不可变 image tag**；记录"上一个 good"；回滚不覆盖并发部署 | `push_to_acr.sh` / `pull_and_deploy.sh` |
-| 上传边界 | 只发布不可变 SHA 镜像；每次 ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒；不重建、不重复部署。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
+| 上传边界 | SHA tag 首次缺失时才构建并推送；重跑先查 ACR，已存在则 pull 复用且不重建、不重推；存在性查询无法确认时直接失败。ACR `docker push` 最多 **5 分钟**（TERM 后 15 秒强杀）、最多 **3 次**、间隔 10 秒。部署机再将已验证的 SHA 本地 retag 为短名 `latest` 供 compose 使用 | `push_to_acr.sh` / `pull_and_deploy.sh` |
 | **A3** | 健康探针真定义（endpoint/超时/重试/期望状态/warmup；判健康需 HTTP code 匹配且 curl rc=0），失败 → **自动回滚**；前向 pull/retag/compose up 失败且有 last_good 时走同一套回滚（日志 `rollback triggered by forward deploy failure`）；回滚本身同样受探针门约束，未通过则升级为 `rc=4`；`rollback_safety` 非 `safe` 时守卫跳过自动回滚 | `pull_and_deploy.sh` `health_probe()` / `rollback_to_prev_good()` |
 | **A3** | 健康探针通过后仍需证明本次 SHA 已实际运行：expected SHA image → `latest` → running container image ID 三段对账（持 host 锁，失败 rc=5） | `pull_and_deploy.sh` 对账函数 + `build-deploy.yml` 薄壳 |
 | **A3** | release lane 探针通过后仍需证明每个 long-running declared image 的 running 容器 image ID 与 `<name>:<sha>` 一致（两段，无 `latest`） | `build-deploy-release.yml` 镜像对账 step |
@@ -536,7 +534,7 @@ python -m pytest -q
 - `test_registry_schema.py` —— 8 个坏 fixture（缺字段/重复 id/port/slug/路径、DSN 明文、heartbeat 明文、坏 enum）全部报错；好 registry 通过。
 - `test_pull_and_deploy.py` —— flock 并发串行化、不可变 SHA tag、探针失败自动回滚、前向 pull/compose 失败且有 last_good 时同样回滚、回滚后探针、`rc=4` 分流、回滚不提升坏 tag、本地 registry 快速路径 + 不可达时回退 ACR（docker/curl mock，无需真实守护进程）。
 - `test_release_deploy.py` —— release lane 多镜像发布与整组回滚、回滚后探针、`rc=4` 分流（docker/curl mock，无需真实守护进程）。
-- `test_push_to_acr.py` —— ACR 推送有界重试、本地 registry 双推的致命/非致命语义（单边失败降级继续、双边失败才致命）。
+- `test_push_to_acr.py` —— ACR SHA tag 只写一次、显式构建参数、存在性探测三态、工具链指纹、本地 registry 双推与 ACR 推送致命语义。
 - `test_workflow_contract.py` —— workflow 只声明 6 个 secret、无 `inherit`、per-host concurrency、`local_registry` input 安全默认值。
 - `test_caller_examples.py` —— `examples/*.yml` 与真实接口对齐:6 secret、`ssh_user`、host 是 Tailscale IP、单镜像 caller 钉 `@v2` 且脚本 ref 同为 v2、canary 钉 `@main`。
 

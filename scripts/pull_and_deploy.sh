@@ -218,7 +218,7 @@ fi
 
 # --- pull with retry + local fallback ----------------------------------------
 # 单发 docker pull 碰上 registry 网络抖动(EOF/reset/timeout)会整场判死;而 SHA tag
-# 不可变,本地已有的同 tag 镜像(回滚残留/预热)与远端逐字节一致 —— registry 单独挂
+# 由发布端首次推送后复用,本地已有的同 tag 镜像(回滚残留/预热)按不可变 SHA 身份识别 —— registry 单独挂
 # 不应该拦下部署(2026-07-09 n305→ACR 间歇抖,imflow 因此 9 连败)。
 #
 # 为什么 PULL_RETRIES 默认是 6(而不是 3):2026-07-28 10:20 CST 从部署目标机 n305
@@ -237,7 +237,7 @@ fi
 # 1+2=3 秒)就足够分辨"能连"与"连不上",连不上就快速切到下面完全未改动的 ACR
 # 预算,不会把总部署时长拖长。拉到的字节 retag 成规范名 ${ACR_IMAGE}:${tag} ——
 # 下游 deploy_tag()/last_good_tag/回滚只认这个名字,不关心字节来自哪个 registry
-# (两个 registry 存的是同一个不可变 SHA tag 的逐字节相同内容)。
+# (两个 registry 接收的是同一 SHA tag 对应的发布镜像)。
 pull_from_local_registry() {
   local tag="$1" attempt=1
   while [ "$attempt" -le "$LOCAL_PULL_RETRIES" ]; do
