@@ -77,6 +77,14 @@ def test_build_deploy_notify_steps_are_exhaustive_and_routed_by_production_risk(
         assert assemble["continue-on-error"] is True
 
 
+def test_rollback_notification_skips_deferred_and_removed_failure_routes():
+    text = WORKFLOW.read_text()
+    assert "steps.deploy.outputs.deferred != 'true'" in text
+    assert "steps.deploy.outputs.rollback_unhealthy == 'true'" in text
+    assert "steps.deploy.outputs.reconcile_failed == 'true'" in text
+    assert "steps.deploy.outputs.rollback_unhealthy != 'true'" not in text
+
+
 def test_reconcile_failure_notification_requests_running_sha_check(tmp_path):
     steps = _steps()
     assemble = _step_by_id(steps, "assemble_reconcile_failed")
@@ -95,7 +103,7 @@ def test_reconcile_failure_notification_requests_running_sha_check(tmp_path):
     assert outputs["severity"] == "P0"
     assert outputs["title"] == "生产镜像身份未证 · contract-service"
     for phrase in (
-        "Reconcile 失败", "生产可能正在跑", "镜像身份未证",
+        "Reconcile 步骤", "生产可能正在跑", "镜像身份未证",
         "立即核对运行中容器镜像 SHA",
     ):
         assert phrase in outputs["body"]

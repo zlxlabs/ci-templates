@@ -1106,12 +1106,6 @@ def test_rc3_after_prior_transport_failure_defers_with_uncertainty_warning():
     assert "deferred=true" in text, "rc=3 must still fall through to deferred"
 
 
-def test_red_card_step_skips_when_deferred():
-    text = WORKFLOW.read_text()
-    assert "deferred != 'true'" in text
-    assert "rollback_unhealthy != 'true'" in text
-
-
 def test_deferred_and_ordinary_failure_do_not_send_notifications():
     raw, _ = _load()
     steps = raw["jobs"]["build-deploy"]["steps"]
