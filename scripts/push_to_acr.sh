@@ -20,7 +20,7 @@ PUSH_MAX_ATTEMPTS="${PUSH_MAX_ATTEMPTS:-3}"
 PUSH_RETRY_DELAY_SECONDS="${PUSH_RETRY_DELAY_SECONDS:-10}"
 
 # opt-in 本地网络 registry 镜像(host:port,如 tailnet MagicDNS 名):部署关键路径。
-# 留空(默认)= 禁用,下面的双推逻辑整体退化成改动前的纯 ACR 单推,行为逐字节不变。
+# 留空(默认)= 禁用本地 registry,只推送 ACR。
 LOCAL_REGISTRY="${LOCAL_REGISTRY:-}"
 BUILDER_NAME="ci-templates-registry-cache"
 
@@ -117,9 +117,53 @@ push_with_retry() {
   done
 }
 
-# Classic docker build keeps the LOCAL_REGISTRY opt-out argv unchanged.
+print_toolchain_fingerprint() {
+  local version_info docker_client=unknown docker_server=unknown buildx_version=unknown storage_driver=unknown
+
+  if version_info="$("$DOCKER_BIN" version --format 'client={{.Client.Version}} server={{.Server.Version}}' 2>/dev/null)" \
+    && [[ "$version_info" == client=*' server='* ]]; then
+    docker_client="${version_info#client=}"
+    docker_server="${docker_client#* server=}"
+    docker_client="${docker_client%% server=*}"
+    [ -n "$docker_client" ] || docker_client=unknown
+    [ -n "$docker_server" ] || docker_server=unknown
+  fi
+  if buildx_version="$("$DOCKER_BIN" buildx version 2>/dev/null)" && [ -n "$buildx_version" ]; then
+    :
+  else
+    buildx_version=unknown
+  fi
+  if storage_driver="$("$DOCKER_BIN" info --format '{{.Driver}}' 2>/dev/null)" && [ -n "$storage_driver" ]; then
+    :
+  else
+    storage_driver=unknown
+  fi
+
+  echo "[push] toolchain: docker_client=${docker_client} docker_server=${docker_server} buildx=${buildx_version} storage_driver=${storage_driver}"
+}
+
+# docker manifest inspect exits non-zero both for an absent tag and for registry
+# failures. Only Docker's explicit not-found response means safe-to-build.
+probe_acr_sha() {
+  local ref="$1" output rc
+  if output="$("$DOCKER_BIN" manifest inspect "$ref" 2>&1)"; then
+    return 0
+  else
+    rc=$?
+  fi
+
+  if [[ "$output" == *"no such manifest: ${ref}"* ]]; then
+    return 1
+  fi
+
+  echo "::error::ACR-SHA-PROBE-FAILED ${ref} (docker manifest inspect rc=${rc})"
+  return 2
+}
+
 build_classic_docker_image() {
   "$DOCKER_BIN" build \
+    --provenance=false \
+    --sbom=false \
     --build-arg "GIT_SHA=${GIT_SHA}" \
     -f "${BUILD_CONTEXT}/${DOCKERFILE}" \
     -t "${ACR_IMAGE}:${GIT_SHA}" \
@@ -140,6 +184,8 @@ build_registry_cached_image() {
 
   if ! "$DOCKER_BIN" buildx build \
     --builder "$BUILDER_NAME" \
+    --provenance=false \
+    --sbom=false \
     --build-arg "GIT_SHA=${GIT_SHA}" \
     -f "${BUILD_CONTEXT}/${DOCKERFILE}" \
     -t "${ACR_IMAGE}:${GIT_SHA}" \
@@ -152,19 +198,27 @@ build_registry_cached_image() {
   fi
 }
 
-echo "[push] building ${ACR_IMAGE}:${GIT_SHA}"
-if [ -n "$LOCAL_REGISTRY" ]; then
-  build_registry_cached_image
+print_toolchain_fingerprint
+sha_ref="${ACR_IMAGE}:${GIT_SHA}"
+sha_exists=0
+if probe_acr_sha "$sha_ref"; then
+  sha_exists=1
+  echo "[push] ACR tag already exists → reuse: ${sha_ref}"
+  "$DOCKER_BIN" pull "$sha_ref"
 else
-  build_classic_docker_image
+  probe_rc=$?
+  if [ "$probe_rc" -ne 1 ]; then
+    exit 1
+  fi
+  echo "[push] building ${sha_ref}"
+  if [ -n "$LOCAL_REGISTRY" ]; then
+    build_registry_cached_image
+  else
+    build_classic_docker_image
+  fi
 fi
 
-# 双推:本地 registry(部署关键路径,opt-in) + ACR(异地存档 + 拉取回退,pull_and_deploy.sh
-# 的 pull_from_local_registry() 失败时会退回它)。LOCAL_REGISTRY 为空(默认)时
-# local_enabled 恒为 0,下面的致命判断退化为"ACR 失败就报错退出"—— 退出码与失败/
-# 成功结论与改动前一致(见下面 fatal 判断处的说明,那里有一处刻意的 stdout 差异)。
-# 整条 opt-out 等价性只系于下面这一个 `[ -n "$LOCAL_REGISTRY" ]` guard:删掉或
-# 重构掉它,本地未开启时的行为保证就没有代码在守着了。
+# 本地 registry 是可选的拉取加速路径；ACR SHA tag 是必须的归档，推送失败始终致命。
 local_enabled=0
 local_ok=0
 if [ -n "$LOCAL_REGISTRY" ]; then
@@ -181,33 +235,15 @@ if [ -n "$LOCAL_REGISTRY" ]; then
   fi
 fi
 
-acr_ok=0
-if push_with_retry "${ACR_IMAGE}:${GIT_SHA}" "$PUSH_MAX_ATTEMPTS"; then
-  acr_ok=1
-elif [ "$local_enabled" -eq 1 ]; then
-  echo "::warning::ACR push failed for ${ACR_IMAGE}:${GIT_SHA} — offsite archive/fallback unavailable for this SHA"
-fi
-
-# 致命条件:ACR 失败,且(本地未启用 或 本地也失败)——覆盖默认路径(本地关闭时
-# ACR 失败必须致命)和 opt-in 路径(两处都失败才致命;单边失败允许降级继续,只是
-# 丢掉对应那份保障,已在上面打过 warning)。
-#
-# 退出码与"失败/成功"这个结论,在默认路径(LOCAL_REGISTRY 为空)下与改动前完全
-# 一致:ACR 失败 → exit 1(与改动前 `set -e` 下 push_with_retry 直接返回 1 让脚本
-# 终止时的退出码相同);ACR 成功 → exit 0。**但 stdout 不是逐字节一致**:改动前
-# ACR 失败时脚本在 push_with_retry 打完自己的 `::error::` 后立即因 `set -e` 终止,
-# 永远不会走到任何"汇总"消息;这里为了让 opt-in 路径也能说清"两处都失败"这个
-# 汇总结论,把判断显式收进了 `if`(因此不再触发 set -e),失败时统一多打一行
-# `::error::push failed ... image not available anywhere`——包括默认路径。这一行
-# stdout 差异是刻意接受的(信息量 > 逐字节形式),不追求恢复原始的隐式 set -e
-# 终止方式。
-fatal=0
-if [ "$acr_ok" -ne 1 ]; then
-  if [ "$local_enabled" -eq 0 ] || [ "$local_ok" -ne 1 ]; then
-    fatal=1
+acr_ok=1
+if [ "$sha_exists" -eq 0 ]; then
+  acr_ok=0
+  if push_with_retry "${ACR_IMAGE}:${GIT_SHA}" "$PUSH_MAX_ATTEMPTS"; then
+    acr_ok=1
   fi
 fi
-if [ "$fatal" -eq 1 ]; then
+
+if [ "$acr_ok" -ne 1 ]; then
   echo "::error::push failed for ${GIT_SHA} to every configured registry — image not available anywhere"
   exit 1
 fi

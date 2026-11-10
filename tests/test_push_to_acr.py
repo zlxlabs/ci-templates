@@ -34,9 +34,24 @@ def _write_fake_docker(tmp_path: Path, body: str) -> Path:
         "set -euo pipefail\n"
         "{ printf 'CALL'; printf ' %q' \"$@\"; printf '\\n'; } >> "
         f"\"{argv_log}\"\n"
-        '''if [ "$1" = version ]; then echo "client=27.3 server=27.3"; exit 0; fi
-if [ "$1" = info ]; then echo overlay2; exit 0; fi
-if [ "$1" = buildx ] && [ "$2" = version ]; then echo "github.com/docker/buildx v0.19.0"; exit 0; fi
+        '''if [ "$1" = version ]; then
+  [ ! -f "'''
+        + str(tmp_path / "toolchain-unavailable")
+        + '''" ] || exit 1
+  echo "client=27.3 server=27.3"; exit 0
+fi
+if [ "$1" = info ]; then
+  [ ! -f "'''
+        + str(tmp_path / "toolchain-unavailable")
+        + '''" ] || exit 1
+  echo overlay2; exit 0
+fi
+if [ "$1" = buildx ] && [ "$2" = version ]; then
+  [ ! -f "'''
+        + str(tmp_path / "toolchain-unavailable")
+        + '''" ] || exit 1
+  echo "github.com/docker/buildx v0.19.0"; exit 0
+fi
 if [ "$1" = manifest ] && [ "$2" = inspect ]; then
   if [ -f "'''
         + str(tmp_path / "manifest-error")
@@ -124,7 +139,7 @@ def test_missing_sha_builds_with_explicit_artifact_shape_then_pushes(tmp_path):
 
 def test_sha_probe_error_fails_without_build_or_pull(tmp_path):
     (tmp_path / "manifest-error").touch()
-    docker = _write_fake_docker(tmp_path, "exit 0\\n")
+    docker = _write_fake_docker(tmp_path, "exit 0\n")
 
     result = subprocess.run(
         ["bash", str(SCRIPT)], env=_env(tmp_path, docker), text=True, capture_output=True,
@@ -158,6 +173,24 @@ def test_toolchain_fingerprint_is_logged_before_build(tmp_path):
         ["build", "--provenance=false", "--sbom=false", "--build-arg", "GIT_SHA=abc123",
          "-f", f"{tmp_path}/Dockerfile", "-t", "registry.example/namespace/service:abc123", str(tmp_path)]
     )
+
+
+def test_toolchain_fingerprint_unknown_is_fail_open(tmp_path):
+    (tmp_path / "toolchain-unavailable").touch()
+    docker = _write_fake_docker(
+        tmp_path,
+        '''if [ "$1" = build ] || [ "$1" = push ]; then exit 0; fi
+''',
+    )
+
+    result = subprocess.run(
+        ["bash", str(SCRIPT)], env=_env(tmp_path, docker, PUSH_MAX_ATTEMPTS="1"),
+        text=True, capture_output=True,
+    )
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "[push] toolchain: docker_client=unknown docker_server=unknown buildx=unknown storage_driver=unknown" in result.stdout
+    assert [call[0] for call in _all_recorded_argv(tmp_path)] == ["version", "buildx", "info", "manifest", "build", "push"]
 
 
 def test_push_retries_a_transient_failure_without_rebuilding(tmp_path):
@@ -259,11 +292,9 @@ def test_push_bounds_cannot_be_relaxed(tmp_path):
     assert "PUSH_TIMEOUT_SECONDS must not exceed 300" in result.stderr
 
 
-# --- local registry dual-push (opt-in; LOCAL_REGISTRY empty = ACR-only, unchanged) ---
-# 本地 registry 是部署关键路径,ACR 是异地存档 + 拉取回退。LOCAL_REGISTRY 未设置时
-# (下面所有既有测试都不设置它)必须逐字节复刻改动前行为——见
-# test_push_retries_a_transient_failure_without_rebuilding 等测试对 calls 的精确
-# 断言,任何意外多出的 docker tag/push 调用都会让那些测试先炸。
+# --- local registry dual-push (opt-in; LOCAL_REGISTRY empty = ACR-only) ---
+# 本地 registry 是部署关键路径,ACR 是异地存档 + 拉取回退。下面的既有测试不设置
+# LOCAL_REGISTRY,验证默认情况下不会出现本地 tag/push 调用。
 
 def test_local_registry_pushes_both_targets_when_set(tmp_path):
     """LOCAL_REGISTRY 设置后:build 一次,retag 到本地路径,先推本地再推 ACR,两处都要推。"""
@@ -472,6 +503,8 @@ if [ "$1" = build ]; then exit 17; fi
     assert recorded[1][:2] == ["buildx", "build"]
     assert recorded[-1] == [
         "build",
+        "--provenance=false",
+        "--sbom=false",
         "--build-arg",
         "GIT_SHA=abc123",
         "-f",
@@ -622,9 +655,8 @@ if [ "$1" = push ]; then exit 0; fi
 
 
 def test_default_path_success_stdout_is_exact_no_extra_lines(tmp_path):
-    """默认路径(LOCAL_REGISTRY 未设置)成功时,stdout 的收尾行必须还是改动前那句
-    `[push] done: ...`,不能多出任何汇总行——把"stdout 差异只发生在失败路径,成功
-    路径逐字节不变"这个结论从注释口头保证升级成测试断言(OCR round-3 finding #4/#9)。"""
+    """默认路径成功时保留既定收尾 summary,不额外打印本地 registry 汇总行；工具链指纹
+    是单独的诊断输出,此处只锁定结尾行(OCR round-3 finding #4/#9)。"""
     docker = _write_fake_docker(
         tmp_path,
         '''if [ "$1" = build ]; then exit 0; fi
