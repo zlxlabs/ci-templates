@@ -550,4 +550,4 @@ python -m pytest -q
 
 ## 版本与爆炸半径
 
-稳定调用方的 `build-deploy.yml` 使用 `@v2`，并传 `ci_templates_ref: v2`；唯一 canary（url-parse-api）使用 `@main`，并传 `ci_templates_ref: main`。`@v2` 是会动的 tag：合并到 `main` 后先由 canary 实际部署验证，确认通过后再手动移动 `v2` 推广。完整推广节奏、回滚与历史记录以[部署 go-live runbook](docs/RUNBOOK-go-live.md)为唯一依据；不要逐仓改 caller 来推广版本。
+稳定调用方的 `build-deploy.yml` 使用 `@v2`，并传 `ci_templates_ref: v2`；唯一 canary（url-parse-api）使用 `@main`，并传 `ci_templates_ref: main`。模板默认值随 workflow 版本对齐（#82）：`ci_templates_ref` 的默认值等于 workflow 所在 major（现为 `v2`），caller 漏传参数不再静默拿到旧版部署脚本；现有 caller 全部显式传参，默认值只兜新 caller。`@v2` 是会动的 tag：合并到 `main` 后先由 canary 实际部署验证，确认通过后再手动移动 `v2` 推广。完整推广节奏、回滚与历史记录以[部署 go-live runbook](docs/RUNBOOK-go-live.md)为唯一依据；不要逐仓改 caller 来推广版本。

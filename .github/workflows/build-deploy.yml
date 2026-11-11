@@ -96,9 +96,13 @@ on:
         default: ""
         type: string
       ci_templates_ref:
+        # #82: 默认值必须跟随 workflow 自己的 major——caller 用 @v2 引用本 workflow
+        # 却漏传本参数时,曾静默 checkout 出 v1 的部署脚本,两边版本错配且不报错。
+        # 全舰队 caller(13×@v2、1×canary@main)都显式传参,默认值只对未来新 caller
+        # 生效;fork 出新 major 时同步改这里(测试锁死:tests/test_ci_templates_ref_default.py)。
         description: "Ref of ci-templates to fetch the deploy scripts from"
         required: false
-        default: "v1"
+        default: "v2"
         type: string
       runner:
         # self | hosted — same two values and meaning as zlxlabs/gate's gate-v2.yml
