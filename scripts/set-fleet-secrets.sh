@@ -25,6 +25,23 @@ if [ -z "${INFISICAL_TOKEN:-}" ] && {
   exit 1
 fi
 
+if [ -z "${INFISICAL_TOKEN:-}" ]; then
+  token="$(infisical login --method=universal-auth \
+    --client-id="$INFISICAL_UNIVERSAL_AUTH_CLIENT_ID" \
+    --client-secret="$INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET" \
+    --silent --plain 2>/dev/null)" || {
+    echo "✗ infisical login 失败，无法取 ACR_USERNAME / ACR_PASSWORD；$NEED_LOGIN" >&2
+    exit 1
+  }
+  if [ -z "$token" ]; then
+    echo "✗ infisical login 未返回 token，无法取 ACR_USERNAME / ACR_PASSWORD；$NEED_LOGIN" >&2
+    exit 1
+  fi
+  INFISICAL_TOKEN="$token"
+  export INFISICAL_TOKEN
+  unset token
+fi
+
 export_json="$(infisical export \
   --projectId "$INFISICAL_PROJECT_ID" --env dev --path /ci-templates \
   --format json --silent 2>/dev/null)" || {
@@ -40,16 +57,20 @@ try:
 except json.JSONDecodeError:
     sys.stderr.write("✗ infisical export 不是 JSON，缺 ACR_USERNAME / ACR_PASSWORD" + msg)
     sys.exit(1)
-if not isinstance(data, dict):
-    sys.stderr.write("✗ infisical export 不是 JSON 对象，缺 ACR_USERNAME / ACR_PASSWORD" + msg)
+if not isinstance(data, list):
+    sys.stderr.write("✗ infisical export 不是 JSON 数组，缺 ACR_USERNAME / ACR_PASSWORD" + msg)
     sys.exit(1)
+by_key = {}
+for item in data:
+    if isinstance(item, dict) and isinstance(item.get("key"), str):
+        by_key[item["key"]] = item.get("value")
 missing = [k for k in ("ACR_USERNAME", "ACR_PASSWORD")
-           if not isinstance(data.get(k), str) or not data[k]]
+           if not isinstance(by_key.get(k), str) or not by_key[k]]
 if missing:
     sys.stderr.write("✗ infisical 缺 " + " / ".join(missing) + msg)
     sys.exit(1)
-sys.stdout.write("ACR_USERNAME=" + shlex.quote(data["ACR_USERNAME"]) + "\n")
-sys.stdout.write("ACR_PASSWORD=" + shlex.quote(data["ACR_PASSWORD"]) + "\n")
+sys.stdout.write("ACR_USERNAME=" + shlex.quote(by_key["ACR_USERNAME"]) + "\n")
+sys.stdout.write("ACR_PASSWORD=" + shlex.quote(by_key["ACR_PASSWORD"]) + "\n")
 ')"
 eval "$_acr_assign"
 unset _acr_assign export_json

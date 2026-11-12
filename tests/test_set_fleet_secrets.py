@@ -22,12 +22,29 @@ SSH_KEY = (
     "-----BEGIN OPENSSH PRIVATE KEY-----\n"
     "FAKE_SSH_KEY_s3ntinel\n-----END OPENSSH PRIVATE KEY-----\n"
 )
+UA_ID = "fake-ua-client-id-s3ntinel"
+UA_SECRET = "fake-ua-client-secret-s3ntinel"
+UA_TOKEN = "fake-ua-login-token-s3ntinel"
 ENV_SENTS = (ENV_USER, ENV_PASS, ENV_PAT, ENV_TS)
-VALUE_SENTS = ENV_SENTS + (ACR_USER, ACR_PASS, KNOWN, "FAKE_SSH_KEY_s3ntinel")
+VALUE_SENTS = ENV_SENTS + (ACR_USER, ACR_PASS, KNOWN, "FAKE_SSH_KEY_s3ntinel", UA_TOKEN)
 INFISICAL_FLAGS = (
     "--projectId", "b0467d60-36b6-49a2-858c-c2bb82cc633e",
     "--env", "dev", "--path", "/ci-templates", "--format", "json",
 )
+
+
+def _secret_item(key: str, value: str) -> dict:
+    return {
+        "_id": f"id-{key}",
+        "key": key,
+        "value": value,
+        "type": "shared",
+        "secretPath": "/ci-templates",
+    }
+
+
+def _export_list(*pairs: tuple[str, str]) -> list[dict]:
+    return [_secret_item(k, v) for k, v in pairs]
 
 
 def _exec(path: Path, body: str) -> None:
@@ -49,16 +66,20 @@ def sentinel_dotenv():
         path.write_bytes(previous) if existed else path.unlink(missing_ok=True)
 
 
-def _invoke(tmp_path: Path, payload: dict, extra: dict[str, str] | None = None):
+def _invoke(tmp_path: Path, payload, extra: dict[str, str] | None = None):
     bindir, cap = tmp_path / "bin", tmp_path / "capture"
     bindir.mkdir()
     cap.mkdir()
-    log = cap / "infisical-argv.json"
     body = json.dumps(payload, separators=(",", ":"))
     _exec(bindir / "infisical", (
         "#!/bin/bash\nset -euo pipefail\n"
-        "python3 -c 'import json,sys; json.dump(sys.argv[2:], open(sys.argv[1],\"w\"))' "
-        f"{shlex.quote(str(log))} \"$@\"\nprintf '%s' {shlex.quote(body)}\n"
+        f"cap={shlex.quote(str(cap))}\n"
+        'n=$(($(cat "$cap/inf-n" 2>/dev/null || echo 0)+1)); echo "$n" > "$cap/inf-n"\n'
+        'python3 -c \'import json,sys; json.dump(sys.argv[2:], open(sys.argv[1],"w"))\' '
+        '"$cap/inf-argv-$n.json" "$@"\n'
+        'if [ "${1:-}" = login ]; then printf "%s" '
+        f"{shlex.quote(UA_TOKEN)}; exit 0; fi\n"
+        f"printf '%s' {shlex.quote(body)}\n"
     ))
     _exec(bindir / "gh", (
         "#!/bin/bash\nset -euo pipefail\n"
@@ -80,13 +101,18 @@ def _invoke(tmp_path: Path, payload: dict, extra: dict[str, str] | None = None):
             "DEPLOY_HOST_IP": "192.0.2.1", "LC_ALL": "C", **(extra or {}),
         }, check=False,
     )
-    nfile = cap / "n"
     calls = []
+    nfile = cap / "n"
     if nfile.exists():
         for i in range(1, int(nfile.read_text().strip()) + 1):
             argv = json.loads((cap / f"argv-{i}.json").read_text())
             calls.append((argv, (cap / f"stdin-{i}.bin").read_bytes()))
-    return result, calls, cap
+    inf_calls = []
+    inf_n = cap / "inf-n"
+    if inf_n.exists():
+        for i in range(1, int(inf_n.read_text().strip()) + 1):
+            inf_calls.append(json.loads((cap / f"inf-argv-{i}.json").read_text()))
+    return result, calls, inf_calls
 
 
 def _no_values(*texts: str) -> None:
@@ -95,16 +121,7 @@ def _no_values(*texts: str) -> None:
         assert sentinel not in blob
 
 
-def test_stdin_not_argv_and_dotenv_ignored(tmp_path, sentinel_dotenv):
-    result, calls, cap = _invoke(
-        tmp_path, {"ACR_USERNAME": ACR_USER, "ACR_PASSWORD": ACR_PASS},
-        {"INFISICAL_TOKEN": "fake-infisical-token-s3ntinel"},
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
-    inf_argv = json.loads((cap / "infisical-argv.json").read_text())
-    for flag in INFISICAL_FLAGS:
-        assert flag in inf_argv
-    assert ACR_PASS not in inf_argv and ACR_USER not in inf_argv
+def _assert_secrets_via_stdin(calls):
     sets = {argv[2]: (argv, stdin) for argv, stdin in calls
             if len(argv) >= 3 and argv[:2] == ["secret", "set"]}
     expected = {
@@ -125,19 +142,38 @@ def test_stdin_not_argv_and_dotenv_ignored(tmp_path, sentinel_dotenv):
             assert sentinel not in " ".join(argv)
 
 
+def test_stdin_not_argv_and_dotenv_ignored(tmp_path, sentinel_dotenv):
+    result, calls, inf_calls = _invoke(
+        tmp_path,
+        _export_list(("ACR_USERNAME", ACR_USER), ("ACR_PASSWORD", ACR_PASS)),
+        {"INFISICAL_TOKEN": "fake-infisical-token-s3ntinel"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(inf_calls) == 1
+    inf_argv = inf_calls[0]
+    assert inf_argv[0] == "export"
+    for flag in INFISICAL_FLAGS:
+        assert flag in inf_argv
+    assert ACR_PASS not in inf_argv and ACR_USER not in inf_argv
+    _assert_secrets_via_stdin(calls)
+
+
 def test_missing_infisical_auth_fails_without_values(tmp_path, sentinel_dotenv):
-    result, calls, _ = _invoke(
-        tmp_path, {"ACR_USERNAME": ACR_USER, "ACR_PASSWORD": ACR_PASS},
+    result, calls, inf_calls = _invoke(
+        tmp_path,
+        _export_list(("ACR_USERNAME", ACR_USER), ("ACR_PASSWORD", ACR_PASS)),
     )
     assert result.returncode != 0
     assert "ACR_USERNAME" in result.stderr and "INFISICAL_TOKEN" in result.stderr
     _no_values(result.stderr, result.stdout)
     assert calls == []
+    assert inf_calls == []
 
 
 def test_missing_acr_key_fails_without_values(tmp_path, sentinel_dotenv):
     result, calls, _ = _invoke(
-        tmp_path, {"ACR_USERNAME": ACR_USER},
+        tmp_path,
+        _export_list(("ACR_USERNAME", ACR_USER)),
         {"INFISICAL_TOKEN": "fake-infisical-token-s3ntinel"},
     )
     assert result.returncode != 0
@@ -145,3 +181,48 @@ def test_missing_acr_key_fails_without_values(tmp_path, sentinel_dotenv):
     for sentinel in (ACR_USER, ACR_PASS, ENV_USER, ENV_PASS):
         assert sentinel not in result.stderr and sentinel not in result.stdout
     assert calls == []
+
+
+def test_dict_export_shape_is_rejected(tmp_path, sentinel_dotenv):
+    result, calls, _ = _invoke(
+        tmp_path,
+        {"ACR_USERNAME": ACR_USER, "ACR_PASSWORD": ACR_PASS},
+        {"INFISICAL_TOKEN": "fake-infisical-token-s3ntinel"},
+    )
+    assert result.returncode != 0
+    assert "JSON 数组" in result.stderr
+    _no_values(result.stderr, result.stdout)
+    assert calls == []
+
+
+def test_universal_auth_logs_in_then_exports(tmp_path, sentinel_dotenv):
+    result, calls, inf_calls = _invoke(
+        tmp_path,
+        _export_list(("ACR_USERNAME", ACR_USER), ("ACR_PASSWORD", ACR_PASS)),
+        {
+            "INFISICAL_UNIVERSAL_AUTH_CLIENT_ID": UA_ID,
+            "INFISICAL_UNIVERSAL_AUTH_CLIENT_SECRET": UA_SECRET,
+        },
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert len(inf_calls) == 2
+    login_argv, export_argv = inf_calls
+    assert login_argv[0] == "login"
+    assert "--method=universal-auth" in login_argv
+    assert f"--client-id={UA_ID}" in login_argv
+    assert f"--client-secret={UA_SECRET}" in login_argv
+    assert ACR_PASS not in login_argv and UA_TOKEN not in login_argv
+    assert export_argv[0] == "export"
+    for flag in INFISICAL_FLAGS:
+        assert flag in export_argv
+    assert "--token" not in export_argv
+    assert UA_TOKEN not in export_argv
+    assert UA_SECRET not in export_argv
+    _assert_secrets_via_stdin(calls)
+    for argv, stdin in calls:
+        assert UA_SECRET.encode() not in stdin
+        assert UA_TOKEN.encode() not in stdin
+        assert UA_SECRET not in " ".join(argv)
+        assert UA_TOKEN not in " ".join(argv)
+    assert UA_SECRET not in result.stderr and UA_TOKEN not in result.stderr
+    assert UA_SECRET not in result.stdout and UA_TOKEN not in result.stdout
