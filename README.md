@@ -540,8 +540,12 @@ python -m pytest -q
 
 `workflow_call` 本体 + 真机 SSH 部署属**集成**，本地无法纯单测。推荐流程：
 
-1. 配 6 个 secrets（个人账号无 org secrets，每 repo `gh secret set --repo` 配）：
-   `ACR_USERNAME` / `ACR_PASSWORD` / `SSH_DEPLOY_KEY` / `KNOWN_HOSTS` / `TS_AUTHKEY` / `CI_TEMPLATES_PAT`。
+1. 配 secrets（个人账号无 org secrets，每 repo 配一遍）：
+   `DEPLOY_HOST_IP='<tailscale-ip>' scripts/set-fleet-secrets.sh <owner/repo>`。
+   `ACR_USERNAME` / `ACR_PASSWORD` 从 Infisical 项目 `shared-infra`（env `dev`，路径 `/ci-templates`）读取，不读本仓 `.env`。
+   `SSH_DEPLOY_KEY` 来自本机私钥，`KNOWN_HOSTS` 由 `ssh-keyscan` 现扫。
+   `CI_TEMPLATES_PAT` 模板已不消费，默认不写（caller 仍可传空占位；需要占位值时设环境变量 `CI_TEMPLATES_PAT`）。
+   `TS_AUTHKEY` 只在 `runner: hosted` 时消费；默认 self 模式不写，hosted 应急设环境变量 `TS_AUTHKEY`。
 2. 建一个低风险 canary 服务仓，用 `examples/canary-workflow.yml`（钉 `@main`）。
 3. push → 观察 build→ACR→SSH 部署→探针→（人为让探针失败）→自动回滚。
 4. 合并到 `main` 后先让 canary 实际部署验证；全绿后按 [go-live runbook](docs/RUNBOOK-go-live.md) 手动推广 v2。CI 全绿本身不等于推广完成。
