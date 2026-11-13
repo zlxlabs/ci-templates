@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# gate-v2 quality entry (Detect repository quality entry, gate-v2.yml:613-625).
+# The reusable workflow does not install caller deps; the entry owns every
+# project dependency (quality_prepare_mise comment, gate-v2.yml:100-106).
+# This repo has no pyproject.toml / uv.lock; use the same `uv run --with`
+# launcher as gate-v2.yml's python Tests step (gate-v2.yml:1004-1005).
+cd "$(dirname "$0")/.."
+uv run --with pytest,pyyaml,jsonschema python scripts/validate_registry.py registry.yaml
+uv run --with pytest,pyyaml,jsonschema python -m pytest -q
