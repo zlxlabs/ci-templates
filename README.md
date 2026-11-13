@@ -463,10 +463,10 @@ running 全景；错误信息同时说明 `last_good_release` **已经**被推�
 
 ## 门禁（pre-merge）在哪
 
-pre-merge 门禁的 reusable workflow（gate.yml）曾于 2026-07-09 短暂迁入本仓，同日再迁至
-**[`zlxlabs/gate`](https://github.com/zlxlabs/gate)**（org 公开仓）：org runner group 的
-`restricted_to_workflows` 白名单只接受 **org 内仓库**的 workflow（实测个人账号公开仓
-不行），这道硬闸必须配上。本仓回归只管部署 lane（build-deploy）。
+本仓 PR 的 pre-merge 门禁是 `.github/workflows/gate.yml` 调用
+**[`zlxlabs/gate`](https://github.com/zlxlabs/gate)** 的 gate v2（模型主审 +
+`scripts/gate-quality`）；reusable workflow 本体仍在 gate 仓（org runner group 的
+`restricted_to_workflows` 白名单只接受 **org 内仓库**的 workflow）。`ci.yml` 仍跑 pytest。
 
 ## 锁死的核心契约（来自 plan-eng-review）
 
