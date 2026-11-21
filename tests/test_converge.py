@@ -93,7 +93,11 @@ def _base_env(tmp_path: Path, *, webhook: str = FEISHU_WEBHOOK) -> dict:
         D3_INTENT_WEBHOOK=webhook,
         D3_NOTIFY_ON_SUCCESS="false",
         DEFERRED_INTENT_SH=str(DEFERRED_INTENT_SH),
+        D3_DEPLOY_SCRIPT=str(tmp_path / "seed-deploy.sh"),
     )
+    seed = Path(env["D3_DEPLOY_SCRIPT"])
+    seed.write_text("#!/bin/bash\nexit 0\n")
+    seed.chmod(0o700)
     env["_CURL_ARGV"] = str(curl_log)
     return env
 
@@ -112,7 +116,10 @@ def _events_path(env: dict) -> Path:
 
 
 def _script_ref(env: dict) -> str:
-    return f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.sh"
+    return (
+        f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}"
+        f".r{env['D3_RUN_NUMBER']}a{env['D3_RUN_ATTEMPT']}.sh"
+    )
 
 
 def write_intent(env: dict) -> None:
@@ -350,6 +357,11 @@ def test_superseded_during_execute_keeps_new_pending_and_next_round_runs_it(tmp_
     newer["D3_RUN_NUMBER"] = "200"
     newer["D3_RUN_ATTEMPT"] = "1"
     newer["GIT_SHA"] = "def5678"
+    # Copy the already-installed fake replay script onto itself so accepted
+    # install does not replace converge's fake with the seed stub.
+    newer["D3_DEPLOY_SCRIPT"] = str(
+        _home(env) / ".d3-converge" / "scripts" / _script_ref(env)
+    )
     helper = tmp_path / "write_newer.sh"
     export_lines = []
     for key in (
@@ -378,6 +390,7 @@ def test_superseded_during_execute_keeps_new_pending_and_next_round_runs_it(tmp_
         "D3_INTENT_WEBHOOK",
         "D3_NOTIFY_ON_SUCCESS",
         "DEFERRED_INTENT_SH",
+        "D3_DEPLOY_SCRIPT",
         "PATH",
     ):
         export_lines.append(f"export {key}={json.dumps(newer[key])}")
@@ -542,8 +555,9 @@ def test_missing_script_marks_failed_sends_p1(tmp_path):
     """(j) 脚本文件缺失 → failed 并发 P1。"""
     env = _base_env(tmp_path)
     write_intent(env)
-    scripts = _home(env) / ".d3-converge" / "scripts"
-    scripts.mkdir(parents=True, exist_ok=True)
+    installed = _home(env) / ".d3-converge" / "scripts" / _script_ref(env)
+    assert installed.is_file()
+    installed.unlink()
 
     res = _run_converge(env)
     assert res.returncode == 0, res.stdout + res.stderr

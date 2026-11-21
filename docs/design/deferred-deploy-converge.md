@@ -91,11 +91,12 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 **原则：收敛器零部署逻辑。** 它不重实现探针、回滚、对账、忙锁循环中的任何一个；它只做「按意图快照的 env，重放同一次部署所用的同一个脚本字节」。
 
-- **脚本固化**：`build-deploy.yml` 在 `intent_file` opt-in 时，把本次 run 实际执行的那个部署脚本（`safe` 时是仓内 `pull_and_deploy.sh` 原件；`unsafe`/`conditional` 时是 awk 注入守卫后生成的脚本，[实测] 该生成发生在 workflow 侧 deploy step 内）以 `scp` 安装到 `${HOME}/.d3-converge/scripts/<script_ref>`（`script_ref` = `pull_and_deploy.<sanitized-deploy-dir>.sh`，per caller 隔离，两个 caller 的 rollback_safety 不同互不影响）。意图记录 `script_ref` 字段指向它。**执行契约由此字节级一致**：守卫、探针预算、回滚语义、对账、回执写入（`last_deploy_result.json`）全部是同一段代码。每次部署 run（无论成败）都刷新安装（哈希相同则跳过写），收敛器与模板的版本漂移窗口收敛到一个 run 内部。
+- **脚本固化**：`script_ref` 命名只在写侧定义，`script_ref` = `pull_and_deploy.<stem>.r<run_number>a<run_attempt>.sh`（`stem` 来自 `sanitize_deploy_dir`；每个意图一对一绑定自己的脚本文件，从不覆盖其他意图正在引用的字节）。`write_deferred_intent` 在持有 `intents.lock`、写入 accepted 意图的同一个临界区里，把**当前正在执行的脚本本身**（调用方传入的 `D3_DEPLOY_SCRIPT`，即本次 run 实际执行的那份字节：`safe` 时是仓内原件；`unsafe`/`conditional` 时是 workflow awk 注入守卫后 scp 上来的那份）原子安装到 `${HOME}/.d3-converge/scripts/<script_ref>`（0700，tmp + mv）。顺序：先装本意图的脚本，再追加事件，最后替换意图；任一步失败：删掉刚装的这个文件、打 write-failed、旧意图和旧脚本都不动。superseded 时不装。替换成功后仍在锁内删除被顶掉的旧意图 `script_ref`（只删 `scripts/` 下校验过格式的那个文件名）。workflow 不再实现 sanitize，也不再单独 scp 固化脚本。**执行契约由此字节级一致**：守卫、探针预算、回滚语义、对账、回执写入全部是同一段代码。
 - **否决：脚本快照写进 STATE_DIR/意图文件同目录**——即第 1 节否决过的容器可写位置，不赘述。
 - **否决：收敛器运行时从 GitHub 拉脚本**——主机无 GitHub 凭据（CI_TEMPLATES_PAT 已废，runbook 明载），离线不可用，且把「部署脚本内容」这一执行契约绑到收敛时刻的网络与权限状态上。
-- **否决：意图记录存脚本内容或哈希供收敛器校验**——校验基准与被校验对象在同一可写位置时校验无意义；脚本由部署 run 直接安装到收敛器目录，安装通道本身即信任锚（与今天 scp 部署脚本到 /tmp 同一信任模型，收敛器目录只是 /tmp 换成了持久且容器不可见的路径）。
-- **收尾清理差异**：在线部署 ssh 命令里 `rm -f` 临时脚本；收敛器目录的脚本持久保留（下个意图可能仍引用同一字节），清理随模板 major 升级的 RUNBOOK 步骤走。
+- **否决：意图记录存脚本内容或哈希供收敛器校验**——校验基准与被校验对象在同一可写位置时校验无意义；脚本由写侧在 `intents.lock` 内安装到收敛器目录，安装通道本身即信任锚（与今天 scp 部署脚本到 /tmp 同一信任模型：workflow 把本次字节交到主机，写侧再从正在执行的那份拷到持久且容器不可见的路径）。
+- **否决：workflow 再实现一遍 sanitize 并 scp 固化脚本**——命名规则只应有一份（写侧）；workflow 重复实现会与 rollback_safety 守卫变体、并发 run 文件名漂移。
+- **收尾清理差异**：在线部署 ssh 命令里 `rm -rf` 本 run 的远端唯一目录；被顶掉的意图所引用的脚本在写侧锁内删除，当前 pending 意图的脚本保留到下一次替换。
 - 回执复用：`do_deploy()` 成功/失败路径写的 `last_deploy_result.json`（`write_deploy_result`）与 `DEPLOY_EVENT_LOG` 钩子在收敛器重放时照常工作——**已上线的详细回执格式零新增**。deferred 时写意图失败是唯一新增的 fail-loud 分支：意图目录不可写/磁盘满时打 `[deploy][evidence] intent: write-failed` 到 stdout 并照常 `exit 3`（deferred 语义不变，workflow 侧凭标记把黄卡升级为 P1 卡）。
 - 配置校验新增一条：`INTENT_FILE` 机制启用但 `BUSY_LOCK_FILE` 为空 → `exit 1` fail fast（没有忙锁就没有 deferred，意图永不触发，纯误导配置）。
 
@@ -132,11 +133,12 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 ### workflow 侧结论语义（DEFERRED 不判绿）
 
 - job 结论保持 **failure**（`exit 3`，现状不动）——诚实反映「新 SHA 未上线」，README 既有表述不变。
-- 新增解析远端 stdout 的 `intent:` 标记 → `intent_status` output（accepted / superseded / write-failed），与 `capture_deploy_result` 同款解析模式。
-- 黄卡（新增 step，复用 `zlxlabs/gate/.github/actions/notify@v2`，severity=`P2`，`FEISHU_CI_WEBHOOK` secret，`if: failure() && outputs.deferred == 'true'`）：
-  - accepted：「部署延期（服务忙，录制中）。部署意图已持久化到主机，录制结束后将**自动上线**，无需手动 re-run。结果查询：主机 `~/.d3-converge/intents/...` 或 `events.jsonl`。」
-  - superseded：「部署延期。已有更新的部署意图（run #N）排队，本次（run #M）不会上线（被覆盖），re-run 本 run 无效。」
-  - write-failed：升级 **P1**：「部署延期且意图持久化失败——自动收敛不会发生，需人工空闲后 re-run 或上机。」（意图写失败若只打 warning，事件流静默退回「没人管」现状，违背失败可见性。）
+- 新增解析远端 stdout 的 `intent:` / `converge:` 标记 → `intent_status` / `converge_status` output，与 `capture_deploy_result` 同款解析模式。开启路径在部署脚本结束后跑 `systemctl is-active --quiet d3-converge.timer`（不需要 root）并打印 `converge: active|inactive`。
+- 黄卡（新增 step，复用 `zlxlabs/gate/.github/actions/notify@v2`，`FEISHU_CI_WEBHOOK` secret，`if: failure() && outputs.deferred == 'true' && inputs.deferred_deploy == true`）：
+  - accepted 且 converge active：`P2`「部署延期（服务忙，录制中）。部署意图已持久化到主机，录制结束后将**自动上线**，无需手动 re-run。结果查询：主机 `~/.d3-converge/intents/...` 或 `events.jsonl`。」
+  - accepted 且 converge 不是 active（inactive 或标记缺失）：升级 **P1**「收敛器 timer 未启用，意图不会自动重放；按 scripts/converge/README.md 用 root 执行一次 enable。」
+  - superseded：`P2`「部署延期。已有更新的部署意图排队，本次不会上线（被覆盖），re-run 本 run 无效。」
+  - write-failed 或 intent 标记缺失：升级 **P1**「部署延期且意图持久化失败——自动收敛不会发生，需人工空闲后 re-run 或上机。」（意图写失败若只打 warning，事件流静默退回「没人管」现状，违背失败可见性。）
 
 ### 收敛器侧通知（复用既有通道：同一 webhook、同一卡面语义）
 
