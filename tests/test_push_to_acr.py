@@ -270,6 +270,58 @@ if [ "$1" = push ]; then trap '' TERM; sleep 10; fi
     assert "timed out after 1s" in result.stdout
 
 
+def test_push_timeout_reaps_grandchildren_the_client_left_behind(tmp_path):
+    """超时后整棵 docker 进程树都必须不再存活。这个场景比 sigterm 用例更苛刻：
+    直接客户端不陷阱 TERM（一击即死），但它留下一个 trap 掉 TERM 的孙进程握住
+    stdout 管道。GNU timeout 在这里同样泄漏（直接子进程一死它就收工，永远轮不
+    到对整组补 KILL），uutils 连组 TERM 都不可靠——所以这条不变式只能由脚本自
+    己持有：超时后先对整组 TERM，kill-after 内对整组补 KILL，客户端死后也要
+    扫尾。孙进程的死活判定看 /proc/<pid> 消失或 stat 变 Z（SIGKILL 已送达后
+    的收割是容器 init 的职责，不算泄漏）。红验基准：base（GNU 9.4）下孙进程
+    存活约 30s 拽住管道，elapsed 断言必炸。"""
+    pidfile = tmp_path / "grandchild.pid"
+    docker = _write_fake_docker(
+        tmp_path,
+        'if [ "$1" = build ]; then exit 0; fi\n'
+        'if [ "$1" = push ]; then\n'
+        "  bash -c 'trap \"\" TERM; echo $$ > " + shlex.quote(str(pidfile)) + "; exec sleep 30' &\n"
+        "  wait $!\n"
+        "fi\n",
+    )
+
+    started = time.monotonic()
+    result = subprocess.run(
+        ["bash", str(SCRIPT)],
+        env=_env(
+            tmp_path, docker, PUSH_TIMEOUT_SECONDS="1", PUSH_TIMEOUT_KILL_AFTER_SECONDS="1",
+            PUSH_MAX_ATTEMPTS="1",
+        ),
+        text=True, capture_output=True,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.returncode != 0
+    assert elapsed < 4, f"push attempt took {elapsed:.1f}s — a grandchild is holding the log pipe"
+    assert "timed out after 1s" in result.stdout
+
+    assert pidfile.exists(), "fake docker must record its grandchild pid"
+    grandchild = int(pidfile.read_text().strip())
+    stat = Path(f"/proc/{grandchild}/stat")
+    deadline = time.monotonic() + 3
+    state = None
+    while time.monotonic() < deadline:
+        if not stat.exists():
+            state = "gone"
+            break
+        # stat 形如 "pid (comm) state ..."：comm 可能带空格/括号，按最后一个
+        # 右括号切，切出来的第一个字段才是 state。
+        state = stat.read_text().rsplit(")", 1)[-1].split()[0]
+        if state == "Z":
+            break
+        time.sleep(0.15)
+    assert state in {"gone", "Z"}, f"grandchild pid {grandchild} still alive (state={state}) after timeout"
+
+
 def test_push_bounds_cannot_be_relaxed(tmp_path):
     docker = _write_fake_docker(tmp_path, 'exit 0\n')
 
