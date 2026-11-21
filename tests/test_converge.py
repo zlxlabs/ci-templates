@@ -116,7 +116,10 @@ def _events_path(env: dict) -> Path:
 
 
 def _script_ref(env: dict) -> str:
-    return f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.sh"
+    return (
+        f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}"
+        f".r{env['D3_RUN_NUMBER']}a{env['D3_RUN_ATTEMPT']}.sh"
+    )
 
 
 def write_intent(env: dict) -> None:

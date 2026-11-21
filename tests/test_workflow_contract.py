@@ -46,10 +46,8 @@ def _load():
 # 425222feeacd56662a8ede9b01d8beea83433cf1)声明的 inputs 键清单,作为跨仓边界
 # fixture 保留在此:模板 with: 只允许落在该集合内;gate 侧增删 input 时同步本 fixture。
 NOTIFY_ACTION = "zlxlabs/gate/.github/actions/notify@v2"
-NOTIFY_ACTION_INPUTS = {"webhook", "title_prefix", "severity", "title", "body", "links"}
+NOTIFY_ACTION_INPUTS = {"webhook", "title_prefix", "severity", "title", "body", "links"    }
 
-# 通知 step 名 -> (组装 step id, 触发条件[与 base 逐字一致], severity 映射)
-# 保留成功回执 opt-in;失败通知只覆盖回滚健康未证与镜像身份未证。
 NOTIFY_STEPS = {
     "部署成功回执通知 (opt-in, fail-open)": (
         "assemble_success_receipt",
@@ -66,6 +64,12 @@ NOTIFY_STEPS = {
         "failure() && steps.deploy.outputs.deferred != 'true' && "
         "steps.deploy.outputs.rollback_unhealthy == 'true'",
         "P0",
+    ),
+    "部署延期通知 (deferred, fail-open)": (
+        "assemble_deferred",
+        "failure() && steps.deploy.outputs.deferred == 'true' && "
+        "inputs.deferred_deploy == true",
+        "P2",
     ),
 }
 
@@ -784,9 +788,6 @@ def test_success_receipt_skips_without_digest_and_emits_no_severity(tmp_path):
 
 def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     text = WORKFLOW.read_text()
-
-    # 标题前缀不再经 env 进组装 step,而是 3 处 notify step 统一作为 action 输入;
-    # 默认值 [zlxlabs·CI] 由 gate notify action 承担(模板注释说明)。
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "FEISHU_TITLE_PREFIX" not in text
     assert "[zlxlabs·CI]" in text
@@ -794,9 +795,7 @@ def test_deploy_notify_title_prefix_is_repo_variable_with_default():
 
 
 def test_notify_steps_call_gate_notify_action_with_contract_inputs():
-    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。7 处通知(本文件 4 处,
-    # release lane 3 处见 test_release_workflow_contract.py)的 if 必须与 base 逐字一致,
-    # with: 键集合必须是 action.yml 声明 inputs 的子集且含 webhook/title/body,
+    # 跨发布边界:模板 -> notify@v2 输入面。if 与 expected 逐字相等,闭集穷举。
     # webhook 只能来自 secrets.FEISHU_CI_WEBHOOK(#46:vars 不打码会进日志)。
     raw, _ = _load()
     steps = _steps_by_name(raw)
@@ -805,7 +804,7 @@ def test_notify_steps_call_gate_notify_action_with_contract_inputs():
         for step in raw["jobs"]["build-deploy"]["steps"]
         if step.get("uses") == NOTIFY_ACTION
     }
-    assert set(NOTIFY_STEPS) <= notify_names, "既有 notify action steps 必须仍在"
+    assert notify_names == set(NOTIFY_STEPS), "notify action steps 必须穷举且仅含允许的通知"
     for name, (assemble_id, condition, _severity) in NOTIFY_STEPS.items():
         step = steps[name]
         assert step["uses"] == NOTIFY_ACTION
@@ -1112,7 +1111,7 @@ def test_deferred_and_ordinary_failure_do_not_send_notifications():
     notify_names = {
         step.get("name") for step in steps if step.get("uses") == NOTIFY_ACTION
     }
-    assert set(NOTIFY_STEPS) <= notify_names
+    assert notify_names == set(NOTIFY_STEPS)
     assert "部署失败通知 (P0, fail-open)" not in notify_names
     text = WORKFLOW.read_text()
     assert "<at id=all>" not in text

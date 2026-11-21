@@ -197,8 +197,11 @@ def test_default_deploy_once_scp_ssh_stdin_match_base_path(tmp_path):
     assert "INTENT_FILE_ENABLED" not in ssh_argv
     assert "D3_RUN_NUMBER" not in ssh_argv
     assert "D3_INTENT_WEBHOOK" not in ssh_argv
+    assert "systemctl is-active" not in ssh_argv
+    assert "d3-converge.timer" not in ssh_argv
     assert DEFERRED_WEBHOOK not in ssh_argv
     assert "intent_status=" not in github_output
+    assert "converge_status=" not in github_output
     deploy_stdin = [stdin for argv, stdin in ssh_recs if "IMAGE_NAME=" in argv]
     assert deploy_stdin == [""]
 
@@ -215,7 +218,10 @@ def test_deferred_deploy_once_scps_intent_and_converge_without_webhook_in_argv(
             "NOTIFY_ON_SUCCESS": "false",
             "D3_REPO": "zlxlabs/ci-templates",
             "D3_RUN_URL": "https://github.com/zlxlabs/ci-templates/actions/runs/4411",
-            "MOCK_REMOTE_OUTPUT": "[deploy][evidence] intent: accepted",
+            "MOCK_REMOTE_OUTPUT": (
+                "[deploy][evidence] intent: accepted\n"
+                "[deploy][evidence] converge: active"
+            ),
             "MOCK_REMOTE_RC": "3",
         },
     )
@@ -241,8 +247,37 @@ def test_deferred_deploy_once_scps_intent_and_converge_without_webhook_in_argv(
     ):
         assert key in argv, key
     assert "D3_INTENT_WEBHOOK=" not in argv
+    assert "systemctl is-active --quiet d3-converge.timer" in argv
+    assert "rm -rf --" in argv
     assert stdin.splitlines()[:1] == [DEFERRED_WEBHOOK]
     assert "intent_status=accepted" in github_output.splitlines()
+    assert "converge_status=active" in github_output.splitlines()
+
+
+@pytest.mark.parametrize(
+    ("marker", "expected"),
+    [
+        ("[deploy][evidence] converge: active", "active"),
+        ("[deploy][evidence] converge: inactive", "inactive"),
+        ("remote log without converge marker", ""),
+    ],
+)
+def test_converge_status_is_parsed_from_remote_stdout(tmp_path, marker, expected):
+    completed, github_output, _, _ = _run_deploy_once(
+        tmp_path,
+        {
+            "DEFERRED_DEPLOY": "true",
+            "FEISHU_CI_WEBHOOK": "",
+            "NOTIFY_ON_SUCCESS": "false",
+            "D3_REPO": "zlxlabs/ci-templates",
+            "D3_RUN_URL": "https://example.test/run/1",
+            "MOCK_REMOTE_OUTPUT": marker,
+            "MOCK_REMOTE_RC": "3",
+        },
+    )
+    assert completed.returncode == 3, completed.stdout + completed.stderr
+    parsed = _parse_github_output(github_output)
+    assert parsed.get("converge_status", "MISSING") == expected
 
 
 @pytest.mark.parametrize(
@@ -286,10 +321,10 @@ def test_deferred_notify_maps_intent_status_to_severity(tmp_path):
     assert notify["if"] == DEFERRED_NOTIFY_IF
     assert notify["uses"] == NOTIFY_ACTION
     cases = (
-        ("accepted", "P2", "自动上线", "无需手动 re-run"),
-        ("superseded", "P2", "已有更新的部署意图排队", "re-run 本 run 无效"),
-        ("write-failed", "P1", "意图持久化失败", "自动收敛不会发生"),
-        ("", "P1", "未能解析意图状态", "自动收敛不会发生"),
+        ("accepted", "active", "P2", "自动上线", "无需手动 re-run"),
+        ("superseded", "", "P2", "已有更新的部署意图排队", "re-run 本 run 无效"),
+        ("write-failed", "", "P1", "意图持久化失败", "自动收敛不会发生"),
+        ("", "", "P1", "未能解析意图状态", "自动收敛不会发生"),
     )
     base_env = {
         "SVC": "demo",
@@ -299,11 +334,11 @@ def test_deferred_notify_maps_intent_status_to_severity(tmp_path):
         "RUN_URL": "https://example.test/run/1",
         "RUN_NUMBER": "131",
     }
-    for status, severity, *phrases in cases:
+    for status, converge, severity, *phrases in cases:
         completed, outputs = _run_assemble_step(
             assemble,
-            base_env | {"INTENT_STATUS": status},
-            tmp_path / f"out-{status or 'empty'}",
+            base_env | {"INTENT_STATUS": status, "CONVERGE_STATUS": converge},
+            tmp_path / f"out-{status or 'empty'}-{converge or 'none'}",
         )
         assert completed.returncode == 0, completed.stdout + completed.stderr
         assert outputs["severity"] == severity, status
@@ -329,3 +364,33 @@ def test_deferred_notify_is_opt_in_and_enumerated():
             assert "inputs.deferred_deploy == true" in cond
     text = WORKFLOW.read_text()
     assert DEFERRED_NOTIFY_IF in text
+    assert "rm -rf -- '${REMOTE_DIR}'" in text
+
+
+def test_accepted_notify_severity_depends_on_converge_status(tmp_path):
+    """accepted+active=P2; accepted+inactive 或标记缺失=P1。"""
+    raw, _ = _load()
+    assemble = _step_by_id(raw, "assemble_deferred")
+    base_env = {
+        "SVC": "demo",
+        "HOST": "host.example",
+        "REPO": "zlxlabs/ci-templates",
+        "SHA": "abc1234",
+        "RUN_URL": "https://example.test/run/1",
+        "RUN_NUMBER": "131",
+        "INTENT_STATUS": "accepted",
+    }
+    cases = (
+        ("active", "P2", "自动上线"),
+        ("inactive", "P1", "收敛器 timer 未启用"),
+        ("", "P1", "scripts/converge/README.md"),
+    )
+    for converge, severity, phrase in cases:
+        completed, outputs = _run_assemble_step(
+            assemble,
+            base_env | {"CONVERGE_STATUS": converge},
+            tmp_path / f"converge-{converge or 'missing'}",
+        )
+        assert completed.returncode == 0, completed.stdout + completed.stderr
+        assert outputs["severity"] == severity, converge
+        assert phrase in outputs["body"]

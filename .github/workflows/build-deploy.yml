@@ -406,14 +406,14 @@ jobs:
             echo "image source: ${image_source}" >> "$GITHUB_STEP_SUMMARY" || echo "::warning::failed to write image source to step summary"
           }
 
-          capture_intent_status() {
-            local remote_output="$1" intent_prefix='[deploy][evidence] intent: ' line intent_status=""
+          capture_marker() {
+            local remote_output="$1" prefix="$2" key="$3" line value=""
             while IFS= read -r line; do
-              if [[ "$line" == "$intent_prefix"* ]]; then
-                intent_status="${line:${#intent_prefix}}"
+              if [[ "$line" == "$prefix"* ]]; then
+                value="${line:${#prefix}}"
               fi
             done <<< "$remote_output"
-            echo "intent_status=${intent_status}" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write intent_status output"
+            echo "${key}=${value}" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write ${key} output"
           }
 
           deploy_once() {
@@ -459,11 +459,14 @@ jobs:
                  D3_RUN_URL='${D3_RUN_URL}' \
                  D3_REPO='${D3_REPO}' \
                  D3_NOTIFY_ON_SUCCESS='${NOTIFY_ON_SUCCESS}' \
-                 bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}' '${REMOTE_INTENT}'; exit \$rc"
+                 bash '${REMOTE_SCRIPT}'; rc=\$?; \
+                 if systemctl is-active --quiet d3-converge.timer; then echo '[deploy][evidence] converge: active'; else echo '[deploy][evidence] converge: inactive'; fi; \
+                 rm -rf -- '${REMOTE_DIR}'; exit \$rc"
               )" || remote_rc=$?
               printf '%s\n' "$remote_output"
               capture_deploy_result "$remote_output"
-              capture_intent_status "$remote_output"
+              capture_marker "$remote_output" '[deploy][evidence] intent: ' intent_status
+              capture_marker "$remote_output" '[deploy][evidence] converge: ' converge_status
               return "$remote_rc"
             fi
             scp $SSH_OPTS "$DEPLOY_SCRIPT" \
@@ -579,7 +582,7 @@ jobs:
               # holds and this cleanup needs the same reconsideration the
               # release lane's did.
               if [ "${DEFERRED_DEPLOY:-}" = "true" ]; then
-                ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}' '${REMOTE_INTENT}'" || true
+                ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -rf -- '${REMOTE_DIR}'" || true
               else
                 ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
               fi
@@ -812,6 +815,7 @@ jobs:
           SHA:     ${{ steps.sha.outputs.git_sha }}
           RUN_NUMBER: ${{ github.run_number }}
           INTENT_STATUS: ${{ steps.deploy.outputs.intent_status }}
+          CONVERGE_STATUS: ${{ steps.deploy.outputs.converge_status }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           set -u -o pipefail
@@ -824,13 +828,20 @@ jobs:
           run_url = os.environ["RUN_URL"]
           run_number = os.environ.get("RUN_NUMBER", "") or "?"
           status  = os.environ.get("INTENT_STATUS", "")
-          if status == "accepted":
+          converge = os.environ.get("CONVERGE_STATUS", "")
+          if status == "accepted" and converge == "active":
               severity = "P2"
               body = (f"服务 {svc} · 目标机 {host}\n"
                       f"仓库 {repo} · SHA {sha}\n"
                       f"部署延期（服务忙，录制中）。部署意图已持久化到主机，"
                       f"录制结束后将**自动上线**，无需手动 re-run。"
                       f"结果查询：主机 `~/.d3-converge/intents/...` 或 `events.jsonl`。")
+          elif status == "accepted":
+              severity = "P1"
+              body = (f"服务 {svc} · 目标机 {host}\n"
+                      f"仓库 {repo} · SHA {sha}\n"
+                      f"部署延期且收敛器 timer 未启用，意图不会自动重放；"
+                      f"按 scripts/converge/README.md 用 root 执行一次 enable。")
           elif status == "superseded":
               severity = "P2"
               body = (f"服务 {svc} · 目标机 {host}\n"

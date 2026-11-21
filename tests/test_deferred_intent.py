@@ -109,7 +109,10 @@ def _assert_intent_payload(intent: dict, env: dict) -> None:
     assert intent["run_id"] == int(env["D3_RUN_ID"])
     assert intent["run_url"] == env["D3_RUN_URL"]
     assert intent["git_sha"] == env["GIT_SHA"]
-    assert intent["script_ref"] == f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.sh"
+    assert intent["script_ref"] == (
+        f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}"
+        f".r{env['D3_RUN_NUMBER']}a{env['D3_RUN_ATTEMPT']}.sh"
+    )
     assert ISO_Z.match(intent["created_at"])
     assert ISO_Z.match(intent["updated_at"])
     assert intent["attempts"] == 0
@@ -166,10 +169,7 @@ def test_busy_lock_timeout_writes_intent_with_whitelist_and_mode_0600(tmp_path):
     assert events[-1]["event"] == "accepted"
     assert events[-1]["run_number"] == 131
     _assert_no_webhook_leak(res, env)
-    script_path = (
-        _home(env) / ".d3-converge" / "scripts"
-        / f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.sh"
-    )
+    script_path = _script_path(env)
     assert script_path.is_file()
     assert script_path.read_bytes() == (REPO_ROOT / "scripts" / "pull_and_deploy.sh").read_bytes()
     _assert_mode(script_path, 0o700)
@@ -249,11 +249,15 @@ def test_run_number_attempt_monotonic_overwrite_and_supersede(tmp_path):
     assert events[3]["run_attempt"] == 2
 
 
-def _script_path(env: dict) -> Path:
+def _script_ref(env: dict) -> str:
     return (
-        _home(env) / ".d3-converge" / "scripts"
-        / f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.sh"
+        f"pull_and_deploy.{sanitize_deploy_dir(env['DEPLOY_DIR'])}"
+        f".r{env['D3_RUN_NUMBER']}a{env['D3_RUN_ATTEMPT']}.sh"
     )
+
+
+def _script_path(env: dict) -> Path:
+    return _home(env) / ".d3-converge" / "scripts" / _script_ref(env)
 
 
 def test_accepted_installs_executing_script_bytes(tmp_path):
@@ -278,7 +282,7 @@ def test_accepted_installs_executing_script_bytes(tmp_path):
 
 
 def test_superseded_does_not_install_script(tmp_path):
-    """(e) superseded 时不安装脚本。"""
+    """superseded 时不装任何脚本。"""
     env = _intent_env(tmp_path)
     holder = _hold_shared(env["BUSY_LOCK_FILE"])
     try:
@@ -286,8 +290,8 @@ def test_superseded_does_not_install_script(tmp_path):
         env["D3_RUN_NUMBER"] = "200"
         first = _run(env)
         assert first.returncode == 3, first.stdout + first.stderr
-        installed = _script_path(env)
-        installed.write_bytes(b"KEEP-ORIGINAL-BYTES\n")
+        kept = _script_path(env)
+        kept_bytes = kept.read_bytes()
         env["D3_RUN_NUMBER"] = "50"
         older = _run(env)
     finally:
@@ -296,7 +300,8 @@ def test_superseded_does_not_install_script(tmp_path):
 
     assert older.returncode == 3, older.stdout + older.stderr
     assert "[deploy][evidence] intent: superseded" in older.stdout
-    assert _script_path(env).read_bytes() == b"KEEP-ORIGINAL-BYTES\n"
+    assert kept.read_bytes() == kept_bytes
+    assert not _script_path(env).exists()
     assert _load_intent(env)["run_number"] == 200
 
 
@@ -548,6 +553,34 @@ def test_concurrent_writes_keep_larger_run_number(tmp_path):
     _assert_no_webhook_leak(results[20], env)
 
 
+def test_accepted_replace_deletes_old_script(tmp_path):
+    """成功替换后旧脚本删除、新脚本存在。"""
+    env = _intent_env(tmp_path)
+    holder = _hold_shared(env["BUSY_LOCK_FILE"])
+    try:
+        time.sleep(0.5)
+        env["D3_RUN_NUMBER"] = "50"
+        first = _run(env)
+        assert first.returncode == 3, first.stdout + first.stderr
+        old_path = _script_path(env)
+        assert old_path.is_file()
+        env["D3_RUN_NUMBER"] = "80"
+        second = _run(env)
+    finally:
+        holder.terminate()
+        holder.wait()
+
+    assert second.returncode == 3, second.stdout + second.stderr
+    assert "[deploy][evidence] intent: accepted" in second.stdout
+    assert not old_path.exists()
+    assert _script_path(env).is_file()
+    assert _script_path(env).read_bytes() == (
+        REPO_ROOT / "scripts" / "pull_and_deploy.sh"
+    ).read_bytes()
+    _assert_mode(_script_path(env), 0o700)
+    assert _load_intent(env)["script_ref"] == _script_ref(env)
+
+
 def test_events_unwritable_does_not_replace_intent(tmp_path):
     """events.jsonl 不可写 → write-failed，已发布的意图文件字节不变。
 
@@ -574,6 +607,13 @@ def test_events_unwritable_does_not_replace_intent(tmp_path):
         assert "intent: accepted" not in second.stdout
         assert _intent_path(env).read_bytes() == before
         assert json.loads(before)["run_number"] == 50
+        old_env = dict(env)
+        old_env["D3_RUN_NUMBER"] = "50"
+        assert _script_path(old_env).is_file()
+        assert _script_path(old_env).read_bytes() == (
+            REPO_ROOT / "scripts" / "pull_and_deploy.sh"
+        ).read_bytes()
+        assert not _script_path(env).exists()
         _assert_no_webhook_leak(second, env)
     finally:
         busy.terminate()
