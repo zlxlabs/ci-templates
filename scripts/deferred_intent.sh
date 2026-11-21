@@ -1,11 +1,11 @@
 # Sourced by pull_and_deploy.sh when INTENT_FILE_ENABLED=true.
-# Not a shared library: converge.sh (C2) copies sanitize_deploy_dir.
 # Do not execute this file directly.
 #
-# Independent function so C2 can copy the same rule; tests lock both sides
-# character-for-character. Rule: strip leading slashes; replace every char
-# not in [A-Za-z0-9._-] with _; append '-' and the first 8 hex chars of
-# sha256(original deploy_dir).
+# sanitize_deploy_dir is the only definition of script_ref naming. Rule:
+# strip leading slashes; replace every char not in [A-Za-z0-9._-] with _;
+# append '-' and the first 8 hex chars of sha256(original deploy_dir).
+# The caller must set D3_DEPLOY_SCRIPT to the executing pull_and_deploy.sh
+# path (BASH_SOURCE[0] before this file is sourced); this file does not guess.
 sanitize_deploy_dir() {
   local raw="${1-}" stripped c i sanitized digest
   stripped="$raw"
@@ -36,6 +36,29 @@ _append_intent_event() {
   printf '%s\n' "$line" >> "$events_file" || return 1
 }
 
+# Install the executing deploy script bytes to ~/.d3-converge/scripts/<script_ref>
+# (0700, tmp + mv). src must be an explicit path from the caller.
+_install_current_deploy_script() {
+  local scripts_dir="$1" dest="$2" src="$3" tmp
+  mkdir -p "$scripts_dir" || return 1
+  chmod 0700 "$scripts_dir" || return 1
+  [ -n "$src" ] && [ -f "$src" ] && [ -r "$src" ] || return 1
+  tmp="$(mktemp "${scripts_dir}/.script.XXXXXX")" || return 1
+  if ! cp -- "$src" "$tmp"; then
+    rm -f -- "$tmp" || true
+    return 1
+  fi
+  if ! chmod 0700 "$tmp"; then
+    rm -f -- "$tmp" || true
+    return 1
+  fi
+  if ! mv -f -- "$tmp" "$dest"; then
+    rm -f -- "$tmp" || true
+    return 1
+  fi
+  return 0
+}
+
 validate_deferred_intent_config() {
   if [ -z "$BUSY_LOCK_FILE" ]; then
     log "INTENT_FILE_ENABLED=true requires BUSY_LOCK_FILE (no busy lock means no deferred path)"
@@ -57,11 +80,12 @@ _release_intent_lock() {
 }
 
 # Critical section: caller already holds intents.lock (fd 7).
-# Event append happens before replacing the intent file. Event write
-# failure → write-failed, leave the published intent unchanged.
+# Install the executing script first, then append the event, then replace
+# the intent file. Script install or event write failure → write-failed,
+# leave the published intent unchanged. superseded does not install.
 _write_deferred_intent_locked() {
   local existing_run existing_attempt now notify_json run_id_json result
-  local event_line tmp
+  local event_line tmp script_ref scripts_dir
 
   if [ -f "$intent_path" ]; then
     existing_run="$(sed -n 's/.*"run_number":\([0-9][0-9]*\).*/\1/p' "$intent_path" 2>/dev/null)" || existing_run=""
@@ -83,6 +107,13 @@ _write_deferred_intent_locked() {
     fi
   fi
 
+  script_ref="pull_and_deploy.${stem}.sh"
+  scripts_dir="${converge_dir}/scripts"
+  if ! _install_current_deploy_script "$scripts_dir" "${scripts_dir}/${script_ref}" "${D3_DEPLOY_SCRIPT-}"; then
+    _intent_write_failed
+    return 0
+  fi
+
   now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || now=""
   if [ "${D3_NOTIFY_ON_SUCCESS:-}" = "true" ]; then
     notify_json=true
@@ -102,7 +133,7 @@ _write_deferred_intent_locked() {
     "$run_id_json" \
     "$(json_quote "${D3_RUN_URL-}")" \
     "$(json_quote "$GIT_SHA")" \
-    "$(json_quote "pull_and_deploy.${stem}.sh")" \
+    "$(json_quote "$script_ref")" \
     "$(json_quote "$now")" \
     "$(json_quote "$now")" \
     "$notify_json" \

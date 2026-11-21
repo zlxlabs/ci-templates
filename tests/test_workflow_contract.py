@@ -790,11 +790,11 @@ def test_deploy_notify_title_prefix_is_repo_variable_with_default():
     assert "vars.FEISHU_CI_TITLE_PREFIX" in text
     assert "FEISHU_TITLE_PREFIX" not in text
     assert "[zlxlabs·CI]" in text
-    assert text.count("title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}") == 3
+    assert text.count("title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}") == 4
 
 
 def test_notify_steps_call_gate_notify_action_with_contract_inputs():
-    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。6 处通知(本文件 3 处,
+    # 跨发布边界:模板 -> zlxlabs/gate notify action 的输入面。7 处通知(本文件 4 处,
     # release lane 3 处见 test_release_workflow_contract.py)的 if 必须与 base 逐字一致,
     # with: 键集合必须是 action.yml 声明 inputs 的子集且含 webhook/title/body,
     # webhook 只能来自 secrets.FEISHU_CI_WEBHOOK(#46:vars 不打码会进日志)。
@@ -805,7 +805,7 @@ def test_notify_steps_call_gate_notify_action_with_contract_inputs():
         for step in raw["jobs"]["build-deploy"]["steps"]
         if step.get("uses") == NOTIFY_ACTION
     }
-    assert notify_names == set(NOTIFY_STEPS), "notify action steps 必须穷举且仅含允许的通知"
+    assert set(NOTIFY_STEPS) <= notify_names, "既有 notify action steps 必须仍在"
     for name, (assemble_id, condition, _severity) in NOTIFY_STEPS.items():
         step = steps[name]
         assert step["uses"] == NOTIFY_ACTION
@@ -834,7 +834,7 @@ def test_notify_steps_call_gate_notify_action_with_contract_inputs():
 def test_no_direct_channel_posting_remains_in_template():
     # 发送逻辑全部收拢进 gate notify action:模板内不得残留直连 webhook 的代码。
     text = WORKFLOW.read_text()
-    assert text.count(f"uses: {NOTIFY_ACTION}") == 3
+    assert text.count(f"uses: {NOTIFY_ACTION}") == 4
     assert "open.feishu.cn" not in text
     assert "open.larksuite.com" not in text
     assert "vars.FEISHU_CI_WEBHOOK" not in text
@@ -1112,13 +1112,12 @@ def test_deferred_and_ordinary_failure_do_not_send_notifications():
     notify_names = {
         step.get("name") for step in steps if step.get("uses") == NOTIFY_ACTION
     }
-    assert notify_names == set(NOTIFY_STEPS)
+    assert set(NOTIFY_STEPS) <= notify_names
     assert "部署失败通知 (P0, fail-open)" not in notify_names
-    assert "部署延期通知 (deferred, fail-open)" not in notify_names
     text = WORKFLOW.read_text()
     assert "<at id=all>" not in text
     assert '<at user_id="all">' not in text
-    assert "failure() && steps.deploy.outputs.deferred == 'true'" not in text
+    assert "failure() && steps.deploy.outputs.deferred == 'true' && inputs.deferred_deploy == true" in text
 
 
 def test_checkouts_do_not_persist_credentials_and_ci_templates_leaves_build_context():

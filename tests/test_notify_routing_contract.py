@@ -66,6 +66,11 @@ def test_build_deploy_notify_steps_are_exhaustive_and_routed_by_production_risk(
             "failure() && steps.deploy.outputs.deferred != 'true' && "
             "steps.deploy.outputs.rollback_unhealthy == 'true'",
         ),
+        "部署延期通知 (deferred, fail-open)": (
+            "assemble_deferred",
+            "failure() && steps.deploy.outputs.deferred == 'true' && "
+            "inputs.deferred_deploy == true",
+        ),
     }
     assert set(notify_steps) == set(expected)
     for name, (assemble_id, condition) in expected.items():

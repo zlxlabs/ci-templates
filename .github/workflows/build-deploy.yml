@@ -76,6 +76,11 @@ on:
         required: false
         default: false
         type: boolean
+      deferred_deploy:
+        description: "opt-in: on busy-lock deferral, persist a deploy intent and install the host converge artifacts so idle-time replay can finish the deploy without a manual re-run. Default false keeps the existing deferred path (job stays red, no intent, no converge install)."
+        required: false
+        default: false
+        type: boolean
       local_registry:
         description: "opt-in local-network registry mirror host:port (e.g. a tailnet MagicDNS name:5001), used as the primary push/pull target for this deploy; ACR remains the offsite archive + fallback. Empty (default) disables this entirely — same ACR-only code path, same exit codes, same success-path stdout as today; the one documented exception is that a default-path ACR-push failure now also prints one extra summary line before failing."
         required: false
@@ -264,6 +269,11 @@ jobs:
           BUSY_LOCK_FILE: ${{ inputs.busy_lock_file }}
           BUSY_LOCK_TIMEOUT: ${{ inputs.busy_lock_timeout }}
           ONESHOT_SERVICES: ${{ inputs.oneshot_services }}
+          DEFERRED_DEPLOY: ${{ inputs.deferred_deploy }}
+          NOTIFY_ON_SUCCESS: ${{ inputs.notify_on_success }}
+          FEISHU_CI_WEBHOOK: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          D3_REPO: ${{ github.repository }}
+          D3_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           # P1-B (codex review round 5): ssh_user starting with '-' makes the
           # assembled "${SSH_USER}@${DEPLOY_HOST}:path" argument itself start
@@ -307,6 +317,13 @@ jobs:
           repo_slug="$(printf '%s' "${GITHUB_REPOSITORY//\//-}" | tr -cd 'A-Za-z0-9_-')"
           [[ -n "$repo_slug" ]] || repo_slug="unknown-repo"
           REMOTE_SCRIPT="/tmp/pull_and_deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$.sh"
+          if [ "${DEFERRED_DEPLOY:-}" = "true" ]; then
+            # Unique directory so pull_and_deploy.sh still finds sibling
+            # deferred_intent.sh, while concurrent runs cannot clobber either file.
+            REMOTE_DIR="/tmp/d3-deploy.${repo_slug}-${GITHUB_RUN_ID:-manual}-${GITHUB_RUN_ATTEMPT:-0}-$$"
+            REMOTE_SCRIPT="${REMOTE_DIR}/pull_and_deploy.sh"
+            REMOTE_INTENT="${REMOTE_DIR}/deferred_intent.sh"
+          fi
 
           rollback_safety="${ROLLBACK_SAFETY:-safe}"
           case "$rollback_safety" in
@@ -389,7 +406,66 @@ jobs:
             echo "image source: ${image_source}" >> "$GITHUB_STEP_SUMMARY" || echo "::warning::failed to write image source to step summary"
           }
 
+          capture_intent_status() {
+            local remote_output="$1" intent_prefix='[deploy][evidence] intent: ' line intent_status=""
+            while IFS= read -r line; do
+              if [[ "$line" == "$intent_prefix"* ]]; then
+                intent_status="${line:${#intent_prefix}}"
+              fi
+            done <<< "$remote_output"
+            echo "intent_status=${intent_status}" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write intent_status output"
+          }
+
           deploy_once() {
+            if [ "${DEFERRED_DEPLOY:-}" = "true" ]; then
+              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                "mkdir -p -- '${REMOTE_DIR}' \"\$HOME/.d3-converge/bin\" \"\$HOME/.d3-converge/systemd\"" || return 255
+              converge_tmp="$(ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                'mktemp "$HOME/.d3-converge/bin/.converge.XXXXXX"')" || return 255
+              converge_tmp="${converge_tmp%%$'\n'*}"
+              [ -n "$converge_tmp" ] || return 255
+              scp $SSH_OPTS "$DEPLOY_SCRIPT" \
+                "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
+              scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/deferred_intent.sh" \
+                "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_INTENT}" || return 255
+              scp $SSH_OPTS "$RUNNER_TEMP/ci-templates/scripts/converge/converge.sh" \
+                "${SSH_USER}@${DEPLOY_HOST}:${converge_tmp}" || return 255
+              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                "chmod 0700 -- '${converge_tmp}' && mv -f -- '${converge_tmp}' \"\$HOME/.d3-converge/bin/converge.sh\"" || return 255
+              scp $SSH_OPTS "$RUNNER_TEMP"/ci-templates/scripts/converge/systemd/* \
+                "${SSH_USER}@${DEPLOY_HOST}:.d3-converge/systemd/" || return 255
+              remote_output=""
+              remote_rc=0
+              remote_output="$(
+                printf '%s\n' "${FEISHU_CI_WEBHOOK:-}" | ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
+                "IFS= read -r D3_INTENT_WEBHOOK; export D3_INTENT_WEBHOOK; \
+                 IMAGE_NAME='${IMAGE_NAME}' ACR_IMAGE='${ACR_IMAGE}' \
+                 LOCAL_IMAGE='${LOCAL_IMAGE}' \
+                 GIT_SHA='${GIT_SHA}' DEPLOY_DIR='${DEPLOY_DIR}' \
+                 HOST_LOCK='/var/lock/fleet-deploy.lock' \
+                 HEALTHCHECK_URL='${HEALTHCHECK_URL}' \
+                 HEALTHCHECK_EXPECT_STATUS='${HEALTHCHECK_EXPECT_STATUS}' \
+                 HEALTHCHECK_RETRIES='${HEALTHCHECK_RETRIES}' \
+                 HEALTHCHECK_INTERVAL='${HEALTHCHECK_INTERVAL}' \
+                 HEALTHCHECK_WARMUP='${HEALTHCHECK_WARMUP}' \
+                 ROLLBACK_SAFETY='${rollback_safety}' \
+                 BUSY_LOCK_FILE='${BUSY_LOCK_FILE}' \
+                 BUSY_LOCK_TIMEOUT='${BUSY_LOCK_TIMEOUT}' \
+                 ONESHOT_SERVICES='${ONESHOT_SERVICES}' \
+                 INTENT_FILE_ENABLED=true \
+                 D3_RUN_NUMBER='${GITHUB_RUN_NUMBER}' \
+                 D3_RUN_ATTEMPT='${GITHUB_RUN_ATTEMPT}' \
+                 D3_RUN_ID='${GITHUB_RUN_ID}' \
+                 D3_RUN_URL='${D3_RUN_URL}' \
+                 D3_REPO='${D3_REPO}' \
+                 D3_NOTIFY_ON_SUCCESS='${NOTIFY_ON_SUCCESS}' \
+                 bash '${REMOTE_SCRIPT}'; rc=\$?; rm -f '${REMOTE_SCRIPT}' '${REMOTE_INTENT}'; exit \$rc"
+              )" || remote_rc=$?
+              printf '%s\n' "$remote_output"
+              capture_deploy_result "$remote_output"
+              capture_intent_status "$remote_output"
+              return "$remote_rc"
+            fi
             scp $SSH_OPTS "$DEPLOY_SCRIPT" \
               "${SSH_USER}@${DEPLOY_HOST}:${REMOTE_SCRIPT}" || return 255
             remote_output=""
@@ -502,7 +578,11 @@ jobs:
               # rollback/health decision, this safety argument no longer
               # holds and this cleanup needs the same reconsideration the
               # release lane's did.
-              ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
+              if [ "${DEFERRED_DEPLOY:-}" = "true" ]; then
+                ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}' '${REMOTE_INTENT}'" || true
+              else
+                ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" "rm -f -- '${REMOTE_SCRIPT}'" || true
+              fi
               exit 1
             fi
             echo "::warning::SSH transport hiccup (rc=255) attempt ${attempt}/${max_attempts}, retrying in 10s"
@@ -717,3 +797,72 @@ jobs:
           title: ${{ steps.assemble_rollback_unhealthy.outputs.title }}
           body: ${{ steps.assemble_rollback_unhealthy.outputs.body }}
           links: ${{ steps.assemble_rollback_unhealthy.outputs.links }}
+
+      # opt-in deferred_deploy: persist intent + host converge, so a yellow card
+      # is enough; job conclusion stays failure (exit 3). Default-off callers
+      # never enter these steps (inputs.deferred_deploy == true is required).
+      - name: 组装部署延期通知字段
+        id: assemble_deferred
+        if: failure() && steps.deploy.outputs.deferred == 'true' && inputs.deferred_deploy == true
+        continue-on-error: true
+        env:
+          SVC:     ${{ inputs.image_name }}
+          HOST:    ${{ inputs.host }}
+          REPO:    ${{ github.repository }}
+          SHA:     ${{ steps.sha.outputs.git_sha }}
+          RUN_NUMBER: ${{ github.run_number }}
+          INTENT_STATUS: ${{ steps.deploy.outputs.intent_status }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -u -o pipefail
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json, os
+          svc     = os.environ.get("SVC", "") or "?"
+          host    = os.environ.get("HOST", "") or "?"
+          repo    = os.environ["REPO"]
+          sha     = os.environ.get("SHA", "") or "?"
+          run_url = os.environ["RUN_URL"]
+          run_number = os.environ.get("RUN_NUMBER", "") or "?"
+          status  = os.environ.get("INTENT_STATUS", "")
+          if status == "accepted":
+              severity = "P2"
+              body = (f"服务 {svc} · 目标机 {host}\n"
+                      f"仓库 {repo} · SHA {sha}\n"
+                      f"部署延期（服务忙，录制中）。部署意图已持久化到主机，"
+                      f"录制结束后将**自动上线**，无需手动 re-run。"
+                      f"结果查询：主机 `~/.d3-converge/intents/...` 或 `events.jsonl`。")
+          elif status == "superseded":
+              severity = "P2"
+              body = (f"服务 {svc} · 目标机 {host}\n"
+                      f"仓库 {repo} · SHA {sha}\n"
+                      f"部署延期。已有更新的部署意图排队，本次（run #{run_number}）"
+                      f"不会上线（被覆盖），re-run 本 run 无效。")
+          else:
+              severity = "P1"
+              if status == "write-failed":
+                  reason = "部署延期且意图持久化失败——自动收敛不会发生，需人工空闲后 re-run 或上机。"
+              else:
+                  reason = ("部署延期但未能解析意图状态——"
+                            "自动收敛不会发生，需人工处理。")
+              body = (f"服务 {svc} · 目标机 {host}\n"
+                      f"仓库 {repo} · SHA {sha}\n"
+                      f"{reason}")
+          print(f"severity={severity}")
+          print(f"title=部署延期 · {svc}")
+          print("body<<EOF_NOTIFY_BODY")
+          print(body)
+          print("EOF_NOTIFY_BODY")
+          print("links=" + json.dumps([{"text": "查看部署 Run", "url": run_url}], ensure_ascii=False))
+          PY
+
+      - name: 部署延期通知 (deferred, fail-open)
+        if: failure() && steps.deploy.outputs.deferred == 'true' && inputs.deferred_deploy == true
+        continue-on-error: true
+        uses: zlxlabs/gate/.github/actions/notify@v2
+        with:
+          webhook: ${{ secrets.FEISHU_CI_WEBHOOK }}
+          title_prefix: ${{ vars.FEISHU_CI_TITLE_PREFIX }}
+          severity: ${{ steps.assemble_deferred.outputs.severity }}
+          title: ${{ steps.assemble_deferred.outputs.title }}
+          body: ${{ steps.assemble_deferred.outputs.body }}
+          links: ${{ steps.assemble_deferred.outputs.links }}

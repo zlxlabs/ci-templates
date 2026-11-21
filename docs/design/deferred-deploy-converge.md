@@ -91,10 +91,11 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 **原则：收敛器零部署逻辑。** 它不重实现探针、回滚、对账、忙锁循环中的任何一个；它只做「按意图快照的 env，重放同一次部署所用的同一个脚本字节」。
 
-- **脚本固化**：`build-deploy.yml` 在 `intent_file` opt-in 时，把本次 run 实际执行的那个部署脚本（`safe` 时是仓内 `pull_and_deploy.sh` 原件；`unsafe`/`conditional` 时是 awk 注入守卫后生成的脚本，[实测] 该生成发生在 workflow 侧 deploy step 内）以 `scp` 安装到 `${HOME}/.d3-converge/scripts/<script_ref>`（`script_ref` = `pull_and_deploy.<sanitized-deploy-dir>.sh`，per caller 隔离，两个 caller 的 rollback_safety 不同互不影响）。意图记录 `script_ref` 字段指向它。**执行契约由此字节级一致**：守卫、探针预算、回滚语义、对账、回执写入（`last_deploy_result.json`）全部是同一段代码。每次部署 run（无论成败）都刷新安装（哈希相同则跳过写），收敛器与模板的版本漂移窗口收敛到一个 run 内部。
+- **脚本固化**：`script_ref` 命名只在写侧（`deferred_intent.sh` 的 `sanitize_deploy_dir`）定义，`script_ref` = `pull_and_deploy.<sanitized-deploy-dir>.sh`（per caller 隔离，两个 caller 的 rollback_safety 不同互不影响）。`write_deferred_intent` 在持有 `intents.lock`、写入 accepted 意图的同一个临界区里，把**当前正在执行的脚本本身**（调用方在 source 之前记下的 `${BASH_SOURCE[0]}`，即本次 run 实际执行的那份字节：`safe` 时是仓内原件；`unsafe`/`conditional` 时是 workflow awk 注入守卫后 scp 上来的那份）原子安装到 `${HOME}/.d3-converge/scripts/<script_ref>`（0700，tmp + mv）。顺序：先装脚本，再追加事件，最后替换意图；装脚本失败按 write-failed 处理，不替换意图。superseded 时不装。workflow 不再实现 sanitize，也不再单独 scp 固化脚本——它只把本次执行的脚本（含守卫变体）scp 到 `/tmp` 给这次 run 跑。**执行契约由此字节级一致**：守卫、探针预算、回滚语义、对账、回执写入（`last_deploy_result.json`）全部是同一段代码。收敛器与模板的版本漂移窗口收敛到一次 accepted 写入。
 - **否决：脚本快照写进 STATE_DIR/意图文件同目录**——即第 1 节否决过的容器可写位置，不赘述。
 - **否决：收敛器运行时从 GitHub 拉脚本**——主机无 GitHub 凭据（CI_TEMPLATES_PAT 已废，runbook 明载），离线不可用，且把「部署脚本内容」这一执行契约绑到收敛时刻的网络与权限状态上。
-- **否决：意图记录存脚本内容或哈希供收敛器校验**——校验基准与被校验对象在同一可写位置时校验无意义；脚本由部署 run 直接安装到收敛器目录，安装通道本身即信任锚（与今天 scp 部署脚本到 /tmp 同一信任模型，收敛器目录只是 /tmp 换成了持久且容器不可见的路径）。
+- **否决：意图记录存脚本内容或哈希供收敛器校验**——校验基准与被校验对象在同一可写位置时校验无意义；脚本由写侧在 `intents.lock` 内安装到收敛器目录，安装通道本身即信任锚（与今天 scp 部署脚本到 /tmp 同一信任模型：workflow 把本次字节交到主机，写侧再从正在执行的那份拷到持久且容器不可见的路径）。
+- **否决：workflow 再实现一遍 sanitize 并 scp 固化脚本**——命名规则只应有一份（写侧）；workflow 重复实现会与 rollback_safety 守卫变体、并发 run 文件名漂移。
 - **收尾清理差异**：在线部署 ssh 命令里 `rm -f` 临时脚本；收敛器目录的脚本持久保留（下个意图可能仍引用同一字节），清理随模板 major 升级的 RUNBOOK 步骤走。
 - 回执复用：`do_deploy()` 成功/失败路径写的 `last_deploy_result.json`（`write_deploy_result`）与 `DEPLOY_EVENT_LOG` 钩子在收敛器重放时照常工作——**已上线的详细回执格式零新增**。deferred 时写意图失败是唯一新增的 fail-loud 分支：意图目录不可写/磁盘满时打 `[deploy][evidence] intent: write-failed` 到 stdout 并照常 `exit 3`（deferred 语义不变，workflow 侧凭标记把黄卡升级为 P1 卡）。
 - 配置校验新增一条：`INTENT_FILE` 机制启用但 `BUSY_LOCK_FILE` 为空 → `exit 1` fail fast（没有忙锁就没有 deferred，意图永不触发，纯误导配置）。

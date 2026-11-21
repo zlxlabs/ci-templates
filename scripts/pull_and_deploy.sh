@@ -737,12 +737,12 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
     _remain=$(( _deadline - SECONDS ))
     if [ "$_remain" -le 0 ]; then
       log "service busy: host deploy lock busy through the whole ${BUSY_LOCK_TIMEOUT}s budget — DEFERRED, old container kept"
-      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && write_deferred_intent; exit 3
+      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && D3_DEPLOY_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" write_deferred_intent; exit 3
     fi
     _frc=0; flock -w "$_remain" -x 8 || _frc=$?
     if [ "$_frc" -eq 1 ]; then
       log "service busy: busy lock not acquired within budget — DEFERRED, old container kept"
-      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && write_deferred_intent; exit 3
+      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && D3_DEPLOY_SCRIPT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")" write_deferred_intent; exit 3
     elif [ "$_frc" -ne 0 ]; then
       log "flock on busy lock failed with rc=${_frc} (not a lock timeout — config or host problem)"
       exit 1
