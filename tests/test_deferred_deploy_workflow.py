@@ -308,6 +308,114 @@ def test_intent_status_is_parsed_from_remote_stdout(tmp_path, marker, expected):
     assert parsed.get("intent_status", "MISSING") == expected
 
 
+def _run_deploy_step(tmp_path: Path, extra: dict | None = None):
+    deploy = next(
+        step
+        for step in _load()[0]["jobs"]["build-deploy"]["steps"]
+        if step.get("id") == "deploy"
+    )
+    _seed_ci_templates_scripts(tmp_path)
+    _write_transport_fakes(tmp_path)
+    output = tmp_path / "github-output"
+    summary = tmp_path / "github-step-summary"
+    env = _deploy_env(tmp_path, output, extra) | {"GITHUB_STEP_SUMMARY": str(summary)}
+    completed = subprocess.run(
+        ["bash", "-c", deploy["run"]],
+        text=True,
+        capture_output=True,
+        env=env,
+        check=False,
+    )
+    github_output = output.read_text() if output.exists() else ""
+    return completed, github_output
+
+
+def test_rc3_warning_matches_intent_and_converge_status(tmp_path):
+    """rc=3 warning 须与意图及收敛器状态一致；未开 opt-in 或其他状态保持原文本。"""
+    base_warning = (
+        "::warning::deploy DEFERRED — service busy, old container kept. "
+        "Image abc1234 is already in ACR; re-run this workflow when the "
+        "service is idle (the rerun rebuilds the same immutable SHA)."
+    )
+
+    # (a) accepted + active -> 新文案，不含 re-run this workflow
+    completed, out = _run_deploy_step(
+        tmp_path / "accepted-active",
+        {
+            "DEFERRED_DEPLOY": "true",
+            "FEISHU_CI_WEBHOOK": DEFERRED_WEBHOOK,
+            "NOTIFY_ON_SUCCESS": "false",
+            "D3_REPO": "zlxlabs/ci-templates",
+            "D3_RUN_URL": "https://example.test/run/1",
+            "MOCK_REMOTE_OUTPUT": (
+                "[deploy][evidence] intent: accepted\n"
+                "[deploy][evidence] converge: active"
+            ),
+            "MOCK_REMOTE_RC": "3",
+        },
+    )
+    assert completed.returncode == 3, completed.stdout + completed.stderr
+    assert _parse_github_output(out).get("deferred") == "true"
+    assert (
+        "intent persisted on host; d3-converge will deploy this SHA "
+        "automatically when the service is idle — no re-run needed"
+    ) in completed.stdout
+    assert "re-run this workflow" not in completed.stdout
+
+    # (b) accepted + inactive (及 converge 缺失) -> enable 提示
+    for case_name, remote_out in (
+        (
+            "accepted-inactive",
+            "[deploy][evidence] intent: accepted\n[deploy][evidence] converge: inactive",
+        ),
+        ("accepted-missing-converge", "[deploy][evidence] intent: accepted"),
+    ):
+        completed, out = _run_deploy_step(
+            tmp_path / case_name,
+            {
+                "DEFERRED_DEPLOY": "true",
+                "FEISHU_CI_WEBHOOK": "",
+                "NOTIFY_ON_SUCCESS": "false",
+                "D3_REPO": "zlxlabs/ci-templates",
+                "D3_RUN_URL": "https://example.test/run/1",
+                "MOCK_REMOTE_OUTPUT": remote_out,
+                "MOCK_REMOTE_RC": "3",
+            },
+        )
+        assert completed.returncode == 3, (case_name, completed.stdout + completed.stderr)
+        assert _parse_github_output(out).get("deferred") == "true", case_name
+        assert "intent persisted on host" in completed.stdout, case_name
+        assert "not active" in completed.stdout, case_name
+        assert "scripts/converge/README.md" in completed.stdout, case_name
+        assert "re-run this workflow" not in completed.stdout, case_name
+
+    # (c) 未开 opt-in / superseded / write-failed / 空值 -> 与 Base 字节级一致
+    for case_name, deferred_flag, remote_out in (
+        ("opt-out", "false", ""),
+        ("superseded", "true", "[deploy][evidence] intent: superseded\n[deploy][evidence] converge: active"),
+        ("write-failed", "true", "[deploy][evidence] intent: write-failed\n[deploy][evidence] converge: active"),
+        ("empty-intent", "true", "remote log without markers"),
+    ):
+        completed, out = _run_deploy_step(
+            tmp_path / case_name,
+            {
+                "DEFERRED_DEPLOY": deferred_flag,
+                "FEISHU_CI_WEBHOOK": "",
+                "NOTIFY_ON_SUCCESS": "false",
+                "D3_REPO": "zlxlabs/ci-templates",
+                "D3_RUN_URL": "https://example.test/run/1",
+                "MOCK_REMOTE_OUTPUT": remote_out,
+                "MOCK_REMOTE_RC": "3",
+            },
+        )
+        assert completed.returncode == 3, (case_name, completed.stdout + completed.stderr)
+        assert _parse_github_output(out).get("deferred") == "true", case_name
+        warning_lines = [
+            line for line in completed.stdout.splitlines() if line.startswith("::warning::deploy DEFERRED")
+        ]
+        assert warning_lines == [base_warning], (case_name, warning_lines)
+
+
 def test_deferred_notify_maps_intent_status_to_severity(tmp_path):
     """(d) 延期通知 if 条件与 severity 三态(空值→P1)。"""
     raw, _ = _load()
