@@ -414,7 +414,116 @@ skip-forward 被拒绝、文件被装回正确版本。生产**不**演练探针
 （或删掉该行）即可离开下发路径——主机上已装的正确文件留着无害（旧 compose 不
 再引用、回滚不删除），主机 override 始终保持主机持有、部署不碰。
 
-## 阶段 5：收尾 —— BACKLOG 重评触发条件巡检
+## 阶段 5：deferred_deploy 推广（opt-in，忙锁延期后自动上线）
+
+ci-templates#95：忙锁延期（rc=3）后「要部署这个版本」的意图随即丢失、只能人工
+空闲后 re-run（live-recorder 曾因此连续 deferred、停摆以小时计）。解法是意图
+持久化到主机 + 主机侧收敛器空闲后自动重放，写侧、收敛器与 workflow 接线
+（C1–C3）已合并 main（`c49358c`）。本阶段把首个使用者（live-recorder）接上，
+并按「版本推广模型」推广 v2。机制与回执语义见
+[README「延期后自动上线」](../README.md#延期后自动上线deferred_deploy可选opt-in)与
+[设计稿](design/deferred-deploy-converge.md)。**本阶段全部动作由人按序执行，
+一步核一步，顺序不可换；agent 不代替人移动 v2 或改 caller。**
+
+### 5.1 canary 零回归验证（未开启 deferred_deploy）
+
+1. canary（`zlxlabs/url-parse-api`，钉 `@main`）**不开** `deferred_deploy`，推一个
+   低风险变更触发一次真实部署。
+2. 判据：部署 success、生产 http=200；job 日志中**没有** `intent:` 与 `converge:`
+   标记（未 opt-in 路径不写意图、不装收敛器工件，行为与本特性合并前逐字节一致）。
+
+### 5.2 显式推广 v2（由人执行）
+
+1. `git rev-parse main` 记下发布 SHA；`git rev-parse v2` 记下移动前旧 SHA
+   （回滚 = `git tag -f v2 <旧 sha> && git push -f origin v2`，见「版本推广模型」
+   的回滚节）。
+2. `git tag -f v2 <main sha> && git push -f origin v2`。
+3. 判据以远端为准：`git ls-remote origin refs/tags/v2` 返回的 sha 等于发布 SHA
+   （本地 tag 不算数）。
+
+### 5.3 目标主机 enable 收敛器 timer（需要 root，一次性）
+
+按 [`scripts/converge/README.md`](../scripts/converge/README.md)「首次安装
+（需要 root 一次）」节执行，以 live-recorder 实际的 `ssh_user` 为准。完成后核验：
+
+```bash
+systemctl list-timers d3-converge.timer          # timer 在列，下次触发 ≤2min
+systemctl is-active --quiet d3-converge.timer    # exit 0（部署 run 对同一命令只回传 active|inactive）
+```
+
+此步不做，之后每张延期卡都是 P1（「timer 未启用」），意图永远不会自动上线。
+
+### 5.4 live-recorder caller 开 opt-in
+
+caller 的 `with:` 块加一行 `deferred_deploy: true`。前提：忙锁门禁已在该仓上线
+（即阶段 3 的产物——compose 挂载 `.deploy-state`、任务持 `LOCK_SH`、caller 已配
+`busy_lock_file`）；没有忙锁就没有延期路径，开了 `deferred_deploy` 只会在配置校验
+阶段得到一个显式 `exit 1`。
+
+### 5.5 生产验收演练（人工持锁）
+
+按[设计稿第 7 节](design/deferred-deploy-converge.md)「生产验收判据」，在
+live-recorder 低风险时段执行：
+
+1. 在目标主机人工持住 `busy_lock_file` 指向的锁文件，模拟「服务忙」：
+   `flock -x <busy_lock_file 的值> -c 'sleep 600' &`。部署脚本对这个文件申请排他锁，
+   任何持有者（共享或排他）都会让它等到预算耗尽；低风险时段无真实任务，排他与
+   共享锁等价，这里按设计稿用排他锁。
+2. 推一个只改注释的 commit 触发部署。
+3. 判据一（延期侧）：job 红（rc=3，结论 failure）；延期卡 **P2** 送达（accepted 且
+   converge active）；主机 `~/.d3-converge/intents/<stem>.json` 出现且
+   `status=pending`、`run_number` 与 `deploy_env.GIT_SHA` 对得上本次 commit；
+   `events.jsonl` 追加 `accepted`；生产容器与 `.deploy-state/last_good_tag` 未动。
+4. 释放锁（sleep 到期，或 kill 后台的 `flock` 进程）。
+5. 判据二（收敛侧）：≤15 分钟内意图自动上线：`status=deployed`、`events.jsonl`
+   追加 `deployed`、生产跑的是本次 SHA、`.deploy-state/last_deploy_result.json`
+   更新、`last_good_tag` 推进。
+6. 判据三（一致性）：意图 status、`events.jsonl`、通知卡三处讲的是同一个 run。
+
+### 5.6 记录实跑证据
+
+在本阶段下方追加「执行记录」小节（格式照阶段 1 / 阶段 3 执行记录）：每步的 run id、
+`ls-remote` 核实的 v2 值、意图文件路径与 status 变化时间线、卡送达级别。没有记录
+不得视为推广完成。
+
+### 处置命令（日常运维，部署用户在目标主机执行）
+
+命令与 [`scripts/converge/README.md`](../scripts/converge/README.md) 一致，此处按
+场景归档。意图互斥锁是 `~/.d3-converge/intents.lock`，改 status / 删文件都必须持锁：
+
+```bash
+lock=~/.d3-converge/intents.lock
+file=~/.d3-converge/intents/<stem>.json   # stem 即文件名，ls intents/ 可见
+```
+
+- **人工放弃某个意图**（录制无限期排队、或该版本作废）：置 `abandoned` 或删除
+  意图文件。自动永不放弃——放弃永远是人的显式决定：
+  ```bash
+  flock -w 30 -x "$lock" sed -i 's/"status":"[^"]*"/"status":"abandoned"/' "$file"
+  # 或：flock -w 30 -x "$lock" rm -f -- "$file"
+  ```
+- **interrupted 重置**：收敛器启动时发现上次 `running` 无终态会置 `interrupted`、
+  发 P0 卡、**不自动重试**（生产状态未证，与 rc=4 同语义）。先上机核对生产
+  （镜像 / 容器 / `last_good_tag`），再二选一：
+  ```bash
+  # 生产已是目标版本：置 deployed，避免再跑
+  flock -w 30 -x "$lock" sed -i 's/"status":"interrupted"/"status":"deployed"/' "$file"
+  # 生产仍是旧版本、需要再试：置 pending，下一轮 timer（2min 周期）重放
+  flock -w 30 -x "$lock" sed -i 's/"status":"interrupted"/"status":"pending"/' "$file"
+  ```
+  未核对生产前不要直接改回 pending。
+- **caller workflow 文件重建 / 重命名导致 run_number 重置**：新意图的
+  `(run_number, run_attempt)` 小于存量 pending 意图，写侧拒绝覆盖（`intent:`
+  `superseded`，P2 卡），新版本不会被部署。处置 = 按「人工放弃」删除旧意图文件
+  （或置 `abandoned`），让新意图接管。该场景以年计低频，靠 pending 意图的 24h
+  周期告警暴露，不做机器自动甄别（设计稿「已否决备选方案汇总」末行）。
+
+**回滚点**：caller 把 `deferred_deploy: true` 一行删掉即回到人工 re-run 模式
+（存量意图按上文处置命令清理）。主机侧 `systemctl disable --now d3-converge.timer`
+（需 root）会让意图不再重放——**先撤 caller 的 opt-in，再 disable timer**；顺序反
+过来会出现「延期继续写意图但永不重放、每张卡都是 P1」的窗口。
+
+## 阶段 6：收尾 —— BACKLOG 重评触发条件巡检
 
 **动作**：过一遍 [docs/BACKLOG.md](BACKLOG.md) 里每条「接受不修」事项的重评
 触发条件，对照阶段 1-4 实际观察到的情况（canary 探针失败频率、忙锁延期频率、
