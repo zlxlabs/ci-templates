@@ -113,12 +113,14 @@ on:
         # self | hosted — same two values and meaning as zlxlabs/gate's gate-v2.yml
         # `runner` input (this workflow's runs-on ternary below mirrors that file's
         # mapping pattern verbatim, just without the PR/fork-guard clause a deploy
-        # job doesn't need). self = self-hosted (VM201 fleet, labels
-        # self-hosted,linux,x64,codex); hosted = GitHub-hosted ubuntu-latest.
-        # Default self since D3 migration P1 (2026-07-27): every @v1 caller deploys
-        # on the self-hosted fleet; a caller sets `runner: hosted` explicitly to
-        # opt out (emergency fallback lane, paid/free GitHub minutes).
-        description: "Deploy job runner pool: self (self-hosted VM201 fleet, default since D3 migration P1) | hosted (GitHub-hosted ubuntu-latest, explicit opt-out / emergency fallback)."
+        # job doesn't need). self = self-hosted general-purpose `ci` lane (labels
+        # self-hosted,linux,x64,ci — NOT `codex`, which is the agent_review lane
+        # carrying codex/PI credentials and sharing slot DinD cache; see #101,
+        # gate-hub#2569); hosted = GitHub-hosted ubuntu-latest.
+        # Default self since D3 migration P1 (2026-07-27): every caller deploys
+        # on the self-hosted `ci` fleet unless `runner: hosted` is set explicitly
+        # to opt out (emergency fallback lane, paid/free GitHub minutes).
+        description: "Deploy job runner pool: self (self-hosted ci lane, labels self-hosted,linux,x64,ci, default since D3 migration P1) | hosted (GitHub-hosted ubuntu-latest, explicit opt-out / emergency fallback)."
         required: false
         default: "self"
         type: string
@@ -158,10 +160,11 @@ concurrency:
 jobs:
   build-deploy:
     # Same runs-on ternary shape as zlxlabs/gate's gate-v2.yml `gate` job's
-    # control_runner mapping (control_runner == 'self-hosted-control' →
-    # self-hosted labels, else ubuntu-latest) — hosted (default) is unchanged
-    # behavior for every existing @v1 caller; self routes to the VM201 fleet.
-    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # control_runner mapping — `self` routes to the general-purpose `ci` lane
+    # (`["self-hosted","linux","x64","ci"]`), NOT `codex` (agent_review lane
+    # mounting review credentials and sharing DinD namespace; #101, gate-hub#2569).
+    # `hosted` falls back to GitHub-hosted `ubuntu-latest`.
+    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","ci"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -226,7 +229,7 @@ jobs:
 
       - name: Connect to Tailscale
         # runner 临时入 tailnet(ephemeral 节点,job 结束自动下线),才能 SSH 到内网 100.x 目标机。
-        # self 模式整段跳过:VM201 self-hosted runner 容器(默认 bridge 网络,出流量经宿主
+        # self 模式整段跳过:self-hosted `ci` lane 宿主机容器(默认 bridge 网络,出流量经宿主
         # NAT)已可直连部署目标机——宿主机本身就在 tailnet 内,不需要每次 job 再为 runner
         # 临时建一个 ephemeral tailscale 节点(2026-07-27 实测确认,d3mig T2)。
         if: inputs.runner == 'hosted'

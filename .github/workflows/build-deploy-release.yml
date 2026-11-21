@@ -23,9 +23,9 @@ on:
         description: "Tailscale-reachable IP or MagicDNS name; also the concurrency key"
         required: true
         type: string
-      # 默认使用 VM201 的 self runner；hosted 仅作应急 fallback，确保 release 仍可恢复。
+      # 默认使用通用 self-hosted `ci` lane（不落 agent_review 专用 `codex` 槽，防凭据与 DinD 混用，见 #101、gate-hub#2569）；hosted 仅作应急 fallback，确保 release 仍可恢复。
       runner:
-        description: "运行器选择：self 使用 VM201 的 self-hosted/linux/x64/codex labels；hosted 使用 ubuntu-latest 作为应急 fallback"
+        description: "运行器选择：self 使用通用 ci 槽（self-hosted/linux/x64/ci）；hosted 使用 ubuntu-latest 作为应急 fallback"
         required: false
         default: "self"
         type: string
@@ -114,7 +114,9 @@ concurrency:
 
 jobs:
   release:
-    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","codex"]') || fromJSON('["ubuntu-latest"]') }}
+    # self 路由到通用 `ci` lane（["self-hosted","linux","x64","ci"]），不用 `codex`
+    # （agent_review 专用槽，挂载评审凭据且共享 DinD 镜像空间；见 #101、gate-hub#2569）。
+    runs-on: ${{ inputs.runner == 'self' && fromJSON('["self-hosted","linux","x64","ci"]') || fromJSON('["ubuntu-latest"]') }}
     steps:
       - name: Checkout caller repo
         uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
@@ -196,7 +198,7 @@ jobs:
             done
           done < "$RUNNER_TEMP/d3-release.builds"
 
-      # self runner 在 VM201 容器经 NAT 已可达 tailnet；只有 hosted 应急 runner 需要临时入网。
+      # self runner 在 ci 宿主机容器经 NAT 已可达 tailnet；只有 hosted 应急 runner 需要临时入网。
       - name: Connect to Tailscale
         if: inputs.runner == 'hosted'
         uses: tailscale/github-action@4e4c49acaa9818630ce0bd7a564372c17e33fb4d # v2

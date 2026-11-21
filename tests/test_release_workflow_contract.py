@@ -1,5 +1,7 @@
 """Static contract checks for the independent multi-image reusable workflow."""
+import json
 from pathlib import Path
+import re
 import yaml
 WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "build-deploy-release.yml"
 SCRIPT = Path(__file__).parents[1] / "scripts" / "release_deploy.sh"
@@ -31,24 +33,46 @@ def test_release_workflow_contract_and_declared_secrets():
     assert "inputs.host" in str(raw["concurrency"]["group"])
 
 
-def test_release_runner_input_and_hosted_fallback_contract():
-    raw, trigger = load()
+def _assert_runner_ci_lane_contract(workflow_path: Path, job_name: str):
+    raw = yaml.safe_load(workflow_path.read_text())
+    trigger = raw.get("on", raw.get(True))
     runner = trigger["workflow_call"]["inputs"]["runner"]
     assert runner["type"] == "string"
     assert runner["required"] is False
     assert runner["default"] == "self"
+
+    runs_on = raw["jobs"][job_name]["runs-on"]
+    m = re.fullmatch(
+        r"\$\{\{\s*inputs\.runner\s*==\s*'self'\s*&&\s*fromJSON\('([^']+)'\)\s*\|\|\s*fromJSON\('([^']+)'\)\s*\}\}",
+        runs_on,
+    )
+    assert m is not None, f"unexpected runs-on expression: {runs_on!r}"
+    self_labels = json.loads(m.group(1))
+    hosted_labels = json.loads(m.group(2))
+    assert len(self_labels) == 4
+    assert set(self_labels) == {"self-hosted", "linux", "x64", "ci"}
+    assert "codex" not in self_labels
+    assert hosted_labels == ["ubuntu-latest"]
+    return runner
+
+
+def test_release_runner_input_and_hosted_fallback_contract():
+    runner = _assert_runner_ci_lane_contract(WORKFLOW, "release")
     description = runner["description"]
-    assert "VM201" in description
-    assert "self-hosted/linux/x64/codex" in description
+    assert "self-hosted/linux/x64/ci" in description
+    assert "codex" not in description
     assert "hosted" in description
     assert "ubuntu-latest" in description
 
-    expected_runs_on = (
-        "${{ inputs.runner == 'self' && "
-        "fromJSON('[\"self-hosted\",\"linux\",\"x64\",\"codex\"]') || "
-        "fromJSON('[\"ubuntu-latest\"]') }}"
-    )
-    assert raw["jobs"]["release"]["runs-on"] == expected_runs_on
+
+def test_build_deploy_runner_input_and_ci_lane_contract():
+    # #101: tests/test_workflow_contract.py 已超 800 行 ratchet，两条模板的
+    # self-hosted `ci` lane runs-on 契约共用本 helper 收口在此文件校验。
+    build_deploy = WORKFLOW.with_name("build-deploy.yml")
+    runner = _assert_runner_ci_lane_contract(build_deploy, "build-deploy")
+    description = runner["description"]
+    assert "self-hosted,linux,x64,ci" in description
+    assert "codex" not in description
 
 
 def test_release_tailscale_connects_only_for_hosted_runner():
