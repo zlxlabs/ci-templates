@@ -1,0 +1,9 @@
+[Unit]
+Description=Apply deferred deploy intents (d3-converge)
+After=network-online.target
+
+[Service]
+Type=oneshot
+# 安装时把 __DEPLOY_USER__ / __CONVERGE_SH__ 换成 ssh_user 及其家目录下的 converge.sh。
+User=__DEPLOY_USER__
+ExecStart=__CONVERGE_SH__
