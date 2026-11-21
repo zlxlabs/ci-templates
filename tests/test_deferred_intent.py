@@ -92,7 +92,7 @@ def _assert_no_webhook_leak(res, env: dict) -> None:
     blob = res.stdout + res.stderr
     assert WEBHOOK not in blob
     events = _events_path(env)
-    if events.exists():
+    if events.is_file():
         assert WEBHOOK not in events.read_text()
 
 
@@ -461,7 +461,11 @@ def test_concurrent_writes_keep_larger_run_number(tmp_path):
 
 
 def test_events_unwritable_does_not_replace_intent(tmp_path):
-    """events.jsonl 不可写 → write-failed，已发布的意图文件字节不变。"""
+    """events.jsonl 不可写 → write-failed，已发布的意图文件字节不变。
+
+    把 events.jsonl 换成目录，对目录做 >> 追加 root 也会失败（chmod 0444
+    在 euid=0 下无效，gate quality job 以 root 跑会假绿）。
+    """
     env = _intent_env(tmp_path)
     busy = _hold_shared(env["BUSY_LOCK_FILE"])
     try:
@@ -472,7 +476,8 @@ def test_events_unwritable_does_not_replace_intent(tmp_path):
         assert "[deploy][evidence] intent: accepted" in first.stdout
         before = _intent_path(env).read_bytes()
         events = _events_path(env)
-        events.chmod(0o444)
+        events.unlink()
+        events.mkdir()
 
         env["D3_RUN_NUMBER"] = "80"
         second = _run(env)
