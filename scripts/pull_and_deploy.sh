@@ -13,6 +13,8 @@
 #                           not acquired in time, old container untouched),
 #                           5=deploy healthy but image reconcile failed
 #                           (last_good already promoted; no auto-rollback)
+#   - deferred intent     : opt-in (INTENT_FILE_ENABLED=true); on exit 3,
+#                           persist latest deploy intent under ~/.d3-converge
 #
 # All inputs come from the environment so the build-deploy.yml job can export
 # them and so tests can inject mocks (DOCKER_BIN / CURL_BIN).
@@ -32,6 +34,7 @@ CURL_BIN="${CURL_BIN:-curl}"
 
 BUSY_LOCK_FILE="${BUSY_LOCK_FILE:-}"        # opt-in deploy gate; empty = off
 BUSY_LOCK_TIMEOUT="${BUSY_LOCK_TIMEOUT:-600}"
+INTENT_FILE_ENABLED="${INTENT_FILE_ENABLED:-}"  # opt-in deferred intent; true = on
 
 PULL_RETRIES="${PULL_RETRIES:-6}"
 PULL_RETRY_DELAY="${PULL_RETRY_DELAY:-10}"  # base seconds; backoff = delay * attempt
@@ -168,6 +171,16 @@ is_non_negative_integer() {
   [[ "$1" =~ ^[0-9]+$ ]]
 }
 
+if [ "${INTENT_FILE_ENABLED:-}" = "true" ]; then
+  _deferred_intent_src="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/deferred_intent.sh"
+  if [ ! -r "$_deferred_intent_src" ]; then
+    log "INTENT_FILE_ENABLED=true requires deferred_intent.sh next to this script"
+    exit 1
+  fi
+  . "$_deferred_intent_src"
+  unset -v _deferred_intent_src
+  validate_deferred_intent_config
+fi
 if ! is_positive_integer "$RECONCILE_CMD_TIMEOUT"; then
   log "RECONCILE_CMD_TIMEOUT must be a positive integer, got: ${RECONCILE_CMD_TIMEOUT}"
   exit 1
@@ -724,12 +737,12 @@ if [ -n "$BUSY_LOCK_FILE" ]; then
     _remain=$(( _deadline - SECONDS ))
     if [ "$_remain" -le 0 ]; then
       log "service busy: host deploy lock busy through the whole ${BUSY_LOCK_TIMEOUT}s budget — DEFERRED, old container kept"
-      exit 3
+      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && write_deferred_intent; exit 3
     fi
     _frc=0; flock -w "$_remain" -x 8 || _frc=$?
     if [ "$_frc" -eq 1 ]; then
       log "service busy: busy lock not acquired within budget — DEFERRED, old container kept"
-      exit 3
+      [ "${INTENT_FILE_ENABLED:-}" = "true" ] && write_deferred_intent; exit 3
     elif [ "$_frc" -ne 0 ]; then
       log "flock on busy lock failed with rc=${_frc} (not a lock timeout — config or host problem)"
       exit 1
