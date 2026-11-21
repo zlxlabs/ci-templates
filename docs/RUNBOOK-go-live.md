@@ -460,21 +460,22 @@ caller 的 `with:` 块加一行 `deferred_deploy: true`。前提：忙锁门禁�
 `busy_lock_file`）；没有忙锁就没有延期路径，开了 `deferred_deploy` 只会在配置校验
 阶段得到一个显式 `exit 1`。
 
-### 5.5 生产验收演练（人工持锁）
+### 5.5 生产验收演练（首选在真实录制期间触发）
 
 按[设计稿第 7 节](design/deferred-deploy-converge.md)「生产验收判据」，在
-live-recorder 低风险时段执行：
+live-recorder 实际执行：
 
-1. 在目标主机人工持住 `busy_lock_file` 指向的锁文件，模拟「服务忙」：
-   `flock -x <busy_lock_file 的值> -c 'sleep 600' &`。部署脚本对这个文件申请排他锁，
-   任何持有者（共享或排他）都会让它等到预算耗尽；低风险时段无真实任务，排他与
-   共享锁等价，这里按设计稿用排他锁。
-2. 推一个只改注释的 commit 触发部署。
+1. **首选在真实录制期间触发**（人工持锁会占住 `busy_lock_file`，从而阻止真实录制任务启动）：
+   等服务进入真实录制（例如观测主机 `/proc/locks` 确认 `busy.lock` 正被持有），再触发部署。
+   仅在长期无业务窗口且确认无需运行录制时，才用人工持锁作为备选：
+   `flock -x <busy_lock_file 的值> -c 'sleep 600' &`（部署脚本对这个文件申请排他锁，
+   任何持有者（共享或排他）都会让它等到预算耗尽）。
+2. 推一个只改注释的 commit（或触发 `workflow_dispatch`）触发部署。
 3. 判据一（延期侧）：job 红（rc=3，结论 failure）；延期卡 **P2** 送达（accepted 且
    converge active）；主机 `~/.d3-converge/intents/<stem>.json` 出现且
    `status=pending`、`run_number` 与 `deploy_env.GIT_SHA` 对得上本次 commit；
    `events.jsonl` 追加 `accepted`；生产容器与 `.deploy-state/last_good_tag` 未动。
-4. 释放锁（sleep 到期，或 kill 后台的 `flock` 进程）。
+4. 等待录制结束释放锁（若使用备选人工持锁则等 sleep 到期或 kill 后台的 `flock` 进程）。
 5. 判据二（收敛侧）：≤15 分钟内意图自动上线：`status=deployed`、`events.jsonl`
    追加 `deployed`、生产跑的是本次 SHA、`.deploy-state/last_deploy_result.json`
    更新、`last_good_tag` 推进。
@@ -485,6 +486,24 @@ live-recorder 低风险时段执行：
 在本阶段下方追加「执行记录」小节（格式照阶段 1 / 阶段 3 执行记录）：每步的 run id、
 `ls-remote` 核实的 v2 值、意图文件路径与 status 变化时间线、卡送达级别。没有记录
 不得视为推广完成。
+
+### 阶段 5 执行记录（2026-11-21）
+
+| 步 | 内容 | 证据 |
+|---|---|---|
+| 5.1 canary | `url-parse-api` 未开启 `deferred_deploy` 零回归 | `workflow_dispatch` run `44888613586` 结论为 `success`，日志中没有出现任何 `intent`/`converge` 标记 |
+| 5.2 v2 | 移动 `v2` 标签推广 | 从 `ef1f46ac472f6f3cbda55cfc2f1f842d0c28eb48`（回滚点）移到 `c514314b613ec3c19369d9d5aae7f32722033578`，已用 API 和 `git ls-remote` 两种方式回读确认 |
+| 5.3 n305 | 目标主机启用 `d3-converge.timer` | `d3-converge.timer` 已 enable，`User=<部署用户>`，`ExecStart=~/.d3-converge/bin/converge.sh`（部署用户家目录），周期 2 分钟，首轮 `Result=success` |
+| 5.4 live-recorder | caller 开启 `deferred_deploy` | PR `#123` 已合并，合并提交 `5d3965222e4b6b82b4e45fbdbce3bbe8cd40ee6a` |
+
+#### 5.5 生产验收演练实测
+
+**与 RUNBOOK 写法有偏差**：没有人工持锁（那样会阻止录制启动），而是在真实录制期间触发部署：脚本每分钟读一次 n305 的 `/proc/locks`，连续两次看到 `busy.lock` 被持有（`2026-11-21T15:51:44Z`）后，执行 `gh workflow run`。
+
+- **判据一（延期侧）**：run `44921425074`（`run_number` `137`），job 在 `16:05:07Z` 以 exit code 3 结束，结论为 `failure`；日志含 `[deploy][evidence] intent: accepted` 和 `converge: active`，通知 severity 为 `P2`。意图文件为 `~/.d3-converge/intents/opt_media_live_recorder-0875cb9f.json`，`run_number=137`，`GIT_SHA=5d3965222e4b`；events 中有 `accepted`（`16:05:07Z`）；此时 `last_good_tag` 仍为 `5ae7da4d79e1`。
+- **收敛过程**：`16:06:05Z` 起 timer 接手，`status=running`，共尝试 5 次；第 4 次在 `16:46:07Z` 因 rc=3 再次推迟（录制仍在进行），第 5 次在 `16:52:18Z` 记为 `deployed` rc=0。
+- **判据二（收敛侧）**：由于 `16:46:07Z` 时锁仍被持有，锁释放到上线的间隔不超过 6 分 11 秒，满足 15 分钟以内的要求；`last_good_tag` 推进到 `5d3965222e4b`，`last_deploy_result.json` 的 `finished_at` 为 `16:52:18Z`，容器状态 `healthy`。
+- **判据三（一致性）**：意图文件、events、通知卡里的 `run_number` 都是 `137`，三者一致。
 
 ### 处置命令（日常运维，部署用户在目标主机执行）
 

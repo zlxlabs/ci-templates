@@ -413,10 +413,13 @@ jobs:
                 value="${line:${#prefix}}"
               fi
             done <<< "$remote_output"
+            printf -v "$key" '%s' "$value"
             echo "${key}=${value}" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write ${key} output"
           }
 
           deploy_once() {
+            intent_status=""
+            converge_status=""
             if [ "${DEFERRED_DEPLOY:-}" = "true" ]; then
               ssh $SSH_OPTS "${SSH_USER}@${DEPLOY_HOST}" \
                 "mkdir -p -- '${REMOTE_DIR}' \"\$HOME/.d3-converge/bin\" \"\$HOME/.d3-converge/systemd\"" || return 255
@@ -516,7 +519,13 @@ jobs:
                 echo "::warning::transport was interrupted earlier in this run; remote state may have advanced beyond what 'deferred' implies — verify on the host if in doubt"
               fi
               echo "deferred=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write deferred output"
-              echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
+              if [ "$intent_status" = "accepted" ] && [ "$converge_status" = "active" ]; then
+                echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; intent persisted on host; d3-converge will deploy this SHA automatically when the service is idle — no re-run needed."
+              elif [ "$intent_status" = "accepted" ]; then
+                echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; intent persisted on host, but d3-converge.timer is not active — enable it per scripts/converge/README.md."
+              else
+                echo "::warning::deploy DEFERRED — service busy, old container kept. Image ${GIT_SHA} is already in ACR; re-run this workflow when the service is idle (the rerun rebuilds the same immutable SHA)."
+              fi
               exit 3
             fi
             if [ "$rc" -eq 4 ]; then
