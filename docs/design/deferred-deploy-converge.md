@@ -1,6 +1,6 @@
 # 设计稿：build-deploy 忙锁推迟后的部署意图持久化与主机侧收敛（ci-templates #95）
 
-状态：已认可，实施中（C1）
+状态：已认可，实施中（C2）
 基线：7c18471f8954ba35ec6dec60f69693f49b0cbd64。
 
 写侧 opt-in 开关（C1 落地名）：环境变量 `INTENT_FILE_ENABLED=true` 才走意图路径；未设、空、或其他值则意图代码整体跳过，现有 deferred 行为逐字节不变。意图文件路径由 `DEPLOY_DIR` 派生，caller 不传路径。下文草稿中的 `INTENT_FILE` 均指本开关（C3 的 workflow input 仍是 `deferred_deploy`）。README 推广步骤归 C4。
@@ -27,7 +27,7 @@ d3-busy-lock-gate 设计（`docs/design/d3-busy-lock-gate.md`）2026-07-23 拍�
 `${HOME}/.d3-converge/intents/<sanitized-deploy-dir>-<hash8>.json`（ssh_user 的家目录，部署用户可写）。
 
 - **否决：放 `${DEPLOY_DIR}/.deploy-state/`（与 last_good_tag、last_deploy_result.json 同目录）**。`.deploy-state` 被 compose bind mount 进容器（d3 设计明文约定，live-recorder 已挂载）；容器内 root 可写 bind mount。意图 JSON 若含「从哪个 ACR_IMAGE 拉镜像」等执行参数，容器内被攻破的进程可伪造意图，诱导宿主收敛器以攻击者选定的参数执行官方部署脚本 = 把「容器内写一个锁文件」的 DoS 面升级为「替换生产镜像」的接管面。收敛器目录树不在任何容器挂载路径内（[推断] live-recorder compose 只挂 `.deploy-state` 与媒体目录，不挂部署用户整个家目录；实施卡须在该仓复核一次挂载清单），伪造面消除。同时消除「DEPLOY_DIR 本身可能被某服务挂进容器」的不确定性——不依赖任何关于 caller compose 的假设。
-- sanitize 规则：部署目录路径剥去前导 `/`、非 `[A-Za-z0-9._-]` 替换为 `_`，追加 deploy_dir 的 sha256 前 8 位十六进制防歧义碰撞（`/opt/a_b` 与 `/opt/a/b` sanitize 后同名，hash 区分）。规则在 `pull_and_deploy.sh`（写侧）与 `converge.sh`（读侧）各实现一份共约 3 行，加一致性测试锁死两处逐字符相同——不抽共享库（BACKLOG P3「第三个使用者出现前不抽公共库」的既定纪律）。
+- sanitize 规则：部署目录路径剥去前导 `/`、非 `[A-Za-z0-9._-]` 替换为 `_`，追加 deploy_dir 的 sha256 前 8 位十六进制防歧义碰撞（`/opt/a_b` 与 `/opt/a/b` sanitize 后同名，hash 区分）。规则只在写侧（`scripts/deferred_intent.sh` 的 `sanitize_deploy_dir`）实现；收敛器不反推文件名、不需要 sanitize，部署目录从意图文件的 `deploy_env.DEPLOY_DIR` 读取（C2 拍板：两侧各一份 sanitize 的要求作废）。
 
 ### 格式
 
@@ -192,7 +192,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 **S4 单元级补充（对应实现卡的测试清单）**
 
 - `test_pull_and_deploy.py`：两处 exit 3 分支均写意图；`deploy_env` 白名单逐键正确；`(run_number, run_attempt)` 比较三态（覆盖/拒绝/同 run 高 attempt 覆盖）；意图写失败仍 `exit 3` 且带 `intent: write-failed`；`INTENT_FILE` 启用但 `BUSY_LOCK_FILE` 空 → `exit 1`；未传 `INTENT_FILE` → 不碰文件系统（现状逐字节不变）。
-- `test_converge.py`（新文件）：sanitize 规则与 `pull_and_deploy.sh` 逐字符一致（双实现一致性断言）；rc=0/3/1/4/5 → deployed/pending+attempts++/failed/failed/failed；running 残留 → interrupted 且不重试；24h 告警节流；webhook 发送不回显凭据（fake curl 断言 argv）。
+- `test_converge.py`（新文件）：rc=0/3/1/4/5 → deployed/pending+attempts++/failed/failed/failed；running 残留 → interrupted 且不重试；24h 告警节流；webhook 发送不回显凭据（fake curl 断言 argv）。收敛器不实现 sanitize。
 - `test_workflow_contract.py`：`deferred_deploy` input 声明与默认 false；opt-in 时才透传 env 与安装工件；`D3_RUN_NUMBER`/`D3_RUN_ATTEMPT` 传递；intent 标记解析进 output；黄卡三变体（accepted/superseded/write-failed→P1）的 step 存在与 `if:` 条件；未 opt-in 的 deploy step 输出与现状一致。
 
 **生产验收判据**（RUNBOOK 新阶段）：live-recorder 低风险时段人工 `flock -x` 持 busy.lock 推一个注释级 commit → 黄卡+意图落盘；释放锁 → ≤15 分钟内自动上线该 SHA；`cat intent` + `events.jsonl` + 飞书卡三处一致。
@@ -204,7 +204,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 | 卡 | 文件 | 内容 | 依赖 |
 |---|---|---|---|
 | C1 意图写入 | `scripts/pull_and_deploy.sh` + `tests/test_pull_and_deploy.py` | `write_deferred_intent()`（sanitize、白名单快照、原子写、`(run_number,run_attempt)` 比较、write-failed 标记）、INTENT_FILE/BUSY_LOCK_FILE 联动校验；两处 exit 3 接线 | 无 |
-| C2 收敛器工件 | 新增 `scripts/converge/`（converge.sh、units 模板、README）+ `tests/test_converge.py` | 状态机、意图比较 re-read、通知发送（webhook 分派+节流）、events.jsonl、interrupted 语义、systemd 安装说明（unit 首次 enable 需 root 一次性引导，工件更新走部署 run scp 无需 root） | C1 的 schema 与 sanitize 规则（先合 C1 或同 PR 分 commit） |
+| C2 收敛器工件 | 新增 `scripts/converge/`（converge.sh、units 模板、README）+ `tests/test_converge.py` | 状态机、意图比较 re-read、通知发送（webhook 分派+节流）、events.jsonl、interrupted 语义、systemd 安装说明（unit 首次 enable 需 root 一次性引导，工件更新走部署 run scp 无需 root） | C1 的 schema 与意图 JSON 格式（不依赖读侧 sanitize） |
 | C3 workflow 接线 | `.github/workflows/build-deploy.yml` + `tests/test_workflow_contract.py` | `deferred_deploy` input、D3_RUN_* env、工件安装步骤（scp 脚本变体+converge 工件，opt-in 才装）、intent 标记解析、黄卡三变体 | C1、C2 |
 | C4 文档与推广 | README、`docs/RUNBOOK-go-live.md`、本设计稿入库 `docs/design/deferred-deploy-converge.md`、（完工后）BACKLOG 巡检记录 | opt-in 用法、回执查询命令、人工放弃/中断处置、v2 推广与 live-recorder 验收步骤、release lane 同问题登记 | C3 合并后 |
 
