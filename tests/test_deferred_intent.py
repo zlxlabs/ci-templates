@@ -11,6 +11,7 @@ import json
 import re
 import stat
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -365,3 +366,122 @@ def test_disabled_without_sibling_script_still_defers(tmp_path):
     assert "intent:" not in res.stdout
     assert not (_home(env) / ".d3-converge").exists()
     _assert_no_webhook_leak(res, env)
+
+
+def _prepare_intent_lock(env: dict) -> Path:
+    converge = _home(env) / ".d3-converge"
+    converge.mkdir(mode=0o700)
+    lock = converge / "intents.lock"
+    lock.touch()
+    return lock
+
+
+def test_intent_lock_waits_then_writes(tmp_path):
+    """后台持有 intents.lock 时写入必须阻塞等待，锁释放后 accepted。"""
+    env = _intent_env(tmp_path)
+    lock = _prepare_intent_lock(env)
+    busy = _hold_shared(env["BUSY_LOCK_FILE"])
+    holder = subprocess.Popen(["flock", "-x", str(lock), "sleep", "3"])
+    try:
+        time.sleep(0.4)
+        start = time.monotonic()
+        res = _run(env)
+        elapsed = time.monotonic() - start
+    finally:
+        holder.terminate()
+        holder.wait()
+        busy.terminate()
+        busy.wait()
+
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert "[deploy][evidence] intent: accepted" in res.stdout
+    assert elapsed >= 2.2, elapsed
+    _assert_intent_payload(_load_intent(env), env)
+    _assert_no_webhook_leak(res, env)
+
+
+def test_intent_lock_timeout_emits_write_failed(tmp_path):
+    """intents.lock 持有超过 flock -w 上限 → intent: write-failed，不落盘。"""
+    env = _intent_env(tmp_path)
+    env["INTENT_LOCK_TIMEOUT"] = "2"
+    lock = _prepare_intent_lock(env)
+    busy = _hold_shared(env["BUSY_LOCK_FILE"])
+    holder = subprocess.Popen(["flock", "-x", str(lock), "sleep", "20"])
+    try:
+        time.sleep(0.4)
+        start = time.monotonic()
+        res = _run(env)
+        elapsed = time.monotonic() - start
+    finally:
+        holder.terminate()
+        holder.wait()
+        busy.terminate()
+        busy.wait()
+
+    assert res.returncode == 3, res.stdout + res.stderr
+    assert "[deploy][evidence] intent: write-failed" in res.stdout
+    assert "intent: accepted" not in res.stdout
+    assert not _intent_path(env).exists()
+    assert elapsed >= 2.2, elapsed
+    assert elapsed < 10, elapsed
+    _assert_no_webhook_leak(res, env)
+
+
+def test_concurrent_writes_keep_larger_run_number(tmp_path):
+    """两个子进程同时 deferred 写不同 run_number，最终文件保留较大的那个。"""
+    env = _intent_env(tmp_path)
+    busy = _hold_shared(env["BUSY_LOCK_FILE"])
+    results: dict[int, subprocess.CompletedProcess] = {}
+
+    def worker(run_number: int) -> None:
+        child = dict(env)
+        child["D3_RUN_NUMBER"] = str(run_number)
+        results[run_number] = _run(child)
+
+    try:
+        time.sleep(0.4)
+        t_small = threading.Thread(target=worker, args=(10,))
+        t_large = threading.Thread(target=worker, args=(20,))
+        t_small.start()
+        t_large.start()
+        t_small.join(timeout=20)
+        t_large.join(timeout=20)
+        assert not t_small.is_alive() and not t_large.is_alive()
+    finally:
+        busy.terminate()
+        busy.wait()
+
+    assert results[10].returncode == 3, results[10].stdout + results[10].stderr
+    assert results[20].returncode == 3, results[20].stdout + results[20].stderr
+    intent = _load_intent(env)
+    assert intent["run_number"] == 20
+    assert intent["run_attempt"] == 1
+    _assert_no_webhook_leak(results[10], env)
+    _assert_no_webhook_leak(results[20], env)
+
+
+def test_events_unwritable_does_not_replace_intent(tmp_path):
+    """events.jsonl 不可写 → write-failed，已发布的意图文件字节不变。"""
+    env = _intent_env(tmp_path)
+    busy = _hold_shared(env["BUSY_LOCK_FILE"])
+    try:
+        time.sleep(0.4)
+        env["D3_RUN_NUMBER"] = "50"
+        first = _run(env)
+        assert first.returncode == 3, first.stdout + first.stderr
+        assert "[deploy][evidence] intent: accepted" in first.stdout
+        before = _intent_path(env).read_bytes()
+        events = _events_path(env)
+        events.chmod(0o444)
+
+        env["D3_RUN_NUMBER"] = "80"
+        second = _run(env)
+        assert second.returncode == 3, second.stdout + second.stderr
+        assert "[deploy][evidence] intent: write-failed" in second.stdout
+        assert "intent: accepted" not in second.stdout
+        assert _intent_path(env).read_bytes() == before
+        assert json.loads(before)["run_number"] == 50
+        _assert_no_webhook_leak(second, env)
+    finally:
+        busy.terminate()
+        busy.wait()

@@ -51,30 +51,17 @@ validate_deferred_intent_config() {
   fi
 }
 
-# Persist the current deploy as the host's latest deferred intent.
-# No-op unless INTENT_FILE_ENABLED=true. Never prints webhook values.
-# On any write failure: emit intent: write-failed and return 0 so the
-# caller still exit 3 (deferred semantics unchanged).
-write_deferred_intent() {
-  [ "${INTENT_FILE_ENABLED:-}" = "true" ] || return 0
+_release_intent_lock() {
+  flock -u 7
+  exec 7>&-
+}
 
-  local converge_dir intents_dir intent_path events_file stem tmp now
-  local run_number run_attempt run_id_json notify_json result event_line
-  local existing_run existing_attempt
-
-  run_number="${D3_RUN_NUMBER-}"
-  run_attempt="${D3_RUN_ATTEMPT-}"
-
-  converge_dir="${HOME}/.d3-converge"
-  intents_dir="${converge_dir}/intents"
-  events_file="${converge_dir}/events.jsonl"
-
-  stem="$(sanitize_deploy_dir "$DEPLOY_DIR")" || { _intent_write_failed; return 0; }
-  intent_path="${intents_dir}/${stem}.json"
-
-  mkdir -p "$intents_dir" || { _intent_write_failed; return 0; }
-  chmod 0700 "$converge_dir" || { _intent_write_failed; return 0; }
-  chmod 0700 "$intents_dir" || { _intent_write_failed; return 0; }
+# Critical section: caller already holds intents.lock (fd 7).
+# Event append happens before replacing the intent file. Event write
+# failure → write-failed, leave the published intent unchanged.
+_write_deferred_intent_locked() {
+  local existing_run existing_attempt now notify_json run_id_json result
+  local event_line tmp
 
   if [ -f "$intent_path" ]; then
     existing_run="$(sed -n 's/.*"run_number":\([0-9][0-9]*\).*/\1/p' "$intent_path" 2>/dev/null)" || existing_run=""
@@ -84,10 +71,12 @@ write_deferred_intent() {
     if is_positive_integer "$existing_run" && is_positive_integer "$existing_attempt"; then
       if [ "$existing_run" -gt "$run_number" ] || { [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -gt "$run_attempt" ]; }; then
         now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || now=""
-        event_line=""
         printf -v event_line '{"event":"superseded","run_number":%s,"run_attempt":%s,"kept_run_number":%s,"kept_run_attempt":%s,"at":%s}' \
           "$run_number" "$run_attempt" "$existing_run" "$existing_attempt" "$(json_quote "$now")"
-        _append_intent_event "$events_file" "$event_line" || { _intent_write_failed; return 0; }
+        if ! _append_intent_event "$events_file" "$event_line"; then
+          _intent_write_failed
+          return 0
+        fi
         echo "[deploy][evidence] intent: superseded"
         return 0
       fi
@@ -145,14 +134,54 @@ write_deferred_intent() {
     _intent_write_failed
     return 0
   fi
+  printf -v event_line '{"event":"accepted","run_number":%s,"run_attempt":%s,"git_sha":%s,"at":%s}' \
+    "$run_number" "$run_attempt" "$(json_quote "$GIT_SHA")" "$(json_quote "$now")"
+  if ! _append_intent_event "$events_file" "$event_line"; then
+    rm -f -- "$tmp" || true
+    _intent_write_failed
+    return 0
+  fi
   if ! mv -f -- "$tmp" "$intent_path"; then
     rm -f -- "$tmp" || true
     _intent_write_failed
     return 0
   fi
-  printf -v event_line '{"event":"accepted","run_number":%s,"run_attempt":%s,"git_sha":%s,"at":%s}' \
-    "$run_number" "$run_attempt" "$(json_quote "$GIT_SHA")" "$(json_quote "$now")"
-  _append_intent_event "$events_file" "$event_line" || true
   echo "[deploy][evidence] intent: accepted"
+  return 0
+}
+
+# Persist the current deploy as the host's latest deferred intent.
+# No-op unless INTENT_FILE_ENABLED=true. Never prints webhook values.
+# On any write failure: emit intent: write-failed and return 0 so the
+# caller still exit 3 (deferred semantics unchanged).
+write_deferred_intent() {
+  [ "${INTENT_FILE_ENABLED:-}" = "true" ] || return 0
+
+  local converge_dir intents_dir intent_path events_file intent_lock stem
+  local run_number run_attempt
+
+  run_number="${D3_RUN_NUMBER-}"
+  run_attempt="${D3_RUN_ATTEMPT-}"
+
+  converge_dir="${HOME}/.d3-converge"
+  intents_dir="${converge_dir}/intents"
+  events_file="${converge_dir}/events.jsonl"
+  intent_lock="${converge_dir}/intents.lock"
+
+  stem="$(sanitize_deploy_dir "$DEPLOY_DIR")" || { _intent_write_failed; return 0; }
+  intent_path="${intents_dir}/${stem}.json"
+
+  mkdir -p "$intents_dir" || { _intent_write_failed; return 0; }
+  chmod 0700 "$converge_dir" || { _intent_write_failed; return 0; }
+  chmod 0700 "$intents_dir" || { _intent_write_failed; return 0; }
+
+  exec 7>>"$intent_lock" || { _intent_write_failed; return 0; }
+  if ! flock -w "${INTENT_LOCK_TIMEOUT:-30}" -x 7; then
+    exec 7>&-
+    _intent_write_failed
+    return 0
+  fi
+  _write_deferred_intent_locked
+  _release_intent_lock
   return 0
 }

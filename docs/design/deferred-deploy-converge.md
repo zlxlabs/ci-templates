@@ -101,7 +101,10 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 ## 3. 锁模型相容
 
-收敛器**不含任何锁逻辑**。每次尝试 = 以意图 env 调用固化的 `pull_and_deploy.sh`，锁循环（先忙锁 EX 带剩余预算 → 非阻塞探整机锁 → 被占立即放忙锁、sleep 5s clamp 重试 → 双锁在手才进替换窗口 → 预算耗尽 exit 3）原样执行。由此免费继承全部既有语义：
+收敛器**不含部署锁逻辑**（不重实现忙锁/整机锁循环）。每次尝试 = 以意图 env 调用固化的 `pull_and_deploy.sh`，锁循环（先忙锁 EX 带剩余预算 → 非阻塞探整机锁 → 被占立即放忙锁、sleep 5s clamp 重试 → 双锁在手才进替换窗口 → 预算耗尽 exit 3）原样执行。由此免费继承全部既有语义。
+
+**意图文件互斥**：写侧与 C2 对意图 JSON 的读-比较-替换（含 `status` 更新、events.jsonl 追加）必须持有 `${HOME}/.d3-converge/intents.lock`（`flock -w 30 -x`，阻塞等待、默认 30s 上限；拿不到 → `[deploy][evidence] intent: write-failed` 并仍 `exit 3`）。C2 **必须用同一把锁**，否则收敛器改 status 与 deferred 写入会竞态。这把锁只管意图记录，不是部署锁。
+
 
 - **等待期间不互持**（[实测] `scripts/pull_and_deploy.sh` 等锁循环 + `docs/design/d3-busy-lock-gate.md` 时序图）：收敛器等忙锁时不攥整机锁（不堵同主机其他服务部署），整机锁被占时不攥忙锁（admission 保持打开，录制任务照常接单）。**正在录制的任务不可能被收敛器打断**；唯一受影响窗口是替换窗口本身（`compose up` + warmup + 探针，约 30–60s，期间新 LOCK_SH 申请失败、任务不启动）——这正是忙锁门禁的既有契约，不是新增暴露。
 - 收敛器每轮尝试的时长 ≈ `BUSY_LOCK_TIMEOUT`（600s，沿用意图快照值）——忙锁预算内等到了就部署，等不到 exit 3 返回。systemd timer 周期（2min）小于忙锁预算，实际尝试节奏由收敛锁串行化，约 10–12 分钟一轮。
