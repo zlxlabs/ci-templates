@@ -1,9 +1,9 @@
 # 设计稿：build-deploy 忙锁推迟后的部署意图持久化与主机侧收敛（ci-templates #95）
 
-状态：已认可，实施中（C2）
+状态：已实施（C1–C3），推广中（C4）
 基线：7c18471f8954ba35ec6dec60f69693f49b0cbd64。
 
-写侧 opt-in 开关（C1 落地名）：环境变量 `INTENT_FILE_ENABLED=true` 才走意图路径；未设、空、或其他值则意图代码整体跳过，现有 deferred 行为逐字节不变。意图文件路径由 `DEPLOY_DIR` 派生，caller 不传路径。下文草稿中的 `INTENT_FILE` 均指本开关（C3 的 workflow input 仍是 `deferred_deploy`）。README 推广步骤归 C4。
+写侧 opt-in 开关（C1 落地名）：环境变量 `INTENT_FILE_ENABLED=true` 才走意图路径；未设、空、或其他值则意图代码整体跳过，现有 deferred 行为逐字节不变。意图文件路径由 `DEPLOY_DIR` 派生，caller 不传路径。下文草稿中的 `INTENT_FILE` 均指本开关（C3 的 workflow input 仍是 `deferred_deploy`）。README 用法与 RUNBOOK 推广阶段已由 C4 落地（README「延期后自动上线」、RUNBOOK「阶段 5：deferred_deploy 推广」）。
 
 写侧函数因 `pull_and_deploy.sh` file-size 闸（800 行）落在同目录 `scripts/deferred_intent.sh`，由主脚本在 `INTENT_FILE_ENABLED=true` 时 source。启用但该文件缺失 → 配置校验阶段 `exit 1`（fail loud）；未启用不要求该文件存在。C3 scp 部署脚本时须把 `deferred_intent.sh` 拷到同一目录。
 
@@ -73,7 +73,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 要点：
 
-- `deploy_env` 是**逐键枚举的白名单快照**（与 `build-deploy.yml` deploy step 传给远端脚本的 env 一一对应），不是任意 env 透传。收敛器只读白名单键。`GITHUB_RUN_NUMBER` / `GITHUB_RUN_ATTEMPT` 由 workflow 显式以 `D3_RUN_NUMBER` / `D3_RUN_ATTEMPT` 传入远端（[实测] 当前 `deploy_once()` 的 ssh env 未传这两个值，需新增两行）。
+- `deploy_env` 是**逐键枚举的白名单快照**（与 `build-deploy.yml` deploy step 传给远端脚本的 env 一一对应），不是任意 env 透传。收敛器只读白名单键。`GITHUB_RUN_NUMBER` / `GITHUB_RUN_ATTEMPT` 由 workflow 显式以 `D3_RUN_NUMBER` / `D3_RUN_ATTEMPT` 传入远端（C3 已接线，连同 `D3_RUN_ID` / `D3_RUN_URL` 一起进入 deploy_once() 的 ssh env）。
 - `webhook` 是通知凭据，见第 4 节的落盘决策。
 - 文件权限 `0600`，属主 = ssh_user（部署用户），与收敛器同用户。
 
@@ -98,7 +98,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 - **否决：workflow 再实现一遍 sanitize 并 scp 固化脚本**——命名规则只应有一份（写侧）；workflow 重复实现会与 rollback_safety 守卫变体、并发 run 文件名漂移。
 - **收尾清理差异**：在线部署 ssh 命令里 `rm -rf` 本 run 的远端唯一目录；被顶掉的意图所引用的脚本在写侧锁内删除，当前 pending 意图的脚本保留到下一次替换。
 - 回执复用：`do_deploy()` 成功/失败路径写的 `last_deploy_result.json`（`write_deploy_result`）与 `DEPLOY_EVENT_LOG` 钩子在收敛器重放时照常工作——**已上线的详细回执格式零新增**。deferred 时写意图失败是唯一新增的 fail-loud 分支：意图目录不可写/磁盘满时打 `[deploy][evidence] intent: write-failed` 到 stdout 并照常 `exit 3`（deferred 语义不变，workflow 侧凭标记把黄卡升级为 P1 卡）。
-- 配置校验新增一条：`INTENT_FILE` 机制启用但 `BUSY_LOCK_FILE` 为空 → `exit 1` fail fast（没有忙锁就没有 deferred，意图永不触发，纯误导配置）。
+- 配置校验新增三条（`scripts/deferred_intent.sh` 的 `validate_deferred_intent_config`，均 fail fast `exit 1`）：启用但 `BUSY_LOCK_FILE` 为空 → 没有忙锁就没有 deferred，意图永不触发，纯误导配置；启用但 `D3_RUN_NUMBER` / `D3_RUN_ATTEMPT` 不是正整数 → 两者是意图单调比较键，缺了就无法判新旧。
 
 ## 3. 锁模型相容
 
@@ -197,7 +197,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 - `test_converge.py`（新文件）：rc=0/3/1/4/5 → deployed/pending+attempts++/failed/failed/failed；running 残留 → interrupted 且不重试；24h 告警节流；webhook 发送不回显凭据（fake curl 断言 argv）。收敛器不实现 sanitize。
 - `test_workflow_contract.py`：`deferred_deploy` input 声明与默认 false；opt-in 时才透传 env 与安装工件；`D3_RUN_NUMBER`/`D3_RUN_ATTEMPT` 传递；intent 标记解析进 output；黄卡三变体（accepted/superseded/write-failed→P1）的 step 存在与 `if:` 条件；未 opt-in 的 deploy step 输出与现状一致。
 
-**生产验收判据**（RUNBOOK 新阶段）：live-recorder 低风险时段人工 `flock -x` 持 busy.lock 推一个注释级 commit → 黄卡+意图落盘；释放锁 → ≤15 分钟内自动上线该 SHA；`cat intent` + `events.jsonl` + 飞书卡三处一致。
+**生产验收判据**（已由 C4 写入 RUNBOOK「阶段 5：deferred_deploy 推广」的 5.5 节）：live-recorder 低风险时段人工 `flock -x` 持 busy.lock 推一个注释级 commit → 黄卡+意图落盘；释放锁 → ≤15 分钟内自动上线该 SHA；`cat intent` + `events.jsonl` + 飞书卡三处一致。
 
 ## 8. 拆卡清单
 
@@ -256,6 +256,8 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 不适用：本卡 Exec-Profile=readonly、Verify-Mode=not_applicable，未改任何生产文件，无新增测试函数。设计稿第 7/8 节给出了实现卡的完整测试清单与红验要求（每个新增测试在 base 7c18471 上必须失败——现状无意图机制，天然满足），由后续 C1–C4 实现卡各自落地。
 
 ## 遗留与实施前必核验项
+
+C1–C3 已实施（2026-11-21 合并 `c49358c`）；下列项中属实现卡的核验已随各卡落地，属主机侧的（1）（2）转入 RUNBOOK「阶段 5」推广执行时核验，本节保留原始核验义务不改写结论：
 
 1. [推断→实施卡核验] live-recorder compose 的挂载清单确不含部署用户家目录（第 1 节安全假设）。
 2. [推断→C2 核验] 部署目标主机 systemd 版本支持 timer+oneshot 惯用法；unit 首次 enable 的 root 引导步骤与 gate-hub onboard 流程的衔接。

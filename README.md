@@ -269,6 +269,52 @@ opt-in 用法，在 caller 的 `with:` 块加两个 input（不加则行为与�
 机制细节、锁文件挂载约定、退出码表、验收矩阵见
 [`docs/design/d3-busy-lock-gate.md`](docs/design/d3-busy-lock-gate.md)。
 
+### 延期后自动上线（`deferred_deploy`，可选·opt-in）
+
+忙锁延期的默认出路是人工空闲后 re-run。caller 加开 `deferred_deploy` 后改为**主机自动
+补上线**：延期时把「要部署这个版本」的意图（本次 run 的 env 白名单快照 + 本次实际执行
+的部署脚本字节）持久化到目标主机 `~/.d3-converge/`，忙锁空闲后由主机侧收敛器
+（systemd timer，2 分钟周期）自动重放同一段脚本字节完成上线。**GitHub job 结论仍是
+failure**（rc=3 不变，诚实反映「新 SHA 未上线」）；与默认路径的差别是延期时多发一张
+延期卡（级别见下表），且不需要手动 re-run。
+
+opt-in 用法，在 caller 的 `with:` 块加一个 input（不加则行为与现状完全一致）：
+
+```yaml
+    with:
+      # ...其余 input 照常...
+      deferred_deploy: true
+```
+
+**主机前置（一次性，需要 root）**：目标主机必须先以 root 身份执行一次收敛器的安装与
+timer enable，步骤见 [`scripts/converge/README.md`](scripts/converge/README.md)（unit
+是 system 级，enable 需要 root；root 之后的收敛器工件更新随每次部署 run 自动下发，
+无需 root）。未 enable 时意图只是躺在盘上、不会重放，延期通知会升级为 **P1**。
+
+**延期通知的级别**（按意图持久化结果与 timer 状态分流，未开启本开关的延期不发卡）：
+
+| 意图标记 | timer 状态 | 级别 | 含义与处置 |
+|---|---|---|---|
+| `accepted` | active | **P2** | 意图已持久化，空闲后自动上线，无需手动 re-run |
+| `accepted` | inactive / 未启用 | **P1** | timer 未启用，意图不会自动重放；按 converge README 用 root enable 一次 |
+| `superseded` | —（不参与分流） | **P2** | 已有更新的部署意图排队，本次不会上线（被覆盖），re-run 本 run 无效 |
+| `write-failed` 或标记缺失 | —（不参与分流） | **P1** | 意图持久化失败，自动收敛不会发生，需人工空闲后 re-run 或上机 |
+
+**回执查询**（以部署用户在目标主机执行。意图 JSON 含通知 webhook，权限 `0600`，不要
+把文件内容贴进工单或群）：
+
+```bash
+ls -l ~/.d3-converge/intents/          # 每个部署目录一个意图文件（<stem>.json）
+cat ~/.d3-converge/intents/*.json      # status: pending→running→deployed/failed/interrupted
+cat ~/.d3-converge/events.jsonl        # append-only 历史（accepted/superseded/deployed/…）
+journalctl -u d3-converge.service      # 收敛器执行日志
+```
+
+人工放弃意图、interrupted 重置、caller workflow 文件重建导致 run_number 重置的处置
+命令，见 RUNBOOK「[阶段 5：deferred_deploy 推广](docs/RUNBOOK-go-live.md)」；机制细节
+（意图按 `(run_number, run_attempt)` 单调判定、脚本固化、锁模型）见
+[`docs/design/deferred-deploy-converge.md`](docs/design/deferred-deploy-converge.md)。
+
 带 migration/一次性 compose 服务的 caller 可在 `with:` 块加一行（两条 lane 均支持；不加则
 行为与现状逐字节一致）：
 

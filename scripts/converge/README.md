@@ -15,10 +15,10 @@ home=$(getent passwd "$ssh_user" | cut -d: -f6)
 install -m 644 scripts/converge/systemd/d3-converge.service /etc/systemd/system/d3-converge.service
 install -m 644 scripts/converge/systemd/d3-converge.timer   /etc/systemd/system/d3-converge.timer
 sed -i -e "s/__DEPLOY_USER__/${ssh_user}/g" \
-       -e "s#__CONVERGE_SH__#${home}/.d3-converge/converge.sh#" \
+       -e "s#__CONVERGE_SH__#${home}/.d3-converge/bin/converge.sh#" \
        /etc/systemd/system/d3-converge.service
 install -o "$ssh_user" -g "$ssh_user" -m 755 -D \
-  scripts/converge/converge.sh "${home}/.d3-converge/converge.sh"
+  scripts/converge/converge.sh "${home}/.d3-converge/bin/converge.sh"
 systemctl daemon-reload
 systemctl enable --now d3-converge.timer
 ```
@@ -36,7 +36,7 @@ systemctl cat d3-converge.service
 
 C3 的部署 run 会 scp：
 
-- `converge.sh` → `~/.d3-converge/converge.sh`
+- `converge.sh` → `~/.d3-converge/bin/converge.sh`（与 unit `ExecStart` 同一路径，覆盖后下一轮 timer 即用新字节）
 - 本次实际执行的部署脚本 → `~/.d3-converge/scripts/<script_ref>`
 
 覆盖后下一轮 timer（`OnUnitActiveSec=2min`）即用新字节，不必 `daemon-reload`，也不必 root。
