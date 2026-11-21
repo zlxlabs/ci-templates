@@ -80,6 +80,55 @@ if [ -n "$LOCAL_REGISTRY" ] && ! is_valid_registry_host "$LOCAL_REGISTRY"; then
   exit 2
 fi
 
+# One bounded push attempt that cleans up the WHOLE process tree on deadline.
+# Deliberately not timeout(1): signalling the child's process group is an
+# implementation detail that diverges between coreutils implementations.
+# GNU coreutils kills the whole group, but the uutils default on ubuntu 26.04
+# runners only kills the direct child — a client that ignores TERM left its
+# grandchildren alive, holding the Actions log pipe until they exited on
+# their own (measured on ubuntu:26.04 / uutils 0.10.0: a `sleep 10`
+# grandchild kept the pipe open for 10.0s; GNU coreutils 9.4 closes it in
+# 2.0s). So the client runs in its own process group (setsid, util-linux;
+# the async child is never a process-group leader, so setsid does not fork
+# and $! stays the real pid) and this script TERMs, then KILLs, that group
+# itself. Exit codes keep the timeout(1) contract: 124 = deadline hit and
+# TERM sufficed, 137 = KILL was required, anything else = docker's own exit
+# status. Polling at 0.2s keeps deadlines exact to within one tick.
+push_once() (
+  local tag="$1" p polls max rc
+  setsid "$DOCKER_BIN" push "$tag" &
+  p=$!
+  polls=0
+  max=$((PUSH_TIMEOUT_SECONDS * 5))
+  while kill -0 "$p" 2>/dev/null && [ "$polls" -lt "$max" ]; do
+    sleep 0.2
+    polls=$((polls + 1))
+  done
+  if ! kill -0 "$p" 2>/dev/null; then
+    wait "$p" && rc=0 || rc=$?
+    return "$rc"
+  fi
+  kill -TERM -- "-$p" 2>/dev/null || true
+  polls=0
+  max=$((PUSH_TIMEOUT_KILL_AFTER_SECONDS * 5))
+  while kill -0 "$p" 2>/dev/null && [ "$polls" -lt "$max" ]; do
+    sleep 0.2
+    polls=$((polls + 1))
+  done
+  if kill -0 "$p" 2>/dev/null; then
+    rc=137
+  else
+    rc=124
+  fi
+  # Sweep the group even when the client already died from TERM: a stuck
+  # grandchild would otherwise outlive the attempt, still holding the log
+  # pipe (GNU timeout leaks the same way — it stops once its direct child
+  # is gone, without ever sending KILL to the group).
+  kill -KILL -- "-$p" 2>/dev/null || true
+  wait "$p" 2>/dev/null || true
+  return "$rc"
+)
+
 # An immutable SHA push is safe to retry: it always points to the same image
 # bytes. Bound every attempt so a stalled blob upload cannot keep a deployment
 # job silent for tens of minutes. Do not publish a mutable registry `latest`:
@@ -91,10 +140,7 @@ push_with_retry() {
 
   while true; do
     echo "[push] pushing ${tag} (attempt ${attempt}/${max_attempts}, timeout ${PUSH_TIMEOUT_SECONDS}s)"
-    # Do not use timeout --foreground: it would leave docker's child processes
-    # alive and holding the Actions log pipe after the client is terminated.
-    if timeout --kill-after="${PUSH_TIMEOUT_KILL_AFTER_SECONDS}s" \
-      "${PUSH_TIMEOUT_SECONDS}s" "$DOCKER_BIN" push "$tag"; then
+    if push_once "$tag"; then
       return 0
     else
       rc=$?
