@@ -256,7 +256,9 @@ compose_release() {
     readarray -t rollback_services <<< "$_svc_list"
   fi
   compose_args+=(up -d)
-  if [[ "${#rollback_services[@]}" -gt 0 ]]; then compose_args+=("${rollback_services[@]}"); fi
+  if [[ "${#rollback_services[@]}" -gt 0 ]]; then
+    compose_args+=(--no-deps "${rollback_services[@]}")
+  fi
   local compose_rc=0
   (cd "$DEPLOY_DIR" || exit 200; D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}") || compose_rc=$?
   (( compose_rc != 200 )) && MUTATED=1

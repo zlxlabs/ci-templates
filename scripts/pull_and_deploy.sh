@@ -377,7 +377,7 @@ deploy_tag() {
       return 1
     fi
     # shellcheck disable=SC2086
-    ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d $svc_list )
+    ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d --no-deps $svc_list )
   else
     ( cd "$DEPLOY_DIR" && "$DOCKER_BIN" compose up -d )
   fi
