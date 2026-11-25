@@ -97,20 +97,7 @@ volumes:
     (build_dir / "Dockerfile").write_text(
         "FROM alpine:latest\nARG BUILD_REV\nENV BUILD_REV=${BUILD_REV}\n"
     )
-    local_repo = f"{project}/image"
     remote_repo = f"registry.example.test/{project}/{image_name}"
-    for sha, rev in ((OLD_SHA, "old"), (NEW_SHA, "new")):
-        local_ref = f"{local_repo}:{sha}"
-        result = _run(
-            [docker, "build", "--build-arg", f"BUILD_REV={rev}", "-t", local_ref, str(build_dir)]
-        )
-        assert result.returncode == 0, result.stdout + result.stderr
-        result = _run([docker, "tag", local_ref, f"{remote_repo}:{sha}"])
-        assert result.returncode == 0, result.stdout + result.stderr
-        if not release:
-            result = _run([docker, "tag", local_ref, f"{image_name}:{sha}"])
-            assert result.returncode == 0, result.stdout + result.stderr
-
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir()
     docker_wrapper = bin_dir / "docker-local"
@@ -140,7 +127,22 @@ volumes:
         PULL_RETRIES="1",
         PULL_RETRY_DELAY="0",
     )
-    return docker, project, image_name, remote_repo, deploy_dir, env
+    return docker, project, image_name, remote_repo, deploy_dir, build_dir, env
+
+
+def _build_project_images(docker, project, image_name, remote_repo, build_dir, *, release):
+    local_repo = f"{project}/image"
+    for sha, rev in ((OLD_SHA, "old"), (NEW_SHA, "new")):
+        local_ref = f"{local_repo}:{sha}"
+        result = _run(
+            [docker, "build", "--build-arg", f"BUILD_REV={rev}", "-t", local_ref, str(build_dir)]
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+        result = _run([docker, "tag", local_ref, f"{remote_repo}:{sha}"])
+        assert result.returncode == 0, result.stdout + result.stderr
+        if not release:
+            result = _run([docker, "tag", local_ref, f"{image_name}:{sha}"])
+            assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _curl(path: Path, status: str):
@@ -248,20 +250,64 @@ def _assert_migration_unchanged(
     assert actual_container == expected_container, "rollback must leave migrate container ID and StartedAt unchanged"
 
 
+def _assert_rollback_app(docker, project, image_name, deploy_dir, *, release):
+    cid = subprocess.run(
+        [docker, "compose", "--project-name", project, "ps", "-a", "-q", "app"],
+        cwd=deploy_dir,
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert cid, "rollback must leave an app container"
+    state = subprocess.run(
+        [docker, "inspect", "--format", '{{.State.Running}} {{.Image}} {{index .Config.Labels "rollback-test.release"}}', cid],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip().split(" ", 2)
+    assert state[0] == "true", f"rollback app is not running: {state}"
+    old_image_id = subprocess.run(
+        [docker, "image", "inspect", "--format", "{{.Id}}", f"{image_name}:{OLD_SHA}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.strip()
+    assert state[1] == old_image_id, f"rollback app does not use OLD_SHA image: {state}"
+    if release:
+        assert state[2] == OLD_SHA, f"rollback release label is not OLD_SHA: {state}"
+
+
+def _owned_image_refs(docker, project):
+    listed = subprocess.run(
+        [docker, "image", "ls", "--format", "{{.Repository}}:{{.Tag}}"],
+        capture_output=True,
+        text=True,
+        check=True,
+    ).stdout.splitlines()
+    prefixes = (f"{project}:", f"{project}/", f"registry.example.test/{project}/")
+    return [ref for ref in listed if ref.startswith(prefixes)]
+
+
 def _cleanup_project(docker: str, project: str, deploy_dir: Path):
     compose_file = deploy_dir / ("compose.yml" if (deploy_dir / "compose.yml").exists() else "docker-compose.yml")
-    result = _run(
-        [docker, "compose", "--project-name", project, "-f", str(compose_file), "down", "--volumes", "--remove-orphans"],
-        env={**os.environ, "COMPOSE_PROJECT_NAME": project},
-        timeout=60,
-    )
-    assert result.returncode == 0, result.stdout + result.stderr
+    if compose_file.exists():
+        result = _run(
+            [docker, "compose", "--project-name", project, "-f", str(compose_file), "down", "--volumes", "--remove-orphans"],
+            env={**os.environ, "COMPOSE_PROJECT_NAME": project},
+            timeout=60,
+        )
+        assert result.returncode == 0, result.stdout + result.stderr
+    refs = _owned_image_refs(docker, project)
+    if refs:
+        result = _run([docker, "image", "rm", *refs], timeout=60)
+        assert result.returncode == 0, result.stdout + result.stderr
+    assert not _owned_image_refs(docker, project), f"project image references leaked: {project}"
 
 
 @pytest.mark.parametrize("failure_mode", ["probe_failure", "migration_failure"])
 def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, failure_mode):
     docker = _docker_or_skip()
-    docker, project, image_name, remote_repo, deploy_dir, env = _prepare_project(
+    docker, project, image_name, remote_repo, deploy_dir, build_dir, env = _prepare_project(
         tmp_path, docker, release=False
     )
     env.update(
@@ -271,6 +317,7 @@ def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, 
         HEALTHCHECK_URL="http://127.0.0.1/health",
     )
     try:
+        _build_project_images(docker, project, image_name, remote_repo, build_dir, release=False)
         _curl(Path(env["CURL_BIN"]), "200")
         first = _run(["bash", str(PULL_SCRIPT)], env=env)
         assert first.returncode == 0, first.stdout + first.stderr
@@ -293,6 +340,7 @@ def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, 
         _assert_migration_unchanged(
             snapshot, deploy_dir, project, expected_exit_code=expected_exit_code
         )
+        _assert_rollback_app(docker, project, image_name, deploy_dir, release=False)
     finally:
         _cleanup_project(docker, project, deploy_dir)
 
@@ -300,7 +348,7 @@ def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, 
 @pytest.mark.parametrize("failure_mode", ["probe_failure", "migration_failure"])
 def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, failure_mode):
     docker = _docker_or_skip()
-    docker, project, image_name, remote_repo, deploy_dir, env = _prepare_project(
+    docker, project, image_name, remote_repo, deploy_dir, build_dir, env = _prepare_project(
         tmp_path, docker, release=True
     )
     env.update(
@@ -318,6 +366,7 @@ def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, f
         "probe\thttp://127.0.0.1/health\t200\n"
     )
     try:
+        _build_project_images(docker, project, image_name, remote_repo, build_dir, release=True)
         _curl(Path(env["CURL_BIN"]), "200")
         first = _run(["bash", str(RELEASE_SCRIPT)], env=env)
         assert first.returncode == 0, first.stdout + first.stderr
@@ -340,5 +389,6 @@ def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, f
         _assert_migration_unchanged(
             snapshot, deploy_dir, project, expected_exit_code=expected_exit_code
         )
+        _assert_rollback_app(docker, project, image_name, deploy_dir, release=True)
     finally:
         _cleanup_project(docker, project, deploy_dir)
