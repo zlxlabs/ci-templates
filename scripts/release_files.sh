@@ -163,7 +163,7 @@ install_release_files() {
 
 find_bound_services() {
   local tag="${1:-${D3_RELEASE_TAG:-}}"
-  local running="" container output service source source_real target target_real relpath
+  local running="" container output service source source_real source_prefix target target_real relpath
   FORCE_RECREATE_SERVICES=()
   [[ "${#REPLACED_FILE_PATHS[@]}" -gt 0 ]] || return 0
   local compose_args=(compose)
@@ -196,7 +196,8 @@ find_bound_services() {
       for relpath in "${REPLACED_FILE_PATHS[@]}"; do
         target="$DEPLOY_DIR/$relpath"
         target_real="$(realpath -e -- "$target")" || { log "could not resolve replaced release file: $relpath" >&2; return 1; }
-        if [[ "$source_real" == "$target_real" && -z "${seen_services[$service]+x}" ]]; then
+        source_prefix="${source_real%/}"
+        if [[ ( "$source_real" == "$target_real" || "$target_real" == "$source_prefix/"* ) && -z "${seen_services[$service]+x}" ]]; then
           seen_services["$service"]=1
           FORCE_RECREATE_SERVICES+=("$service")
         fi

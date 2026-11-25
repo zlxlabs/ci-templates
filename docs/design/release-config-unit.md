@@ -122,7 +122,7 @@ file<TAB><relpath><TAB><sha256-hex>
 
 `mv` 换的是目录项；正在跑的容器 bind-mount 按 inode 打开，仍读旧字节。`compose up -d` 只在 compose 声明或镜像 tag 变化时重建容器。`nginx:alpine` **不在** manifest 镜像组里，nginx.conf 内容变化不会触发重建——主机文件已经是新哈希，读回通过，容器仍吃旧 conf。这正是 #71 要修的假绿。
 
-因此：安装非 compose 文件后，仅查询**当前部署目录的 Compose 项目** `compose ps -q`，逐个 inspect 容器；Docker 模板只输出 `.Mounts` 中 `Type=bind` 的 `Source`，命中刚替换文件 realpath 的服务才并入 `compose up -d --force-recreate`。命名卷源不做 realpath；未命中的 bind 源必须可解析，不能确认时点名路径并 fail-loud。项目外容器不参与判定；`oneshot_services` 中的服务明确排除，不 force-recreate。模板用真实 Docker CLI `--format` 渲染验证（测试用本地 Docker API fixture，不需要 daemon）；无 Docker CLI 时测试显式 skip，GitHub `ubuntu-latest` 必须执行实测。postgres 等未 bind 所声明文件的服务不会进集合，避免无故重启。
+因此：安装非 compose 文件后，仅查询**当前部署目录的 Compose 项目** `compose ps -q`，逐个 inspect 容器；Docker 模板只输出 `.Mounts` 中 `Type=bind` 的 `Source`，其 realpath 等于刚替换文件，或刚替换文件位于挂载源目录内（按 `/` 路径边界比较，避免 `/a/ng` 误命中 `/a/nginx/x`）的服务才并入 `compose up -d --force-recreate`。命名卷源不做 realpath；未命中的 bind 源必须可解析，不能确认时点名路径并 fail-loud。项目外容器不参与判定；`oneshot_services` 中的服务明确排除，不 force-recreate。模板用真实 Docker CLI `--format` 渲染验证（测试用本地 Docker API fixture，不需要 daemon）；无 Docker CLI 时测试显式 skip，GitHub `ubuntu-latest` 必须执行实测。postgres 等未 bind 所声明文件的服务不会进集合，避免无故重启。
 
 ### 回滚
 

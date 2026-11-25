@@ -558,6 +558,8 @@ def test_compose_project_bind_detection_uses_real_docker_format_output(tmp_path)
     config.write_text("managed config\n")
     other_bind = tmp_path / "other.conf"
     other_bind.write_text("unrelated bind\n")
+    prefix_bind = deploy / "ng"
+    prefix_bind.mkdir()
     rendered_log = tmp_path / "rendered.bin"
     docker_log = tmp_path / "docker-argv.log"
     containers = {
@@ -575,6 +577,14 @@ def test_compose_project_bind_detection_uses_real_docker_format_output(tmp_path)
         "project-migrate": {
             "service": "migrate",
             "mounts": [{"Type": "bind", "Source": str(config)}],
+        },
+        "project-directory-bind": {
+            "service": "frontend-directory",
+            "mounts": [{"Type": "bind", "Source": str(config.parent)}],
+        },
+        "project-prefix-bind": {
+            "service": "prefix",
+            "mounts": [{"Type": "bind", "Source": str(prefix_bind)}],
         },
         "outside-container": {
             "service": "outside",
@@ -613,7 +623,7 @@ def test_compose_project_bind_detection_uses_real_docker_format_output(tmp_path)
         f'''#!/bin/bash
 printf '%s\\n' "$*" >> "{docker_log}"
 if [[ "$1" == "compose" && " $* " == *" ps -q "* ]]; then
-  printf 'project-frontend\\nproject-backend\\nproject-migrate\\n'
+  printf 'project-frontend\\nproject-backend\\nproject-migrate\\nproject-directory-bind\\nproject-prefix-bind\\n'
   exit 0
 fi
 if [[ "$1 $2" == "ps -q" ]]; then
@@ -651,13 +661,15 @@ printf 'SERVICES=%s\\n' "${FORCE_RECREATE_SERVICES[*]}"
         server.server_close()
 
     assert result.returncode == 0, result.stdout + result.stderr
-    assert result.stdout == "SERVICES=frontend\n"
+    assert result.stdout == "SERVICES=frontend frontend-directory\n"
     assert "compose ps -q" in docker_log.read_text()
     assert "SERVICES=outside" not in result.stdout
     expected_rendered = (
         f"frontend\n{config}\n\0"
         f"backend\n{other_bind}\n\0"
         f"migrate\n{config}\n\0"
+        f"frontend-directory\n{config.parent}\n\0"
+        f"prefix\n{prefix_bind}\n\0"
     ).encode()
     assert rendered_log.read_bytes() == expected_rendered
     assert b"\\n" not in rendered_log.read_bytes()
