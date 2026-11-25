@@ -62,7 +62,9 @@ def _prepare_project(tmp_path: Path, docker: str, *, release: bool):
         condition: service_completed_successfully
   migrate:
     image: {image_name}:${{D3_RELEASE_TAG:?D3_RELEASE_TAG is required}}
-    command: ["sh", "-c", "echo run >> /state/migrate-count"]
+    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$FAIL_BUILD_REV" ] && [ "$BUILD_REV" = "$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
+    environment:
+      FAIL_BUILD_REV: ${{FAIL_BUILD_REV:-}}
     volumes:
       - migration-data:/state
 volumes:
@@ -80,7 +82,9 @@ volumes:
         condition: service_completed_successfully
   migrate:
     image: {image_name}:latest
-    command: ["sh", "-c", "echo run >> /state/migrate-count"]
+    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$FAIL_BUILD_REV" ] && [ "$BUILD_REV" = "$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
+    environment:
+      FAIL_BUILD_REV: ${{FAIL_BUILD_REV:-}}
     volumes:
       - migration-data:/state
 volumes:
@@ -128,6 +132,7 @@ volumes:
         CURL_BIN=str(bin_dir / "curl"),
         COMPOSE_PROJECT_NAME=project,
         ONESHOT_SERVICES="migrate",
+        FAIL_BUILD_REV="",
         HEALTHCHECK_WARMUP="0",
         HEALTHCHECK_INTERVAL="0",
         HEALTHCHECK_RETRIES="1",
@@ -140,6 +145,36 @@ volumes:
 
 def _curl(path: Path, status: str):
     _write_executable(path, f"#!/bin/bash\nprintf '%s' '{status}'\n")
+
+
+def _snapshot_before_rollback(
+    wrapper: Path, docker: str, project: str, snapshot: Path
+):
+    count_file = snapshot.with_suffix(".compose-up-count")
+    _write_executable(
+        wrapper,
+        f'''#!/bin/bash
+real_docker={shlex.quote(docker)}
+if [ "$1" = compose ]; then
+  is_up=0
+  for arg in "$@"; do [ "$arg" = up ] && is_up=1; done
+  if [ "$is_up" -eq 1 ]; then
+    n=$(cat {shlex.quote(str(count_file))} 2>/dev/null || echo 0)
+    n=$((n + 1)); echo "$n" > {shlex.quote(str(count_file))}
+    if [ "$n" -eq 2 ]; then
+      cid=$("$real_docker" compose --project-name {shlex.quote(project)} ps -a -q migrate)
+      "$real_docker" inspect --format '{{{{.Id}}}} {{{{.State.StartedAt}}}} {{{{.State.ExitCode}}}}' "$cid" > {shlex.quote(str(snapshot) + '.container')}
+      "$real_docker" run --rm --volumes-from "$cid" alpine:latest cat /state/migrate-count > {shlex.quote(str(snapshot) + '.count')}
+    fi
+  fi
+fi
+if [ "$1" = pull ]; then
+  "$real_docker" image inspect "$2" >/dev/null 2>&1
+  exit $?
+fi
+exec "$real_docker" "$@"
+''',
+    )
 
 
 def _curl_fail_forward_and_snapshot_migration(
@@ -156,7 +191,7 @@ n=$((n + 1))
 echo "$n" > "$count_file"
 if [ "$n" -eq 1 ]; then
   cid=$(docker compose ps -a -q migrate)
-  docker inspect --format '{{{{.Id}}}} {{{{.State.StartedAt}}}}' "$cid" > {shlex.quote(str(snapshot) + '.container')}
+  docker inspect --format '{{{{.Id}}}} {{{{.State.StartedAt}}}} {{{{.State.ExitCode}}}}' "$cid" > {shlex.quote(str(snapshot) + '.container')}
   docker run --rm --volumes-from "$cid" alpine:latest cat /state/migrate-count > {shlex.quote(str(snapshot) + '.count')}
 fi
 statuses=({status_words})
@@ -181,10 +216,13 @@ def _migration_count(docker: str, project: str, deploy_dir: Path):
     ).stdout.strip()
 
 
-def _assert_migration_unchanged(snapshot: Path, deploy_dir: Path, project: str):
+def _assert_migration_unchanged(
+    snapshot: Path, deploy_dir: Path, project: str, *, expected_exit_code: int
+):
     expected_container = Path(str(snapshot) + ".container").read_text().strip()
     expected_count = Path(str(snapshot) + ".count").read_text().strip()
-    assert expected_container.count(" ") == 1, expected_container
+    assert len(expected_container.split()) == 3, expected_container
+    assert expected_container.split()[2] == str(expected_exit_code)
     assert expected_count.splitlines() == ["run", "run"], "both forward releases must have run migrate"
     docker, = (shutil.which("docker"),)
     cid = subprocess.run(
@@ -195,7 +233,7 @@ def _assert_migration_unchanged(snapshot: Path, deploy_dir: Path, project: str):
         check=True,
     ).stdout.strip()
     actual_container = subprocess.run(
-        [docker, "inspect", "--format", "{{.Id}} {{.State.StartedAt}}", cid],
+        [docker, "inspect", "--format", "{{.Id}} {{.State.StartedAt}} {{.State.ExitCode}}", cid],
         capture_output=True,
         text=True,
         check=True,
@@ -220,7 +258,8 @@ def _cleanup_project(docker: str, project: str, deploy_dir: Path):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path):
+@pytest.mark.parametrize("failure_mode", ["probe_failure", "migration_failure"])
+def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, failure_mode):
     docker = _docker_or_skip()
     docker, project, image_name, remote_repo, deploy_dir, env = _prepare_project(
         tmp_path, docker, release=False
@@ -239,17 +278,27 @@ def test_pull_and_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path):
 
         snapshot = tmp_path / "migration-before-rollback"
         env["GIT_SHA"] = NEW_SHA
-        _curl_fail_forward_and_snapshot_migration(
-            Path(env["CURL_BIN"]), snapshot, deploy_dir, ("500", "200")
-        )
+        env["FAIL_BUILD_REV"] = "new" if failure_mode == "migration_failure" else ""
+        if failure_mode == "probe_failure":
+            _curl_fail_forward_and_snapshot_migration(
+                Path(env["CURL_BIN"]), snapshot, deploy_dir, ("500", "200")
+            )
+            expected_exit_code = 0
+        else:
+            _snapshot_before_rollback(Path(env["DOCKER_BIN"]), docker, project, snapshot)
+            _curl(Path(env["CURL_BIN"]), "200")
+            expected_exit_code = 42
         rollback = _run(["bash", str(PULL_SCRIPT)], env=env)
         assert rollback.returncode == 1, rollback.stdout + rollback.stderr
-        _assert_migration_unchanged(snapshot, deploy_dir, project)
+        _assert_migration_unchanged(
+            snapshot, deploy_dir, project, expected_exit_code=expected_exit_code
+        )
     finally:
         _cleanup_project(docker, project, deploy_dir)
 
 
-def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path):
+@pytest.mark.parametrize("failure_mode", ["probe_failure", "migration_failure"])
+def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path, failure_mode):
     docker = _docker_or_skip()
     docker, project, image_name, remote_repo, deploy_dir, env = _prepare_project(
         tmp_path, docker, release=True
@@ -276,11 +325,20 @@ def test_release_deploy_rollback_does_not_rerun_depends_on_migration(tmp_path):
 
         snapshot = tmp_path / "migration-before-rollback"
         env["D3_RELEASE_TAG"] = NEW_SHA
-        _curl_fail_forward_and_snapshot_migration(
-            Path(env["CURL_BIN"]), snapshot, deploy_dir, ("500", "200")
-        )
+        env["FAIL_BUILD_REV"] = "new" if failure_mode == "migration_failure" else ""
+        if failure_mode == "probe_failure":
+            _curl_fail_forward_and_snapshot_migration(
+                Path(env["CURL_BIN"]), snapshot, deploy_dir, ("500", "200")
+            )
+            expected_exit_code = 0
+        else:
+            _snapshot_before_rollback(Path(env["DOCKER_BIN"]), docker, project, snapshot)
+            _curl(Path(env["CURL_BIN"]), "200")
+            expected_exit_code = 42
         rollback = _run(["bash", str(RELEASE_SCRIPT)], env=env)
         assert rollback.returncode == 1, rollback.stdout + rollback.stderr
-        _assert_migration_unchanged(snapshot, deploy_dir, project)
+        _assert_migration_unchanged(
+            snapshot, deploy_dir, project, expected_exit_code=expected_exit_code
+        )
     finally:
         _cleanup_project(docker, project, deploy_dir)
