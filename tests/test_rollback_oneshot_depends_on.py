@@ -62,7 +62,7 @@ def _prepare_project(tmp_path: Path, docker: str, *, release: bool):
         condition: service_completed_successfully
   migrate:
     image: {image_name}:${{D3_RELEASE_TAG:?D3_RELEASE_TAG is required}}
-    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$FAIL_BUILD_REV" ] && [ "$BUILD_REV" = "$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
+    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$$FAIL_BUILD_REV" ] && [ "$$BUILD_REV" = "$$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
     environment:
       FAIL_BUILD_REV: ${{FAIL_BUILD_REV:-}}
     volumes:
@@ -82,7 +82,7 @@ volumes:
         condition: service_completed_successfully
   migrate:
     image: {image_name}:latest
-    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$FAIL_BUILD_REV" ] && [ "$BUILD_REV" = "$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
+    command: ["sh", "-c", 'echo run >> /state/migrate-count; if [ -n "$$FAIL_BUILD_REV" ] && [ "$$BUILD_REV" = "$$FAIL_BUILD_REV" ]; then exit 42; fi; exit 0']
     environment:
       FAIL_BUILD_REV: ${{FAIL_BUILD_REV:-}}
     volumes:
