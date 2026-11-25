@@ -279,6 +279,12 @@ def test_accepted_installs_executing_script_bytes(tmp_path):
         source = REPO_ROOT / "scripts" / "pull_and_deploy.sh"
     assert installed.read_bytes() == source.read_bytes()
     _assert_mode(installed, 0o700)
+    companion = installed.with_name(
+        f"deferred_intent.{sanitize_deploy_dir(env['DEPLOY_DIR'])}.r"
+        f"{env['D3_RUN_NUMBER']}a{env['D3_RUN_ATTEMPT']}.sh"
+    )
+    assert companion.read_bytes() == (REPO_ROOT / "scripts" / "deferred_intent.sh").read_bytes()
+    _assert_mode(companion, 0o700)
 
 
 def test_superseded_does_not_install_script(tmp_path):

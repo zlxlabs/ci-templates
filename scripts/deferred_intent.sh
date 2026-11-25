@@ -41,10 +41,11 @@ _append_intent_event() {
 # Install the executing deploy script bytes to ~/.d3-converge/scripts/<script_ref>
 # (0700, tmp + mv). src must be an explicit path from the caller.
 _install_current_deploy_script() {
-  local scripts_dir="$1" dest="$2" src="$3" tmp
+  local scripts_dir="$1" dest="$2" src="$3" companion_dest="$4" companion_src="$5" tmp
   mkdir -p "$scripts_dir" || return 1
   chmod 0700 "$scripts_dir" || return 1
   [ -n "$src" ] && [ -f "$src" ] && [ -r "$src" ] || return 1
+  [ -n "$companion_src" ] && [ -f "$companion_src" ] && [ -r "$companion_src" ] || return 1
   tmp="$(mktemp "${scripts_dir}/.script.XXXXXX")" || return 1
   if ! cp -- "$src" "$tmp"; then
     rm -f -- "$tmp" || true
@@ -56,6 +57,11 @@ _install_current_deploy_script() {
   fi
   if ! mv -f -- "$tmp" "$dest"; then
     rm -f -- "$tmp" || true
+    return 1
+  fi
+  tmp="$(mktemp "${scripts_dir}/.script.XXXXXX")" || { rm -f -- "$dest" || true; return 1; }
+  if ! cp -- "$companion_src" "$tmp" || ! chmod 0700 "$tmp" || ! mv -f -- "$tmp" "$companion_dest"; then
+    rm -f -- "$tmp" "$dest" || true
     return 1
   fi
   return 0
@@ -72,11 +78,13 @@ _remove_replaced_script() {
   [ "$old_ref" != "$new_ref" ] || return 0
   _owned_script_ref "$old_ref" || return 0
   rm -f -- "${scripts_dir}/${old_ref}" || true
+  local companion_ref="deferred_intent.${old_ref#pull_and_deploy.}"
+  rm -f -- "${scripts_dir}/${companion_ref}" || true
 }
 
 _fail_after_install() {
-  local dest="$1"
-  rm -f -- "$dest" || true
+  local dest="$1" companion_dest="$2"
+  rm -f -- "$dest" "$companion_dest" || true
   _intent_write_failed
 }
 
@@ -107,7 +115,7 @@ _release_intent_lock() {
 # After a successful replace, delete the displaced intent's script_ref in-lock.
 _write_deferred_intent_locked() {
   local existing_run existing_attempt now notify_json run_id_json result
-  local event_line tmp script_ref scripts_dir dest old_script_ref=""
+  local event_line tmp script_ref companion_ref scripts_dir dest companion_dest old_script_ref=""
 
   if [ -f "$intent_path" ]; then
     existing_run="$(sed -n 's/.*"run_number":\([0-9][0-9]*\).*/\1/p' "$intent_path" 2>/dev/null)" || existing_run=""
@@ -128,13 +136,19 @@ _write_deferred_intent_locked() {
         echo "[deploy][evidence] intent: superseded"
         return 0
       fi
+      if [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -eq "$run_attempt" ]; then
+        echo "[deploy][evidence] intent: accepted"
+        return 0
+      fi
     fi
   fi
 
   script_ref="pull_and_deploy.${stem}.r${run_number}a${run_attempt}.sh"
+  companion_ref="deferred_intent.${stem}.r${run_number}a${run_attempt}.sh"
   scripts_dir="${converge_dir}/scripts"
   dest="${scripts_dir}/${script_ref}"
-  if ! _install_current_deploy_script "$scripts_dir" "$dest" "${D3_DEPLOY_SCRIPT-}"; then
+  companion_dest="${scripts_dir}/${companion_ref}"
+  if ! _install_current_deploy_script "$scripts_dir" "$dest" "${D3_DEPLOY_SCRIPT-}" "$companion_dest" "${BASH_SOURCE[0]}"; then
     _intent_write_failed
     return 0
   fi
@@ -179,27 +193,27 @@ _write_deferred_intent_locked() {
     "$(json_quote "${BUSY_LOCK_TIMEOUT-}")" \
     "$(json_quote "${ONESHOT_SERVICES-}")"
 
-  tmp="$(mktemp "${intents_dir}/.intent.XXXXXX")" || { _fail_after_install "$dest"; return 0; }
+  tmp="$(mktemp "${intents_dir}/.intent.XXXXXX")" || { _fail_after_install "$dest" "$companion_dest"; return 0; }
   if ! printf '%s\n' "$result" > "$tmp"; then
     rm -f -- "$tmp" || true
-    _fail_after_install "$dest"
+    _fail_after_install "$dest" "$companion_dest"
     return 0
   fi
   if ! chmod 0600 "$tmp"; then
     rm -f -- "$tmp" || true
-    _fail_after_install "$dest"
+    _fail_after_install "$dest" "$companion_dest"
     return 0
   fi
   printf -v event_line '{"event":"accepted","run_number":%s,"run_attempt":%s,"git_sha":%s,"at":%s}' \
     "$run_number" "$run_attempt" "$(json_quote "$GIT_SHA")" "$(json_quote "$now")"
   if ! _append_intent_event "$events_file" "$event_line"; then
     rm -f -- "$tmp" || true
-    _fail_after_install "$dest"
+    _fail_after_install "$dest" "$companion_dest"
     return 0
   fi
   if ! mv -f -- "$tmp" "$intent_path"; then
     rm -f -- "$tmp" || true
-    _fail_after_install "$dest"
+    _fail_after_install "$dest" "$companion_dest"
     return 0
   fi
   _remove_replaced_script "$scripts_dir" "$old_script_ref" "$script_ref"
@@ -241,4 +255,124 @@ write_deferred_intent() {
   _write_deferred_intent_locked
   _release_intent_lock
   return 0
+}
+
+# Online deployments reserve the same monotonic identity before any state or
+# compose mutation. Caller holds busy and host locks; fd 7 is held only here.
+_admit_online_locked() {
+  local existing_run existing_attempt old_script_ref="" now event_line result tmp
+  local scripts_dir="${converge_dir}/scripts"
+
+  if [ -f "$intent_path" ]; then
+    existing_run="$(sed -n 's/.*"run_number":\([0-9][0-9]*\).*/\1/p' "$intent_path" 2>/dev/null)" || existing_run=""
+    existing_run="${existing_run%%$'\n'*}"
+    existing_attempt="$(sed -n 's/.*"run_attempt":\([0-9][0-9]*\).*/\1/p' "$intent_path" 2>/dev/null)" || existing_attempt=""
+    existing_attempt="${existing_attempt%%$'\n'*}"
+    old_script_ref="$(sed -n 's/.*"script_ref":"\([^"]*\)".*/\1/p' "$intent_path" 2>/dev/null)" || old_script_ref=""
+    old_script_ref="${old_script_ref%%$'\n'*}"
+    if is_positive_integer "$existing_run" && is_positive_integer "$existing_attempt"; then
+      if [ "$existing_run" -gt "$run_number" ] || { [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -gt "$run_attempt" ]; }; then
+        now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+        printf -v event_line '{"event":"superseded","run_number":%s,"run_attempt":%s,"kept_run_number":%s,"kept_run_attempt":%s,"at":%s}' \
+          "$run_number" "$run_attempt" "$existing_run" "$existing_attempt" "$(json_quote "$now")"
+        _append_intent_event "$events_file" "$event_line" || { _intent_write_failed; return 7; }
+        echo "[deploy][evidence] intent: superseded"
+        return 6
+      fi
+      if [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -eq "$run_attempt" ] \
+        && [ "$(sed -n 's/.*\"status\":\"\([^\"]*\)\".*/\1/p' "$intent_path")" = "admitted" ]; then
+        echo "[deploy][evidence] intent: admitted"
+        return 0
+      fi
+    fi
+  fi
+
+  now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  printf -v result '{"schema_version":1,"status":"admitted","repo":%s,"run_number":%s,"run_attempt":%s,"git_sha":%s,"created_at":%s,"updated_at":%s}' \
+    "$(json_quote "${D3_REPO-}")" "$run_number" "$run_attempt" \
+    "$(json_quote "$GIT_SHA")" "$(json_quote "$now")" "$(json_quote "$now")"
+  tmp="$(mktemp "${intents_dir}/.intent.XXXXXX")" || { _intent_write_failed; return 7; }
+  if ! printf '%s\n' "$result" > "$tmp" || ! chmod 0600 "$tmp"; then
+    rm -f -- "$tmp"
+    _intent_write_failed
+    return 7
+  fi
+  printf -v event_line '{"event":"admitted","run_number":%s,"run_attempt":%s,"git_sha":%s,"at":%s}' \
+    "$run_number" "$run_attempt" "$(json_quote "$GIT_SHA")" "$(json_quote "$now")"
+  if ! _append_intent_event "$events_file" "$event_line" || ! mv -f -- "$tmp" "$intent_path"; then
+    rm -f -- "$tmp"
+    _intent_write_failed
+    return 7
+  fi
+  _remove_replaced_script "$scripts_dir" "$old_script_ref" ""
+  echo "[deploy][evidence] intent: admitted"
+}
+
+admit_online_deploy() {
+  [ "${INTENT_FILE_ENABLED:-}" = "true" ] || return 0
+
+  local converge_dir intents_dir intent_path events_file intent_lock stem rc=0
+  local run_number="${D3_RUN_NUMBER-}" run_attempt="${D3_RUN_ATTEMPT-}"
+  converge_dir="${HOME}/.d3-converge"
+  intents_dir="${converge_dir}/intents"
+  events_file="${converge_dir}/events.jsonl"
+  intent_lock="${converge_dir}/intents.lock"
+  stem="$(sanitize_deploy_dir "$DEPLOY_DIR")" || { _intent_write_failed; return 7; }
+  intent_path="${intents_dir}/${stem}.json"
+  mkdir -p "$intents_dir" || { _intent_write_failed; return 7; }
+  chmod 0700 "$converge_dir" "$intents_dir" || { _intent_write_failed; return 7; }
+  exec 7>>"$intent_lock" || { _intent_write_failed; return 7; }
+  if ! flock -w "${INTENT_LOCK_TIMEOUT:-30}" -x 7; then
+    exec 7>&-
+    _intent_write_failed
+    return 7
+  fi
+  _admit_online_locked || rc=$?
+  _release_intent_lock
+  return "$rc"
+}
+
+# Called only by the replayed script after acquiring busy lock then host lock.
+# It must not deploy if the snapshot no longer owns the latest admission.
+validate_deferred_replay_admission() {
+  local converge_dir intents_dir intent_path events_file intent_lock stem
+  local existing_run existing_attempt existing_status now event_line rc=0
+  [ "${INTENT_FILE_ENABLED:-}" = "true" ] || return 0
+  converge_dir="${HOME}/.d3-converge"
+  intents_dir="${converge_dir}/intents"
+  events_file="${converge_dir}/events.jsonl"
+  intent_lock="${converge_dir}/intents.lock"
+  stem="$(sanitize_deploy_dir "$DEPLOY_DIR")" || return 7
+  intent_path="${intents_dir}/${stem}.json"
+  exec 7>>"$intent_lock" || { echo "[deploy][evidence] intent: write-failed"; return 7; }
+  if ! flock -w "${INTENT_LOCK_TIMEOUT:-30}" -x 7; then
+    exec 7>&-
+    echo "[deploy][evidence] intent: write-failed"
+    return 7
+  fi
+  existing_run=""
+  existing_attempt=""
+  existing_status=""
+  if [ -f "$intent_path" ]; then
+    existing_run="$(sed -n 's/.*"run_number":\([0-9][0-9]*\).*/\1/p' "$intent_path")"
+    existing_attempt="$(sed -n 's/.*"run_attempt":\([0-9][0-9]*\).*/\1/p' "$intent_path")"
+    existing_status="$(sed -n 's/.*"status":"\([^"]*\)".*/\1/p' "$intent_path")"
+  fi
+  if [ "$existing_run" = "$D3_RUN_NUMBER" ] && [ "$existing_attempt" = "$D3_RUN_ATTEMPT" ] \
+    && [ "$existing_status" = "running" ]; then
+    _release_intent_lock
+    return 0
+  fi
+  now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+  if ! is_positive_integer "$existing_run" || ! is_positive_integer "$existing_attempt"; then
+    existing_run=null
+    existing_attempt=null
+  fi
+  printf -v event_line '{"event":"superseded","run_number":%s,"run_attempt":%s,"kept_run_number":%s,"kept_run_attempt":%s,"at":%s}' \
+    "$D3_RUN_NUMBER" "$D3_RUN_ATTEMPT" "$existing_run" "$existing_attempt" "$(json_quote "$now")"
+  _append_intent_event "$events_file" "$event_line" || rc=7
+  echo "[deploy][evidence] intent: superseded"
+  _release_intent_lock
+  [ "$rc" -eq 0 ] && return 6
+  return "$rc"
 }

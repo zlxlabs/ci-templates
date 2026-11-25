@@ -531,6 +531,14 @@ jobs:
               fi
               exit 3
             fi
+            if [ "$rc" -eq 6 ] && [ "$intent_status" = "superseded" ]; then
+              echo "::error::deployment admission superseded this run; do not re-run this old run — trigger a new workflow run for the desired version"
+              exit 6
+            fi
+            if [ "$rc" -eq 7 ] && [ "$intent_status" = "write-failed" ]; then
+              echo "::error::deployment admission could not be recorded; no deployment mutation was started, inspect ~/.d3-converge and trigger a new workflow run after repair"
+              exit 7
+            fi
             if [ "$rc" -eq 4 ]; then
               echo "rollback_unhealthy=true" >> "$GITHUB_OUTPUT" || echo "::warning::failed to write rollback_unhealthy output"
               if [ "$rollback_safety" != "safe" ]; then

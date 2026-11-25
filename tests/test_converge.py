@@ -494,8 +494,8 @@ def test_converge_lock_held_exits_0_without_touching_intent(tmp_path):
     _assert_no_webhook_leak(res, env)
 
 
-def test_deploy_script_receives_only_whitelist_without_intent_file_enabled(tmp_path):
-    """(h) 部署脚本只收到白名单键，且不含 INTENT_FILE_ENABLED。"""
+def test_replay_script_receives_whitelist_and_locked_admission_context(tmp_path):
+    """重放只传白名单业务 env，并显式启用配对 helper 与身份复核。"""
     env = _base_env(tmp_path)
     write_intent(env)
     logs = _install_fake_script(env, rc=0)
@@ -506,9 +506,16 @@ def test_deploy_script_receives_only_whitelist_without_intent_file_enabled(tmp_p
     for key in DEPLOY_ENV_KEYS:
         assert key in recorded, key
         assert recorded[key] == env.get(key, ""), key
-    assert "INTENT_FILE_ENABLED" not in recorded
+    assert recorded["INTENT_FILE_ENABLED"] == "true"
+    assert recorded["D3_DEFERRED_REPLAY"] == "true"
+    assert recorded["D3_RUN_NUMBER"] == str(env["D3_RUN_NUMBER"])
+    assert recorded["D3_RUN_ATTEMPT"] == str(env["D3_RUN_ATTEMPT"])
+    script_ref = _load_intent(env)["script_ref"]
+    companion_ref = "deferred_intent." + script_ref.removeprefix("pull_and_deploy.")
+    scripts = _home(env) / ".d3-converge" / "scripts"
+    assert recorded["D3_DEPLOY_SCRIPT"] == str(logs["script"])
+    assert recorded["D3_DEFERRED_INTENT_SCRIPT"] == str(scripts / companion_ref)
     assert "D3_INTENT_WEBHOOK" not in recorded
-    assert "D3_RUN_NUMBER" not in recorded
     assert env["D3_INTENT_WEBHOOK"] not in recorded.values()
     _assert_no_webhook_leak(res, env)
 

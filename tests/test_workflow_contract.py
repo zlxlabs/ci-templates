@@ -1004,7 +1004,7 @@ def test_post_deploy_image_reconciliation_is_success_only_and_checks_all_layers(
         "flock -u 9"
     )
     flock_acquire = script.index("\nflock 9\n")
-    flock_release = script.index("flock -u 9", flock_acquire)
+    flock_release = script.rindex("flock -u 9")
     call_at = script.index("reconcile_deployed_image", flock_acquire)
     assert flock_acquire < call_at < flock_release
 
