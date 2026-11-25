@@ -65,3 +65,8 @@
 1. 入口：真实 pull_and_deploy.sh 与 converge.sh，真实 flock，假 docker。
 2. 步骤：A 延期 → converge 取 A 快照并等锁 → B 先上线 → 释放锁。
 3. 预期：A 无 compose 调用；last_good_tag 与镜像为 B；事件有 superseded。
+
+## 上线记录（2026-11-25）
+
+- #104、#105、#106、#107 随 PR #108、#109、#110、#111 合入，`v2` 指向 `07d738e01e2858cc6a4c67454dac9ddd7286a88e`。
+- 未做的生产演练：#104 延期重放、#107 失败回滚。
