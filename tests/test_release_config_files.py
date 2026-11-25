@@ -51,7 +51,8 @@ def normalize_file_package(tmp_path, sha, compose_bytes, conf_bytes):
     return manifest_path, tar_path
 
 
-def mock_file_install_docker(path, log, mount_source, *, compose_file, inspect_fail=False):
+def mock_file_install_docker(path, log, mount_source, *, compose_file, inspect_fail=False,
+                             recreate_fail=False):
     inspect_branch = (
         'if [ "$1" = inspect ] && [[ "$*" == *"Config.Labels"* ]]; then exit 9; fi'
         if inspect_fail else
@@ -68,6 +69,7 @@ fi'''.replace("MOUNT_SOURCE", mount_source)
         path,
         f'''#!/bin/bash
 printf '%s\\n' "$*" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" --force-recreate "* ]] && {'true' if recreate_fail else 'false'}; then exit 7; fi
 if [ "$1" = compose ] && [[ " $* " == *" ps -q "* ]] && [[ " $* " != *" --status "* ]]; then
   printf 'cid-mounted\\ncid-unbound\\n'; exit 0
 fi
@@ -464,6 +466,31 @@ def test_unresolvable_bind_source_fails_with_path_before_compose_up(tmp_path):
     assert f"could not resolve inspected bind source: {missing_source}" in out
     assert "compose ps -q" in log.read_text()
     assert not any(" up -d" in line for line in log.read_text().splitlines())
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_force_recreate_failure_has_release_config_recreate_marker(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "nginx").mkdir()
+    live_conf = deploy / "nginx" / "nginx.conf"
+    manifest_path, tar_path = normalize_file_package(
+        tmp_path, "abc123456789",
+        b"services:\n  frontend: {}\n  backend: {}\n",
+        b"release config\n",
+    )
+    env.update(RELEASE_MANIFEST=str(manifest_path), RELEASE_FILES_TAR=str(tar_path))
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()),
+        compose_file=tmp_path / "compose-env.log", recreate_fail=True,
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert "release-config-recreate" in out
+    assert "services frontend" in out
     assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 

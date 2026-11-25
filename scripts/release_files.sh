@@ -278,7 +278,10 @@ compose_release() {
       compose_rc=0
       (cd "$DEPLOY_DIR" || exit 200; D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${force_args[@]}") || compose_rc=$?
       (( compose_rc != 200 )) && MUTATED=1
-      (( compose_rc == 0 )) || return "$compose_rc"
+      if (( compose_rc != 0 )); then
+        log "release-config-recreate failed for services ${selected_services[*]} (rc=${compose_rc})" >&2
+        return "$compose_rc"
+      fi
     fi
   fi
   check_pending || return 130

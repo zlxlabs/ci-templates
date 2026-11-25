@@ -212,7 +212,7 @@ Compose 对每个文件**先逐文件插值、后合并**。仓库 compose 里�
 [release][config-rollback] sha=<12hex> result=restored|skipped-no-file-records|missing-tar
 ```
 
-`result=` 取值封闭。mismatch 必须同时打 `::error::`，避免只靠脚本日志。
+`result=` 取值封闭。mismatch 必须同时打 `::error::`，避免只靠脚本日志。定向 `--force-recreate` 命令失败时额外输出 `[release] release-config-recreate failed for services <names> (rc=<n>)`，确保该关键应用闸可 grep 且失败显式进入部署失败/回滚路径。
 
 **skip-forward**（同 SHA 已在 `last_good_release`）：无声明文件时保持原行为；仅声明 compose 文件时先读回 live 哈希，全部匹配才允许 skip。声明了任一受管非-compose 配置文件时，即使磁盘哈希匹配也禁止 skip，重跑完整安装、按当前 bind 关系定向重建；哈希不匹配同样完整重下发。这样既修复漂移假绿，也保证同 SHA 配置重跑不以主机文件哈希代替容器应用。
 
