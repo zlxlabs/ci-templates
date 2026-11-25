@@ -1871,7 +1871,7 @@ if [ "$1" = "pull" ] && [ "$#" -eq 2 ]; then exit 0; fi
 if [ "$1" = "tag" ] && [ "$#" -eq 3 ]; then exit 0; fi
 if [ "$1" = "compose" ] && [ "$2" = "up" ] && [ "$3" = "-d" ]; then
   [ "$#" -eq 3 ] && exit 0
-  [ "$#" -eq 4 ] && [ "$4" = "app" ] && exit 0
+  [ "$#" -eq 5 ] && [ "$4" = "--no-deps" ] && [ "$5" = "app" ] && exit 0
 fi
 echo "unexpected-docker: $*" >&2
 exit 97
@@ -1891,7 +1891,7 @@ def _assert_compose_up_services(line: str, *, include: tuple[str, ...], exclude:
     idx = parts.index("-d")
     services = parts[idx + 1 :]
     for name in include:
-        assert name in services, (line, services)
+        assert name in services and "--no-deps" in services, (line, services)
     for name in exclude:
         assert name not in services, (line, services)
 

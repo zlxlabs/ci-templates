@@ -1558,7 +1558,7 @@ def _assert_compose_up_services(line: str, *, include: tuple[str, ...], exclude:
     idx = parts.index("-d")
     services = parts[idx + 1 :]
     for name in include:
-        assert name in services, (line, services)
+        assert name in services and "--no-deps" in services, (line, services)
     for name in exclude:
         assert name not in services, (line, services)
 

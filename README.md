@@ -59,11 +59,13 @@ services:
 `oneshot_services` 是可选 compose 一次性/迁移服务声明（默认 `""` = 完全保持现状，50+
 存量 caller 零回归）。值为**空格分隔**的 compose 服务名（不是 ACR 镜像名）。**forward
 路径行为不变**：仍是无服务参数的 `compose up -d`，migrate 照常跑。**只在回滚路径**
-把 compose up 收窄为「全部服务 − 声明集合」，防止旧镜像重跑已执行过的 migration（issue
-#24 事故根因：库已被新版本向前迁移后，旧 migration 镜像不认识当前 revision，回滚本身
-失败、生产停摆）。服务名有效性在 forward 路径、碰生产前的 `compose up` 之前校验——写错
-则 fail-loud 点名，不会拖到回滚时才炸。若声明集合覆盖了 compose 中的全部服务，回滚会
-拒绝执行（避免空服务列表退化成全量 up）。
+把 compose up 收窄为「全部服务 − 声明集合」，并加 `--no-deps`，防止 Compose 按
+`depends_on` 重建并重跑已执行过的 migration（issue #24 事故根因：库已被新版本向前迁移后，
+旧 migration 镜像不认识当前 revision，回滚本身失败、生产停摆）。回滚服务列表已包含全部
+未声明为 oneshot 的服务，因此 `--no-deps` 不会补起被排除的迁移服务，也不再按
+`depends_on` 执行启动顺序或健康等待；回滚后的探针重试仍负责验证应用健康。服务名有效性在
+forward 路径、碰生产前的 `compose up` 之前校验——写错则 fail-loud 点名，不会拖到回滚时才炸。
+若声明集合覆盖了 compose 中的全部服务，回滚会拒绝执行（避免空服务列表退化成全量 up）。
 
 构建仍使用不可变 `${GITHUB_SHA::12}`。远端脚本分两个阶段运行：先在锁外拉取并校验这次发布的
 不可变 SHA 镜像并 retag 为 `<image_name>:<sha>`，完成本地 staging；随后才按忙锁 → host `flock`
