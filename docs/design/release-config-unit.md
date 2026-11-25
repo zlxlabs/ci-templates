@@ -122,7 +122,7 @@ file<TAB><relpath><TAB><sha256-hex>
 
 `mv` 换的是目录项；正在跑的容器 bind-mount 按 inode 打开，仍读旧字节。`compose up -d` 只在 compose 声明或镜像 tag 变化时重建容器。`nginx:alpine` **不在** manifest 镜像组里，nginx.conf 内容变化不会触发重建——主机文件已经是新哈希，读回通过，容器仍吃旧 conf。这正是 #71 要修的假绿。
 
-因此：安装非 compose 文件后，对**当前正在跑、Mount.Source realpath 命中刚替换文件**的容器，取其 `com.docker.compose.service` 标签，把这些服务并入本次 `compose up -d --force-recreate`。检测失败（inspect 超时/无标签）fail-loud，禁止「检测不到就当无 bind」。postgres 镜像不被 bind 到所声明文件时不会进这个集合，避免无故重启数据库。
+因此：安装非 compose 文件后，仅查询**当前部署目录的 Compose 项目** `compose ps -q`，逐个 inspect 容器；Docker 模板只输出 `.Mounts` 中 `Type=bind` 的 `Source`，命中刚替换文件 realpath 的服务才并入 `compose up -d --force-recreate`。命名卷源不做 realpath；未命中的 bind 源必须可解析，不能确认时点名路径并 fail-loud。项目外容器不参与判定；`oneshot_services` 中的服务明确排除，不 force-recreate。模板用真实 Docker CLI `--format` 渲染验证（测试用本地 Docker API fixture，不需要 daemon）；无 Docker CLI 时测试显式 skip，GitHub `ubuntu-latest` 必须执行实测。postgres 等未 bind 所声明文件的服务不会进集合，避免无故重启。
 
 ### 回滚
 
@@ -214,7 +214,7 @@ Compose 对每个文件**先逐文件插值、后合并**。仓库 compose 里�
 
 `result=` 取值封闭。mismatch 必须同时打 `::error::`，避免只靠脚本日志。
 
-**skip-forward**（今日 `:691-694`，同 SHA 已在 last_good）：先读回 live 哈希。全部匹配才允许 skip；任一 mismatch 则**禁止 skip**，落入完整 `deploy_group` 重新下发。否则「哈希当替代」会在重跑时把漂移当成成功。
+**skip-forward**（同 SHA 已在 `last_good_release`）：无声明文件时保持原行为；仅声明 compose 文件时先读回 live 哈希，全部匹配才允许 skip。声明了任一受管非-compose 配置文件时，即使磁盘哈希匹配也禁止 skip，重跑完整安装、按当前 bind 关系定向重建；哈希不匹配同样完整重下发。这样既修复漂移假绿，也保证同 SHA 配置重跑不以主机文件哈希代替容器应用。
 
 零条 `file` 记录时不打 verify 行、不改变 skip-forward——旧 caller 零回归。
 
