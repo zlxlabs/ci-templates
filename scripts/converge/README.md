@@ -38,6 +38,7 @@ C3 的部署 run 会 scp：
 
 - `converge.sh` → `~/.d3-converge/bin/converge.sh`（与 unit `ExecStart` 同一路径，覆盖后下一轮 timer 即用新字节）
 - 本次实际执行的部署脚本 → `~/.d3-converge/scripts/<script_ref>`
+- 与脚本配对的 `deferred_intent.sh` → 同目录的 `deferred_intent.<stem>.r<run_number>a<run_attempt>.sh`；收敛器先核实伴侣存在，重放脚本在忙锁与主机锁内再次核对 latest admission
 
 覆盖后下一轮 timer（`OnUnitActiveSec=2min`）即用新字节，不必 `daemon-reload`，也不必 root。
 
@@ -56,18 +57,17 @@ journalctl -u d3-converge.service -n 50 --no-pager
 
 ## 人工放弃
 
-自动永不放弃。人要放弃某个意图时，持 `intents.lock` 把 `status` 置 `abandoned`，或删除意图文件：
+自动永不放弃。人要停止某个 pending 意图的自动重放时，持 `intents.lock` 把 `status` 置 `abandoned`：
 
 ```bash
 lock=~/.d3-converge/intents.lock
 file=~/.d3-converge/intents/<stem>.json   # stem 即文件名，ls intents/ 可见
 
-# 置 abandoned（下一轮收敛器跳过）
+# 下一轮收敛器跳过；记录保留为 run_number/run_attempt 单调水位
 flock -w 30 -x "$lock" sed -i 's/"status":"[^"]*"/"status":"abandoned"/' "$file"
-
-# 或删除意图文件
-flock -w 30 -x "$lock" rm -f -- "$file"
 ```
+
+`abandoned` 不会放低身份水位；不得靠删除记录让低编号 run 接管。删除前必须证明旧 workflow run 已不可再触发，否则会重新放行旧请求。新版本 B 接纳后，手工重跑旧 run A 会被锁内拒绝（rc=6），且不执行部署脚本。
 
 ## interrupted 重置
 

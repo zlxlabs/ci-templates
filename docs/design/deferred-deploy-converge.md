@@ -79,19 +79,19 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 ### 单调判定：`(run_number, run_attempt)` 字典序
 
-写侧（deferred 时）规则：已存在意图且其 `(run_number, run_attempt)` **严格大于**本次 → 拒绝覆盖，stdout 打 `[deploy][evidence] intent: superseded`，照常 `exit 3`；否则（大于等于 → 覆盖，含同 run 高 attempt 的 re-run）原子替换，打 `intent: accepted`。旧意图被覆盖前先追加一行到 `${HOME}/.d3-converge/events.jsonl`（append-only 历史：谁被谁顶掉）。
+所有接纳写入（在线与延期）共用同一 `intents/<stem>.json` 最新身份记录，并按 `(run_number, run_attempt)` 字典序比较。在线部署拿齐忙锁与主机锁后、首次线上变更前持 `intents.lock`：若现有身份更大，记录 `superseded` 事件并返回专用 rc=6；否则原子写入一个 `status=admitted` 的终态水位记录（不带重放载荷），再释放 intents.lock 开始部署。接纳写入失败返回 rc=7 并 fail closed，不执行部署。延期写入同样拒绝更大身份，但仍返回既有 rc=3；较新身份原子替换为带载荷的 `pending` 记录。相同身份且现有状态为 `pending` / `running` 时，延期重送是幂等 no-op；若相同身份的在线接纳状态为 `admitted`（例如 SSH 255 后 workflow 重试再遇忙锁），延期写入必须改写为携带载荷的 `pending` 并固化脚本，不能把 `admitted` 假报成可重放的 accepted。在线 B 被接纳后，即使部署失败并回滚，记录也不倒退；手工重跑较旧 A（拿到在线锁后）被拒，workflow 明确要求触发新 run。
 
 - **拍板 run 序号，否决 git 提交时间**：commit 时间可伪造、rebase/force-push 后旧 commit 的 author/commit time 可晚于新 commit；deferred 的 re-run 还是同一个 commit。GitHub run 序列才是「发布意图」的真实顺序。
 - **否决 run 侧 created_at 时间戳比较**：runner/主机时钟漂移可在数秒级乱序，恰好落在两个连续 deferred run 的窗口内（#130/#131 相隔 17 分钟尚安全，但不能依赖时钟）。
 - **否决收敛器本地自增序号**：主机重装、多 run 并发写时本地计数漂移，且 GitHub 已提供免维护的单调数。
-- [推断] GitHub 保证同一 workflow 文件在同一 repo 内 `run_number` 按触发顺序单调递增；`re-run` 保留 run_number、attempt 递增。已知的失效场景：caller **重建/重命名 workflow 文件**可能重置 run_number，导致新部署意图永远小于旧意图而被静默拒绝。该场景以年计低频，后果可用 24h 周期告警暴露（收敛器持续 pending 的告警照发），处置 = 人工删除意图文件（RUNBOOK 记载）。不建证明机器自动甄别（BACKLOG「拆除 255 后自动判成功证明机器」同款理由：证明条件可被历史污染，维护面大于价值）。
-- 这个比较键自动给出正确行为的两个既有习惯场景：(a) 旧黄卡的手动 re-run（attempt+1，run_number 不变）在有更新意图 pending 时被拒——旧版本 re-run 不会回退掉新版本；(b) GitHub concurrency `deploy-<host>`（`cancel-in-progress: false`）已保证同主机 run 按 run_number 串行执行，写侧天然按序。
+- [推断] GitHub 保证同一 workflow 文件在同一 repo 内 `run_number` 按触发顺序单调递增；`re-run` 保留 run_number、attempt 递增。已知的失效场景：caller **重建/重命名 workflow 文件**可能重置 run_number，导致新部署意图小于 latest 记录而被明确拒绝。不得删除 / abandoned 该记录以降低水位；优先恢复原 workflow 身份并触发更大编号的新 run。已重置时暂停部署，另行制定可证明旧 run 已失效的迁移方案（RUNBOOK 记载）。不建证明机器自动甄别（BACKLOG「拆除 255 后自动判成功证明机器」同款理由：证明条件可被历史污染，维护面大于价值）。
+- 这个比较键自动给出正确行为的两个既有习惯场景：(a) 旧黄卡的手动 re-run（attempt+1，run_number 不变）在有更高 latest 身份（无论 `pending` 或 `admitted`）时被拒——旧版本 re-run 不会回退掉新版本；(b) GitHub concurrency `deploy-<host>`（`cancel-in-progress: false`）已保证同主机 run 按 run_number 串行执行，写侧天然按序。
 
 ## 2. 执行契约一致
 
 **原则：收敛器零部署逻辑。** 它不重实现探针、回滚、对账、忙锁循环中的任何一个；它只做「按意图快照的 env，重放同一次部署所用的同一个脚本字节」。
 
-- **脚本固化**：`script_ref` 命名只在写侧定义，`script_ref` = `pull_and_deploy.<stem>.r<run_number>a<run_attempt>.sh`（`stem` 来自 `sanitize_deploy_dir`；每个意图一对一绑定自己的脚本文件，从不覆盖其他意图正在引用的字节）。`write_deferred_intent` 在持有 `intents.lock`、写入 accepted 意图的同一个临界区里，把**当前正在执行的脚本本身**（调用方传入的 `D3_DEPLOY_SCRIPT`，即本次 run 实际执行的那份字节：`safe` 时是仓内原件；`unsafe`/`conditional` 时是 workflow awk 注入守卫后 scp 上来的那份）原子安装到 `${HOME}/.d3-converge/scripts/<script_ref>`（0700，tmp + mv）。顺序：先装本意图的脚本，再追加事件，最后替换意图；任一步失败：删掉刚装的这个文件、打 write-failed、旧意图和旧脚本都不动。superseded 时不装。替换成功后仍在锁内删除被顶掉的旧意图 `script_ref`（只删 `scripts/` 下校验过格式的那个文件名）。workflow 不再实现 sanitize，也不再单独 scp 固化脚本。**执行契约由此字节级一致**：守卫、探针预算、回滚语义、对账、回执写入全部是同一段代码。
+- **脚本固化与锁内重放校验**：`script_ref` = `pull_and_deploy.<stem>.r<run_number>a<run_attempt>.sh`，其不可变伴侣为 `deferred_intent.<stem>.r<run_number>a<run_attempt>.sh`。延期写入在 `intents.lock` 内安装当前执行脚本与同版 `deferred_intent.sh`（均 0700），然后发布 pending 记录；替换旧记录时同时清理已校验命名的旧脚本和伴侣。收敛器只在伴侣存在时重放，并给子脚本显式传 `INTENT_FILE_ENABLED=true`、run identity、脚本与伴侣路径。收敛器先把自己的意图置 `running` 并释放 intents.lock；子脚本拿齐忙锁和主机锁后再持 intents.lock 核对记录仍是自己的 running 身份；不匹配即 rc=6、记 superseded、释放锁，不触发 compose。在线接纳替换 pending 后会清掉被替换的旧脚本与伴侣。旧 intent 若缺少伴侣，收敛器不执行，将其置 failed、记 `legacy-script-rejected` 并告警 P1。
 - **否决：脚本快照写进 STATE_DIR/意图文件同目录**——即第 1 节否决过的容器可写位置，不赘述。
 - **否决：收敛器运行时从 GitHub 拉脚本**——主机无 GitHub 凭据（CI_TEMPLATES_PAT 已废，runbook 明载），离线不可用，且把「部署脚本内容」这一执行契约绑到收敛时刻的网络与权限状态上。
 - **否决：意图记录存脚本内容或哈希供收敛器校验**——校验基准与被校验对象在同一可写位置时校验无意义；脚本由写侧在 `intents.lock` 内安装到收敛器目录，安装通道本身即信任锚（与今天 scp 部署脚本到 /tmp 同一信任模型：workflow 把本次字节交到主机，写侧再从正在执行的那份拷到持久且容器不可见的路径）。
@@ -104,12 +104,12 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 收敛器**不含部署锁逻辑**（不重实现忙锁/整机锁循环）。每次尝试 = 以意图 env 调用固化的 `pull_and_deploy.sh`，锁循环（先忙锁 EX 带剩余预算 → 非阻塞探整机锁 → 被占立即放忙锁、sleep 5s clamp 重试 → 双锁在手才进替换窗口 → 预算耗尽 exit 3）原样执行。由此免费继承全部既有语义。
 
-**意图文件互斥**：写侧与 C2 对意图 JSON 的读-比较-替换（含 `status` 更新、events.jsonl 追加）必须持有 `${HOME}/.d3-converge/intents.lock`（`flock -w 30 -x`，阻塞等待、默认 30s 上限；拿不到 → `[deploy][evidence] intent: write-failed` 并仍 `exit 3`）。C2 **必须用同一把锁**，否则收敛器改 status 与 deferred 写入会竞态。这把锁只管意图记录，不是部署锁。
+**意图文件互斥与锁序**：在线部署顺序固定为 busy lock → HOST_LOCK → `intents.lock`，比较 / 替换后立即释放 intents.lock，部署中绝不持有它。延期写入只持 intents.lock；收敛器读 / 置 running 后释放 intents.lock，再调用子脚本取 busy lock → HOST_LOCK → intents.lock 做最终身份核对。收敛器等部署锁前不持 intents.lock，因此没有锁环。锁内写侧与状态回写均使用同一把锁；在线接纳写失败以 rc=7 拒绝部署，延期写失败仍按原语义 rc=3 并标 write-failed。
 
 
 - **等待期间不互持**（[实测] `scripts/pull_and_deploy.sh` 等锁循环 + `docs/design/d3-busy-lock-gate.md` 时序图）：收敛器等忙锁时不攥整机锁（不堵同主机其他服务部署），整机锁被占时不攥忙锁（admission 保持打开，录制任务照常接单）。**正在录制的任务不可能被收敛器打断**；唯一受影响窗口是替换窗口本身（`compose up` + warmup + 探针，约 30–60s，期间新 LOCK_SH 申请失败、任务不启动）——这正是忙锁门禁的既有契约，不是新增暴露。
 - 收敛器每轮尝试的时长 ≈ `BUSY_LOCK_TIMEOUT`（600s，沿用意图快照值）——忙锁预算内等到了就部署，等不到 exit 3 返回。systemd timer 周期（2min）小于忙锁预算，实际尝试节奏由收敛锁串行化，约 10–12 分钟一轮。
-- **应用前核对最新意图**：`converge.sh` 读意图 → 快照 `(run_number, run_attempt)` 与全部 env → 调脚本。执行期间新 deferred run 原子替换意图文件不影响进行中的进程（env 已入进程）。rc=0 后 re-read：文件仍是自己应用的意图 → 置 `status=deployed`；已被更新意图替换 → 新意图保持 pending，下一轮 timer 收敛（最终一致收敛到最新版本）。短暂中间态（文件已显示新意图 pending、生产还在跑旧意图版本）由 events.jsonl 与下一轮收敛消除。
+- **应用前核对最新接纳**：`converge.sh` 读 pending 意图 → 快照 `(run_number, run_attempt)` 与 env → 置 running 并释放 intents.lock → 调配对脚本。脚本拿齐忙锁与 HOST_LOCK 后，在首次线上变更前重新持 intents.lock 确认该身份仍是 running；若 B 已在线接纳，A 不触发 compose。执行期间新 deferred 请求仍可替换意图；rc=0 后 converge re-read：文件仍是自己应用的身份才置 deployed；已被替换则新意图保持 pending，下一轮收敛。
 - **与手动部署并发**：真人/Agent 手动跑 workflow 部署时，与收敛器在主机侧由 HOST_LOCK（fd 9）串行化、服务侧由忙锁竞争；双方锁申请顺序固定「先忙锁后整机锁」，不构成环。GitHub concurrency 域（workflow 之间）与收敛器域（主机侧）互不感知，靠主机锁兜底——与今天「GitHub concurrency + SSH flock 双层」的既有设计同一结构。
 - **收敛器自身的并发保护**：`flock -n ${HOME}/.d3-converge/converge.lock`（防 timer 触发重叠实例），非阻塞拿不到即退出（上一实例还在跑）。
 
@@ -121,6 +121,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 | status | 卡面四态 | 谁写 | 语义 |
 |---|---|---|---|
+| `admitted` | 在线请求已接纳 | 在线 `pull_and_deploy.sh` | latest 身份水位；不含重放载荷，收敛器跳过 |
 | `pending` | 已接收 | deferred 的 `pull_and_deploy.sh` | 意图已持久化，等待空闲窗口 |
 | `running` | 已接收（执行中） | converge.sh 执行前置位 | 收敛器正持有/等待锁执行该意图 |
 | `deployed` | 已上线 | converge.sh rc=0 后置位 | 详细回执在既有 `last_deploy_result.json`（零新格式） |
@@ -128,7 +129,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 | `interrupted` | 失败（变体） | converge.sh 启动时发现上次 running 无终态 | 上次执行被中断（kill/主机重启），生产状态未证 |
 | `abandoned` | 放弃 | **仅人工显式动作** | 见第 5 节 |
 
-历史追加 `events.jsonl`：accepted / superseded / attempt(rc=N) / deployed / failed / interrupted / alert-throttled 每事件一行。回读 = `cat` 两个文件；journald 另有 converge 单元日志。
+历史追加 `events.jsonl`：accepted / admitted / superseded / legacy-script-rejected / attempt(rc=N) / deployed / failed / interrupted / alert-throttled 每事件一行。回读 = `cat` 两个文件；journald 另有 converge 单元日志。
 
 ### workflow 侧结论语义（DEFERRED 不判绿）
 
@@ -159,7 +160,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 2. 放弃的上限参数（次数/天数）无法从任何第一性推导：录制时长分布没有先验，任何上限都是猜测，猜小了回到意图丢失，猜大了等于没有上限。
 3. 「只告警不放弃」的持续成本有界：每轮尝试是忙锁预算内的等待循环，等待不持任何锁，对录制与同主机其他服务零影响；告警有 24h 节流。
 
-配套：人工放弃 = 人工将 `status` 置 `abandoned`（或删除意图文件），RUNBOOK 记载确切命令；这是**人的显式决定**，不是系统的猜测。`interrupted` 也不自动重试（生产状态未证，与 rc=4 同语义，人工核对后重置）。
+配套：人工停止 pending 意图重放 = 将 `status` 置 `abandoned`，但保留记录作为单调身份水位。删除记录会放行旧 run，除非已证明旧 workflow run 不可再触发。workflow 文件重建导致 run_number 重置时，不能靠 abandoned / 删除让低编号接管；应恢复原 workflow 身份并触发更大编号 run，无法做到时先暂停部署并另行制定可验证的迁移。`interrupted` 也不自动重试（生产状态未证，与 rc=4 同语义，人工核对后处置）。
 
 ## 6. 范围与爆炸半径
 

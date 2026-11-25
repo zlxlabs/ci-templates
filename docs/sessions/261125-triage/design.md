@@ -21,9 +21,9 @@
 
 ### #104
 - 现有 `~/.d3-converge/intents/<stem>.json` 升级为该目录「最新已接纳请求」的唯一记录；在线部署即使没有 pending 也写入。只有延期请求带可重放载荷。
-- 在线路径：拿齐忙锁与主机锁后、首次线上变更前，短持 intents.lock 比较 `(run_number, run_attempt)`；记录中的更大则以专用 rc 拒绝，不做任何变更；否则原子写入自己。
-- 延期写入走同一比较，所以新版本上线后才到的旧请求会被拒。
-- 重放：子脚本拿齐部署锁后，核对记录仍是自己这条且可执行；不是则以同一专用 rc 退出，converge 记 superseded 事件，且不改动已属于别人的记录。
+- 在线路径：拿齐忙锁与主机锁后、首次线上变更前，短持 intents.lock 比较 `(run_number, run_attempt)`；较新身份返回 rc=6、记 superseded，不做线上变更；否则原子写入 `status=admitted` 的无载荷记录。写入失败返回 rc=7 并 fail closed。
+- 延期写入走同一比较，所以新版本上线后才到的旧请求会被拒；同身份且现有状态为 `pending` / `running` 时重送为幂等 no-op，而 `admitted` 状态的同身份延期重送须写出可重放 `pending` 载荷。
+- 重放：收敛器固化部署脚本时一并固化匹配的 `deferred_intent.sh`，缺少伴侣的旧脚本不执行、置 failed 并 P1 告警。收敛器先将记录置为 running；子脚本拿齐部署锁后，核对记录仍是自己的 running 身份且可执行；不是则以 rc=6 退出，converge 记 superseded 事件，且不改动已属于别人的记录。
 - 已接纳的新版本部署失败并回滚后，旧意图不复活；记录不倒退。接纳之前（构建、预拉）失败则旧意图仍可执行。
 - 同一身份重送幂等。rc=3（忙锁）、superseded、部署失败三者的 rc 与事件可区分；workflow 对 superseded 不报成功。
 - 锁序：忙锁 → 主机锁 → intents.lock；部署进行中不持 intents.lock；converge 等部署锁前先释放 intents.lock。
@@ -39,8 +39,8 @@
 
 ## 关键不变式
 
-1. [待实现] 已快照并在等锁的旧重放，在新版本接纳后不触发任何 compose 变更；`scripts/deferred_intent.sh`，由 `tests/test_deferred_admission.py` 用真实 flock 锁死。
-2. [待实现] 记录的 `(run_number, run_attempt)` 在同一 workflow 序列内不倒退，含新版本失败回滚后；同上。
+1. [已实现] 已快照并等锁的旧重放，在新版本接纳后不触发任何 compose 变更；`scripts/deferred_intent.sh::validate_deferred_replay_admission` 与 `scripts/converge/converge.sh::process_intent`，由 `tests/test_deferred_admission.py::test_converge_rechecks_admission_after_waiting_at_real_host_lock` 用真实 flock 锁死。
+2. [已实现] 记录的 `(run_number, run_attempt)` 在同一 workflow 序列内不倒退，含新版本失败回滚后；`scripts/deferred_intent.sh::_admit_online_locked` / `_write_deferred_intent_locked`，由 `tests/test_deferred_admission.py::test_new_online_run_rejects_older_run_before_compose_or_state_change` 与 `test_deferred_old_run_after_new_online_admission_is_rejected` 锁死。
 3. [待实现] 未开启 deferred_deploy 时不读写 `~/.d3-converge`；`tests/test_deferred_intent.py`。
 4. [待实现] 项目外容器、命名卷不影响重建判定；`tests/test_release_config_files.py`。
 5. [待实现] 探测模板经真实 Docker 模板引擎渲染后能被解析出全部 bind 源；同上。
@@ -49,9 +49,9 @@
 
 | 资源 | 写入方 | 读取方 | 守卫 | 文件:行 |
 | --- | --- | --- | --- | --- |
-| intents/<stem>.json | 延期写入；本批新增在线接纳 | converge | intents.lock | scripts/deferred_intent.sh:108 |
+| intents/<stem>.json | 在线接纳与延期写入；converge 状态回写 | converge、在线部署 | intents.lock（持有期间不部署） | scripts/deferred_intent.sh；scripts/converge/converge.sh |
 | intents/<stem>.json | converge 状态回写 | converge、人工 | intents.lock | scripts/converge/converge.sh:341 |
-| 忙锁与主机锁 | pull_and_deploy | pull_and_deploy | flock 8 → 9 | scripts/pull_and_deploy.sh:735 |
+| 忙锁与主机锁 | pull_and_deploy | pull_and_deploy | flock 8 → 9；之后短持 intents.lock | scripts/pull_and_deploy.sh:735 |
 | last_good_tag | do_deploy | do_deploy、回滚 | 主机锁 | scripts/pull_and_deploy.sh:650 |
 | 配置文件与 last_good_release | release_deploy | release_files_skip_forward | 主机锁 | scripts/release_deploy.sh:623 |
 

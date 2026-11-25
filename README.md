@@ -291,6 +291,8 @@ timer enable，步骤见 [`scripts/converge/README.md`](scripts/converge/README.
 是 system 级，enable 需要 root；root 之后的收敛器工件更新随每次部署 run 自动下发，
 无需 root）。未 enable 时意图只是躺在盘上、不会重放，延期通知会升级为 **P1**。
 
+每个部署目录的意图文件也是「最新已接纳请求」记录：在线部署在持 busy lock、主机锁后、首次线上变更前写入 `status=admitted`，该记录不含重放载荷，收敛器将其视为终态。延期请求写入 `pending` 并携带脚本与环境快照。run 序号按 `(run_number, run_attempt)` 单调比较；已接纳 B 后手工重跑旧 run A 会被锁内 admission 拒绝（rc=6），不调用 compose、不改 `last_good_tag`，workflow 会提示改用新触发的 run。`rc=7` 表示 admission 状态未能可靠写入，部署同样不会开始，需修复主机状态后触发新 run。
+
 **延期通知的级别**（按意图持久化结果与 timer 状态分流，未开启本开关的延期不发卡）：
 
 | 意图标记 | timer 状态 | 级别 | 含义与处置 |
@@ -305,8 +307,8 @@ timer enable，步骤见 [`scripts/converge/README.md`](scripts/converge/README.
 
 ```bash
 ls -l ~/.d3-converge/intents/          # 每个部署目录一个意图文件（<stem>.json）
-cat ~/.d3-converge/intents/*.json      # status: pending→running→deployed/failed/interrupted
-cat ~/.d3-converge/events.jsonl        # append-only 历史（accepted/superseded/deployed/…）
+cat ~/.d3-converge/intents/*.json      # pending→running→deployed/failed/interrupted；在线已接纳为 admitted
+cat ~/.d3-converge/events.jsonl        # append-only 历史（accepted/admitted/superseded/deployed/…）
 journalctl -u d3-converge.service      # 收敛器执行日志
 ```
 
@@ -339,9 +341,11 @@ journalctl -u d3-converge.service      # 收敛器执行日志
 |---|---|---|---|---|
 | `rc=0` | 新版本已上线、通过健康探针**且通过三段镜像对账** | `deployed`（已部署）或 `skipped_already_deployed`（已是 last-good） | 新版本，已验证在应答 | 无需动作 |
 | `rc=1` | 新版本探针失败，**或**前向 pull/retag/compose up 失败；已回滚到 last_good，且**回滚后的同预算探针已通过** | `rolled_back` | `last_good` 且已验证 | 不需要紧急上机。前向失败触发时日志含 `rollback triggered by forward deploy failure` |
-| `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | Agent 从 GitHub run 处理，空闲后重跑 |
+| `rc=3` | busy-lock 门禁超时，本次延期，未替换容器 | —（部署未进入回执终结路径） | 上一版本，完全未动 | 默认路径空闲后重跑；opt-in 且 `intent: accepted` 时由主机自动收敛，不要重跑 |
 | `rc=4` | 新版本探针失败或前向部署失败之后：`rollback_safety=safe` 时已回滚但同预算探针未证实旧版应答（或回滚动作本身失败）；非 `safe` 时自动回滚未执行（守卫同时覆盖探针失败与前向失败） | `rollback_unhealthy`（safe）/ `rollback_skipped_<safety>`（非 safe） | safe：旧版是否应答未证实；非 safe：生产状态未证实 | safe：先确认生产是否应答；非 safe：确认生产状态并决定是否手动回滚 |
 | `rc=5` | 探针已过、`last_good` 已推进、镜像对账失败 | `reconcile_failed` | 新版本在跑但身份未证明 | **立即上机核对**，不自动回滚，不要重跑 |
+| `rc=6` | 已有更新身份接纳，本次旧 run 被 superseded | —（部署未开始） | 当前已接纳版本保持不变 | 不要 re-run 这个旧 run；触发新的 workflow run |
+| `rc=7` | latest admission 未能可靠写入 | —（部署未开始） | 当前已接纳版本保持不变 | 修复 `~/.d3-converge` 写入 / 锁问题后触发新 run |
 | `rc=130` | 收到 `INT` / `TERM` / `HUP`（仅 release lane 有此码） | —（仅 release lane 定义） | 发布可能被中断，状态需确认 | 立即确认远端状态 |
 | `rc=255` | SSH 传输层失败 | —（远端脚本未必执行） | 未知；若远端已推进，不能据此假设未上线 | 重跑；若本 run 早前出过 `255`，存疑就上机确认 |
 | 其他前向非零码 | pull/retag/compose 失败，且**没有**可回滚的 `prev_good`（≠ 本次 GIT_SHA） | `deploy_failed` | 未发生回滚，生产状态未证实 | 按失败处置并确认主机 |

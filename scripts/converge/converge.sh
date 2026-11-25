@@ -258,13 +258,18 @@ LAST_DEPLOY_RC=0
 
 run_deploy_script_capture() {
   local script="$1" json="$2"
-  local key val
+  local key val script_ref companion_ref
   local -a env_cmd
   env_cmd=(env -i "PATH=${PATH}" "HOME=${HOME}")
   for key in "${DEPLOY_ENV_KEYS[@]}"; do
     val="$(json_get "$json" "$key")"
     env_cmd+=("${key}=${val}")
   done
+  script_ref="$(json_get "$json" script_ref)"
+  companion_ref="deferred_intent.${script_ref#pull_and_deploy.}"
+  env_cmd+=("INTENT_FILE_ENABLED=true" "D3_DEFERRED_REPLAY=true")
+  env_cmd+=("D3_RUN_NUMBER=$(json_get "$json" run_number)" "D3_RUN_ATTEMPT=$(json_get "$json" run_attempt)")
+  env_cmd+=("D3_DEPLOY_SCRIPT=${script}" "D3_DEFERRED_INTENT_SCRIPT=${SCRIPTS_DIR}/${companion_ref}")
   set +e
   "${env_cmd[@]}" bash "$script"
   LAST_DEPLOY_RC=$?
@@ -321,7 +326,7 @@ maybe_stale_alert() {
 process_intent() {
   local file="$1" json status run_number run_attempt script_ref webhook
   local notify_on_success repo git_sha attempts now snapshot_run snapshot_attempt
-  local script_path rc
+  local script_path companion_ref companion_path rc
 
   if ! acquire_intents_lock; then
     return 0
@@ -339,7 +344,7 @@ process_intent() {
   now="$(now_iso)"
 
   case "$status" in
-    deployed|failed|interrupted|abandoned)
+    admitted|deployed|failed|interrupted|abandoned)
       release_intents_lock
       return 0
       ;;
@@ -363,6 +368,23 @@ process_intent() {
       ;;
   esac
 
+  script_path="${SCRIPTS_DIR}/${script_ref}"
+  case "$script_ref" in
+    pull_and_deploy.*.sh) companion_ref="deferred_intent.${script_ref#pull_and_deploy.}" ;;
+    *) companion_ref="" ;;
+  esac
+  companion_path="${SCRIPTS_DIR}/${companion_ref}"
+  if [ -n "$companion_ref" ] && [ -f "$script_path" ] && [ ! -f "$companion_path" ]; then
+    set_status "$file" failed "$now"
+    append_event "$(printf '{\"event\":\"legacy-script-rejected\",\"run_number\":%s,\"run_attempt\":%s,\"at\":%s}' "${run_number:-0}" "${run_attempt:-0}" "$(json_quote "$now")")"
+    release_intents_lock
+    notify P1 \
+      "旧版延期部署脚本已拒绝" \
+      "run #${run_number} 的固化脚本缺少锁内接纳校验，未执行且已置终态。请用新触发的 run 重建意图。repo=${repo} sha=${git_sha}" \
+      "$webhook" || true
+    return 0
+  fi
+
   snapshot_run="$run_number"
   snapshot_attempt="$run_attempt"
   attempts="${attempts:-0}"
@@ -372,7 +394,6 @@ process_intent() {
     "$snapshot_run" "$snapshot_attempt" "$attempts" "$(json_quote "$now")")"
   release_intents_lock
 
-  script_path="${SCRIPTS_DIR}/${script_ref}"
   rc=127
   case "$script_ref" in
     ""|*/*)
@@ -414,6 +435,16 @@ process_intent() {
           "部署意图已上线" \
           "run #${snapshot_run} 的部署意图已由主机自动上线，探针+对账通过。repo=${repo} sha=${git_sha}" \
           "$webhook" || true
+      fi
+      ;;
+    6)
+      if [ "$(json_get "$json" status)" = "running" ]; then
+        set_status "$file" failed "$now"
+        append_event "$(printf '{\"event\":\"failed\",\"run_number\":%s,\"run_attempt\":%s,\"rc\":6,\"at\":%s}' "$snapshot_run" "$snapshot_attempt" "$(json_quote "$now")")"
+        release_intents_lock
+        notify P1 "自动部署失败" "自动部署失败（rc=6，部署脚本明确失败），不再自动重试，需人工处置。repo=${repo} run=#${snapshot_run} sha=${git_sha}" "$webhook" || true
+      else
+        release_intents_lock
       fi
       ;;
     3)
