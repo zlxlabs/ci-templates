@@ -2,7 +2,10 @@
 
 import json
 import os
+import shutil
 import subprocess
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import pytest
@@ -48,7 +51,8 @@ def normalize_file_package(tmp_path, sha, compose_bytes, conf_bytes):
     return manifest_path, tar_path
 
 
-def mock_file_install_docker(path, log, mount_source, *, compose_file, inspect_fail=False):
+def mock_file_install_docker(path, log, mount_source, *, compose_file, inspect_fail=False,
+                             recreate_fail=False):
     inspect_branch = (
         'if [ "$1" = inspect ] && [[ "$*" == *"Config.Labels"* ]]; then exit 9; fi'
         if inspect_fail else
@@ -65,6 +69,10 @@ fi'''.replace("MOUNT_SOURCE", mount_source)
         path,
         f'''#!/bin/bash
 printf '%s\\n' "$*" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" --force-recreate "* ]] && {'true' if recreate_fail else 'false'}; then exit 7; fi
+if [ "$1" = compose ] && [[ " $* " == *" ps -q "* ]] && [[ " $* " != *" --status "* ]]; then
+  printf 'cid-mounted\\ncid-unbound\\n'; exit 0
+fi
 if [ "$1" = compose ]; then printf '%s\\n' "${{COMPOSE_FILE-unset}}" >> "{compose_file}"; fi
 if [ "$1" = ps ] && [ "$2" = "-q" ]; then
   printf 'cid-mounted\\ncid-unbound\\n'; exit 0
@@ -174,7 +182,11 @@ printf '200'
     assert "[release][config-rollback] sha=abc123456789 result=restored" in out
     assert live_compose.read_bytes() == b"services:\n  frontend: {}\n  backend: {}\n"
     assert live_conf.read_bytes() == b"known good conf\n"
-    assert len([line for line in log.read_text().splitlines() if "up -d" in line]) == 4
+    deploy_commands = log.read_text().splitlines()
+    assert len([line for line in deploy_commands if "up -d" in line]) == 4
+    forced = [line for line in deploy_commands if "--force-recreate" in line]
+    assert len(forced) == 2
+    assert all("--force-recreate frontend" in line for line in forced)
 
 
 def test_same_sha_live_mismatch_forbids_skip_forward(tmp_path):
@@ -402,6 +414,86 @@ def test_bind_mount_inspect_failure_is_not_treated_as_no_match(tmp_path):
     assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
 
 
+def test_compose_project_list_failure_is_not_treated_as_no_bind(tmp_path):
+    docker = tmp_path / "docker"
+    log = tmp_path / "docker.log"
+    write_exec(
+        docker,
+        f'''#!/bin/bash
+printf '%s\\n' "$*" >> "{log}"
+if [ "$1" = compose ] && [[ " $* " == *" ps -q "* ]]; then exit 7; fi
+if [ "$1" = ps ] && [ "$2" = "-q" ]; then exit 0; fi
+exit 0
+''',
+    )
+    script = '''source "$1"
+log() { printf '[release] %s\\n' "$*" >&2; }
+release_files_init
+DEPLOY_DIR="$2"
+DOCKER_BIN="$3"
+REPLACED_FILE_PATHS=(managed.conf)
+find_bound_services
+'''
+    result = subprocess.run(
+        ["bash", "-c", script, "bash", str(REPO_ROOT / "scripts" / "release_files.sh"),
+         str(tmp_path), str(docker)],
+        capture_output=True, text=True,
+    )
+
+    assert result.returncode != 0, result.stdout + result.stderr
+    assert "could not list running containers for bind-mount detection" in result.stderr
+    assert "compose ps -q" in log.read_text()
+
+
+def test_unresolvable_bind_source_fails_with_path_before_compose_up(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "nginx").mkdir()
+    missing_source = str(tmp_path / "missing-bind-source.conf")
+    manifest_path, tar_path = normalize_file_package(
+        tmp_path, "abc123456789", b"services: {}\n", b"release config\n",
+    )
+    env.update(RELEASE_MANIFEST=str(manifest_path), RELEASE_FILES_TAR=str(tar_path))
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, missing_source,
+        compose_file=tmp_path / "compose-env.log",
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert f"could not resolve inspected bind source: {missing_source}" in out
+    assert "compose ps -q" in log.read_text()
+    assert not any(" up -d" in line for line in log.read_text().splitlines())
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
+def test_force_recreate_failure_has_release_config_recreate_marker(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "nginx").mkdir()
+    live_conf = deploy / "nginx" / "nginx.conf"
+    manifest_path, tar_path = normalize_file_package(
+        tmp_path, "abc123456789",
+        b"services:\n  frontend: {}\n  backend: {}\n",
+        b"release config\n",
+    )
+    env.update(RELEASE_MANIFEST=str(manifest_path), RELEASE_FILES_TAR=str(tar_path))
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()),
+        compose_file=tmp_path / "compose-env.log", recreate_fail=True,
+    )
+
+    result = run(env)
+    out = result.stdout + result.stderr
+
+    assert result.returncode != 0, out
+    assert "release-config-recreate" in out
+    assert "services frontend" in out
+    assert not (Path(env["STATE_DIR"]) / "last_good_release").exists()
+
+
 def test_helper_source_has_no_load_time_actions(tmp_path):
     helper = REPO_ROOT / "scripts" / "release_files.sh"
     before = set(tmp_path.iterdir())
@@ -453,3 +545,162 @@ def test_exit_cleanup_removes_only_exact_remote_release_files(tmp_path):
     assert not remote_tar.exists()
     assert neighboring_lib.read_text() == "keep"
     neighboring_lib.unlink()
+
+
+def test_compose_project_bind_detection_uses_real_docker_format_output(tmp_path):
+    docker = shutil.which("docker")
+    if not docker:
+        pytest.skip("Docker CLI unavailable; real --format rendering is exercised on ubuntu-latest")
+
+    deploy = tmp_path / "deploy"
+    config = deploy / "nginx" / "nginx.conf"
+    config.parent.mkdir(parents=True)
+    config.write_text("managed config\n")
+    other_bind = tmp_path / "other.conf"
+    other_bind.write_text("unrelated bind\n")
+    prefix_bind = deploy / "ng"
+    prefix_bind.mkdir()
+    rendered_log = tmp_path / "rendered.bin"
+    docker_log = tmp_path / "docker-argv.log"
+    containers = {
+        "project-frontend": {
+            "service": "frontend",
+            "mounts": [{"Type": "bind", "Source": str(config)}],
+        },
+        "project-backend": {
+            "service": "backend",
+            "mounts": [
+                {"Type": "volume", "Source": "/unreachable/named-volume"},
+                {"Type": "bind", "Source": str(other_bind)},
+            ],
+        },
+        "project-migrate": {
+            "service": "migrate",
+            "mounts": [{"Type": "bind", "Source": str(config)}],
+        },
+        "project-directory-bind": {
+            "service": "frontend-directory",
+            "mounts": [{"Type": "bind", "Source": str(config.parent)}],
+        },
+        "project-prefix-bind": {
+            "service": "prefix",
+            "mounts": [{"Type": "bind", "Source": str(prefix_bind)}],
+        },
+        "outside-container": {
+            "service": "outside",
+            "mounts": [{"Type": "bind", "Source": str(config)}],
+        },
+    }
+
+    class DockerAPI(BaseHTTPRequestHandler):
+        def do_GET(self):
+            if self.path == "/_ping":
+                body = b"OK"
+            else:
+                container_id = self.path.split("/containers/", 1)[1].removesuffix("/json")
+                container = containers[container_id]
+                body = json.dumps({
+                    "Id": container_id,
+                    "Config": {"Labels": {
+                        "com.docker.compose.service": container["service"],
+                    }},
+                    "Mounts": container["mounts"],
+                }).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *_args):
+            pass
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), DockerAPI)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    wrapper = tmp_path / "docker-wrapper"
+    write_exec(
+        wrapper,
+        f'''#!/bin/bash
+printf '%s\\n' "$*" >> "{docker_log}"
+if [[ "$1" == "compose" && " $* " == *" ps -q "* ]]; then
+  printf 'project-frontend\\nproject-backend\\nproject-migrate\\nproject-directory-bind\\nproject-prefix-bind\\n'
+  exit 0
+fi
+if [[ "$1 $2" == "ps -q" ]]; then
+  printf 'project-frontend\\nproject-backend\\nproject-migrate\\noutside-container\\n'
+  exit 0
+fi
+output="$("{docker}" "$@")" || exit $?
+printf '%s\\n\\0' "$output" >> "{rendered_log}"
+printf '%s\\n' "$output"
+''',
+    )
+    env = dict(os.environ)
+    env.update(
+        DOCKER_BIN=str(wrapper),
+        DOCKER_HOST=f"tcp://127.0.0.1:{server.server_port}",
+    )
+    script = '''source "$1"
+log() { printf '[release] %s\\n' "$*" >&2; }
+release_files_init
+DEPLOY_DIR="$2"
+DOCKER_BIN="$3"
+ONESHOT_SERVICES=migrate
+REPLACED_FILE_PATHS=(nginx/nginx.conf)
+find_bound_services || exit $?
+printf 'SERVICES=%s\\n' "${FORCE_RECREATE_SERVICES[*]}"
+'''
+    try:
+        result = subprocess.run(
+            ["bash", "-c", script, "bash", str(REPO_ROOT / "scripts" / "release_files.sh"),
+             str(deploy), str(wrapper), str(config)],
+            env=env, capture_output=True, text=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout == "SERVICES=frontend frontend-directory\n"
+    assert "compose ps -q" in docker_log.read_text()
+    assert "SERVICES=outside" not in result.stdout
+    expected_rendered = (
+        f"frontend\n{config}\n\0"
+        f"backend\n{other_bind}\n\0"
+        f"migrate\n{config}\n\0"
+        f"frontend-directory\n{config.parent}\n\0"
+        f"prefix\n{prefix_bind}\n\0"
+    ).encode()
+    assert rendered_log.read_bytes() == expected_rendered
+    assert b"\\n" not in rendered_log.read_bytes()
+
+
+def test_same_sha_with_managed_config_runs_full_apply_again(tmp_path):
+    env, log = base(tmp_path)
+    deploy = Path(env["DEPLOY_DIR"])
+    (deploy / "nginx").mkdir()
+    live_conf = deploy / "nginx" / "nginx.conf"
+    live_conf.write_bytes(b"initial conf\n")
+    manifest_path, tar_path = normalize_file_package(
+        tmp_path, "abc123456789",
+        b"services:\n  frontend: {}\n  backend: {}\n",
+        b"expected conf\n",
+    )
+    env.update(RELEASE_MANIFEST=str(manifest_path), RELEASE_FILES_TAR=str(tar_path))
+    mock_file_install_docker(
+        Path(env["DOCKER_BIN"]), log, str(live_conf.resolve()),
+        compose_file=tmp_path / "compose-env.log",
+    )
+
+    first = run(env)
+    assert first.returncode == 0, first.stdout + first.stderr
+    log.write_text("")
+    second = run(env)
+    out = second.stdout + second.stderr
+
+    assert second.returncode == 0, out
+    assert "skip forward deploy" not in out
+    assert len([line for line in log.read_text().splitlines() if " up -d" in line]) == 2
+    forced = [line for line in log.read_text().splitlines() if "--force-recreate" in line]
+    assert len(forced) == 1
+    assert "--force-recreate frontend" in forced[0]

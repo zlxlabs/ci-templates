@@ -162,14 +162,22 @@ install_release_files() {
 }
 
 find_bound_services() {
-  local running="" container output service source source_real target target_real relpath
+  local tag="${1:-${D3_RELEASE_TAG:-}}"
+  local running="" container output service source source_real source_prefix target target_real relpath
   FORCE_RECREATE_SERVICES=()
   [[ "${#REPLACED_FILE_PATHS[@]}" -gt 0 ]] || return 0
-  running="$("$DOCKER_BIN" ps -q)" || { log "could not list running containers for bind-mount detection" >&2; return 1; }
-  declare -A seen_services=()
+  local compose_args=(compose)
+  if [[ -f "$DEPLOY_DIR/.env" ]]; then compose_args+=(--env-file "$DEPLOY_DIR/.env"); fi
+  if [[ -n "${ENV_FILE:-}" && -f "$ENV_FILE" ]]; then compose_args+=(--env-file "$ENV_FILE"); fi
+  running="$(cd "$DEPLOY_DIR" && D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${compose_args[@]}" ps -q)" || {
+    log "could not list running containers for bind-mount detection" >&2
+    return 1
+  }
+  declare -A seen_services=() oneshot_services=()
+  for service in ${ONESHOT_SERVICES:-}; do oneshot_services["$service"]=1; done
   while IFS= read -r container; do
     [[ -n "$container" ]] || continue
-    output="$("$DOCKER_BIN" inspect "$container" --format '{{index .Config.Labels "com.docker.compose.service"}}{{range .Mounts}}{{printf "\\n%s" .Source}}{{end}}')" || {
+    output="$("$DOCKER_BIN" inspect "$container" --format '{{index .Config.Labels "com.docker.compose.service"}}{{range .Mounts}}{{if eq .Type "bind"}}{{printf "\n%s" .Source}}{{end}}{{end}}')" || {
       log "docker inspect failed during bind-mount detection for $container" >&2
       return 1
     }
@@ -177,21 +185,21 @@ find_bound_services() {
     local inspect_lines=()
     readarray -t inspect_lines <<< "$output"
     service="${inspect_lines[0]:-}"
+    [[ "$service" =~ ^[A-Za-z0-9_.-]+$ ]] || {
+      log "running container $container has no valid docker compose service label" >&2
+      return 1
+    }
+    [[ -z "${oneshot_services[$service]+x}" ]] || continue
     for source in "${inspect_lines[@]:1}"; do
       [[ -n "$source" ]] || continue
-      source_real="$(realpath -e -- "$source")" || { log "could not resolve inspected mount source: $source" >&2; return 1; }
+      source_real="$(realpath -e -- "$source")" || { log "could not resolve inspected bind source: $source" >&2; return 1; }
       for relpath in "${REPLACED_FILE_PATHS[@]}"; do
         target="$DEPLOY_DIR/$relpath"
         target_real="$(realpath -e -- "$target")" || { log "could not resolve replaced release file: $relpath" >&2; return 1; }
-        if [[ "$source_real" == "$target_real" ]]; then
-          [[ "$service" =~ ^[A-Za-z0-9_.-]+$ ]] || {
-            log "running container $container has no valid docker compose service label" >&2
-            return 1
-          }
-          if [[ -z "${seen_services[$service]+x}" ]]; then
-            seen_services["$service"]=1
-            FORCE_RECREATE_SERVICES+=("$service")
-          fi
+        source_prefix="${source_real%/}"
+        if [[ ( "$source_real" == "$target_real" || "$target_real" == "$source_prefix/"* ) && -z "${seen_services[$service]+x}" ]]; then
+          seen_services["$service"]=1
+          FORCE_RECREATE_SERVICES+=("$service")
         fi
       done
     done
@@ -271,7 +279,10 @@ compose_release() {
       compose_rc=0
       (cd "$DEPLOY_DIR" || exit 200; D3_RELEASE_TAG="$tag" "$DOCKER_BIN" "${force_args[@]}") || compose_rc=$?
       (( compose_rc != 200 )) && MUTATED=1
-      (( compose_rc == 0 )) || return "$compose_rc"
+      if (( compose_rc != 0 )); then
+        log "release-config-recreate failed for services ${selected_services[*]} (rc=${compose_rc})" >&2
+        return "$compose_rc"
+      fi
     fi
   fi
   check_pending || return 130
@@ -302,7 +313,7 @@ deploy_group() {
   install_release_files "$sha" || return 1
   verify_live_files || return 1
   if [[ "$ROLLBACK_MODE" -eq 1 && "${#FILE_PATHS[@]}" -gt 0 ]]; then echo "[release][config-rollback] sha=$sha result=restored"; fi
-  find_bound_services || return 1
+  find_bound_services "$sha" || return 1
   report_compose_override
   compose_release "$sha" || return 1
 }
@@ -336,6 +347,17 @@ release_files_deploy_current() {
 
 release_files_skip_forward() {
   [[ "$CURRENT_FILE_STAGE_FAILED" -eq 0 ]] || return 1
+  local relpath
+  for relpath in "${FILE_PATHS[@]}"; do
+    if ! is_compose_file_path "$relpath"; then
+      if ! verify_live_files; then
+        log "same-SHA live release files mismatched; skip-forward is forbidden, redeploying"
+      else
+        log "same-SHA release declares managed config files; skip-forward is forbidden, redeploying"
+      fi
+      return 1
+    fi
+  done
   if verify_live_files; then return 0; fi
   log "same-SHA live release files mismatched; skip-forward is forbidden, redeploying"
   return 1
