@@ -79,7 +79,7 @@ JSON，schema_version 1，与 `last_deploy_result.json` 同风格（原子写：
 
 ### 单调判定：`(run_number, run_attempt)` 字典序
 
-所有接纳写入（在线与延期）共用同一 `intents/<stem>.json` 最新身份记录，并按 `(run_number, run_attempt)` 字典序比较。在线部署拿齐忙锁与主机锁后、首次线上变更前持 `intents.lock`：若现有身份更大，记录 `superseded` 事件并返回专用 rc=6；否则原子写入一个 `status=admitted` 的终态水位记录（不带重放载荷），再释放 intents.lock 开始部署。接纳写入失败返回 rc=7 并 fail closed，不执行部署。延期写入同样拒绝更大身份，但仍返回既有 rc=3；较新身份原子替换为带载荷的 `pending` 记录。完全相同身份重送为幂等 no-op，不重写记录、不重复追加事件。在线 B 被接纳后，即使部署失败并回滚，记录也不倒退；手工重跑较旧 A（拿到在线锁后）被拒，workflow 明确要求触发新 run。
+所有接纳写入（在线与延期）共用同一 `intents/<stem>.json` 最新身份记录，并按 `(run_number, run_attempt)` 字典序比较。在线部署拿齐忙锁与主机锁后、首次线上变更前持 `intents.lock`：若现有身份更大，记录 `superseded` 事件并返回专用 rc=6；否则原子写入一个 `status=admitted` 的终态水位记录（不带重放载荷），再释放 intents.lock 开始部署。接纳写入失败返回 rc=7 并 fail closed，不执行部署。延期写入同样拒绝更大身份，但仍返回既有 rc=3；较新身份原子替换为带载荷的 `pending` 记录。相同身份且现有状态为 `pending` / `running` 时，延期重送是幂等 no-op；若相同身份的在线接纳状态为 `admitted`（例如 SSH 255 后 workflow 重试再遇忙锁），延期写入必须改写为携带载荷的 `pending` 并固化脚本，不能把 `admitted` 假报成可重放的 accepted。在线 B 被接纳后，即使部署失败并回滚，记录也不倒退；手工重跑较旧 A（拿到在线锁后）被拒，workflow 明确要求触发新 run。
 
 - **拍板 run 序号，否决 git 提交时间**：commit 时间可伪造、rebase/force-push 后旧 commit 的 author/commit time 可晚于新 commit；deferred 的 re-run 还是同一个 commit。GitHub run 序列才是「发布意图」的真实顺序。
 - **否决 run 侧 created_at 时间戳比较**：runner/主机时钟漂移可在数秒级乱序，恰好落在两个连续 deferred run 的窗口内（#130/#131 相隔 17 分钟尚安全，但不能依赖时钟）。

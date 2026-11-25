@@ -534,6 +534,7 @@ file=~/.d3-converge/intents/<stem>.json   # stem 即文件名，ls intents/ 可�
 - **caller workflow 文件重建 / 重命名导致 run_number 重置**：新意图的
   `(run_number, run_attempt)` 小于已接纳记录时会被拒绝（延期侧 `intent: superseded`；在线侧 rc=6），即使旧记录状态为 `abandoned` 也一样。不得删除或置 `abandoned` 来“放低水位”，那会放行仍可重跑的旧 run。优先恢复原 workflow 文件身份并触发一个 run number 更大的新 run；若编号已经重置，暂停该目录部署并另行制定可证明旧 run 已失效的迁移方案，不在本机制下强行接管。该场景不做机器自动甄别（设计稿「已否决备选方案汇总」末行）。
 - **关闭 `deferred_deploy`（opt-out）**：先持 `intents.lock` 将当前 pending 意图置 `abandoned`，确认收敛器不再重放；保留这条记录作为身份水位，再从 caller 删除 `deferred_deploy: true`。若更新版本 B 已接纳，手工 re-run 更旧的 run A 会在忙锁与主机锁后被拒（rc=6、无 compose / last-good 变更）；workflow 明确提示“不要重跑旧 run，改用新触发的 workflow run”。
+- **latest identity 字段损坏**（`run_number` / `run_attempt` 任一无法解析为正整数）：在线 rc=7、延期写入标 `intent: write-failed`，两者都保留原记录且不部署；先暂停并确认旧 workflow runs 已终止且不可重跑，持 `intents.lock` 备份并移走损坏记录，再触发新的高编号 run 重建有效水位，不可在旧 run 仍可执行时直接删除。
 
 **回滚点**：caller 把 `deferred_deploy: true` 一行删掉即回到人工 re-run 模式
 （存量意图按上文处置命令清理）。主机侧 `systemctl disable --now d3-converge.timer`

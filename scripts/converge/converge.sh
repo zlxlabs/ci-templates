@@ -438,7 +438,14 @@ process_intent() {
       fi
       ;;
     6)
-      release_intents_lock
+      if [ "$(json_get "$json" status)" = "running" ]; then
+        set_status "$file" failed "$now"
+        append_event "$(printf '{\"event\":\"failed\",\"run_number\":%s,\"run_attempt\":%s,\"rc\":6,\"at\":%s}' "$snapshot_run" "$snapshot_attempt" "$(json_quote "$now")")"
+        release_intents_lock
+        notify P1 "自动部署失败" "自动部署失败（rc=6，部署脚本明确失败），不再自动重试，需人工处置。repo=${repo} run=#${snapshot_run} sha=${git_sha}" "$webhook" || true
+      else
+        release_intents_lock
+      fi
       ;;
     3)
       set_status "$file" pending "$now"

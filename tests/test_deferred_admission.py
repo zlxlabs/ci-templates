@@ -6,6 +6,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 from test_deferred_intent import _events_path, _intent_env, _intent_path, _load_intent
 from test_pull_and_deploy import (
     REPO_ROOT,
@@ -126,6 +128,86 @@ def test_online_deploy_admits_identity_before_first_compose_and_is_idempotent(tm
     assert second.returncode == 0, second.stdout + second.stderr
     assert _events_path(env).read_text().splitlines() == events_before
     assert json.loads(path.read_text())["status"] == "admitted"
+
+
+def test_same_identity_deferred_retry_replaces_online_admission_with_payload(tmp_path):
+    """SSH 255 重试撞忙锁时，同身份 admitted 必须变成可重放 pending。"""
+    env = _with_deferred_identity(_intent_env(tmp_path), 215)
+    env["BUSY_LOCK_TIMEOUT"] = "2"
+    latest = tmp_path / "same-identity-latest"
+    running = tmp_path / "same-identity-running"
+    docker_log = Path(env["DOCKER_LOG"])
+    _write_exec(Path(env["DOCKER_BIN"]), _stateful_docker(docker_log, latest, running))
+    online = _run(env)
+    assert online.returncode == 0, online.stdout + online.stderr
+    assert json.loads(_intent_path(env).read_text())["status"] == "admitted"
+
+    ready = Path(env["BUSY_LOCK_FILE"] + ".same-identity")
+    holder = _hold_lock(Path(env["BUSY_LOCK_FILE"]), "-s", ready)
+    try:
+        retried = _run(env)
+    finally:
+        holder.terminate()
+        holder.wait()
+
+    assert retried.returncode == 3, retried.stdout + retried.stderr
+    assert "[deploy][evidence] intent: accepted" in retried.stdout
+    pending = json.loads(_intent_path(env).read_text())
+    assert pending["status"] == "pending"
+    assert pending["run_number"] == 215
+    assert pending["run_attempt"] == 1
+    assert pending["deploy_env"]["GIT_SHA"] == env["GIT_SHA"]
+    assert pending["script_ref"]
+    script = Path(env["HOME"]) / ".d3-converge" / "scripts" / pending["script_ref"]
+    companion = script.with_name("deferred_intent." + script.name.removeprefix("pull_and_deploy."))
+    assert script.is_file()
+    assert companion.is_file()
+    bindir = Path(env["DOCKER_BIN"]).parent
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+    replay = _run_converge(env)
+    assert replay.returncode == 0, replay.stdout + replay.stderr
+    assert json.loads(_intent_path(env).read_text())["status"] == "deployed"
+
+
+@pytest.mark.parametrize("mode", ["online", "deferred"])
+@pytest.mark.parametrize("field", ["run_number", "run_attempt"])
+def test_malformed_identity_watermark_fails_closed(tmp_path, mode, field):
+    """身份字段损坏时在线 rc=7、延期 write-failed，均保留原记录字节。"""
+    env = _with_deferred_identity(_intent_env(tmp_path), 275)
+    env["BUSY_LOCK_TIMEOUT"] = "2"
+    producer = _run(env)
+    assert producer.returncode == 0, producer.stdout + producer.stderr
+    path = _intent_path(env)
+    before = path.read_bytes()
+    events_before = _events_path(env).read_bytes()
+    original = f'"{field}":{275 if field == "run_number" else 1}'.encode()
+    replacement = f'"{field}":"not-positive"'.encode()
+    damaged, count = before.replace(original, replacement, 1), before.count(original)
+    assert count == 1
+    path.write_bytes(damaged)
+    compose_before = [line for line in Path(env["DOCKER_LOG"]).read_text().splitlines() if line.startswith("compose up -d")]
+
+    target_run, target_attempt = (276, 1) if field == "run_number" else (275, 2)
+    _with_deferred_identity(env, target_run, target_attempt)
+    if mode == "deferred":
+        ready = Path(env["BUSY_LOCK_FILE"] + ".malformed-watermark")
+        holder = _hold_lock(Path(env["BUSY_LOCK_FILE"]), "-s", ready)
+        try:
+            result = _run(env)
+        finally:
+            holder.terminate()
+            holder.wait()
+        assert result.returncode == 3, result.stdout + result.stderr
+    else:
+        result = _run(env)
+        assert result.returncode == 7, result.stdout + result.stderr
+
+    assert "[deploy][evidence] intent: write-failed" in result.stdout
+    assert path.read_bytes() == damaged
+    assert _events_path(env).read_bytes() == events_before
+    assert [line for line in Path(env["DOCKER_LOG"]).read_text().splitlines() if line.startswith("compose up -d")] == compose_before
+    if mode == "deferred":
+        assert not (Path(env["HOME"]) / ".d3-converge" / "scripts").exists()
 
 
 def test_new_online_run_rejects_older_run_before_compose_or_state_change(tmp_path):
@@ -365,6 +447,30 @@ def test_converge_rechecks_admission_after_waiting_at_real_host_lock(tmp_path):
     current = json.loads(_intent_path(env).read_text())
     assert current["run_number"] == 241
     assert current["status"] == "admitted"
+
+
+def test_replay_rc6_for_same_running_intent_becomes_failed_p1(tmp_path):
+    """真实部署命令 rc=6 且身份仍属 running 时，终态为 failed/P1 而非下轮 interrupted/P0。"""
+    env = _with_deferred_identity(_intent_env(tmp_path), 245)
+    webhook = "https://open.feishu.cn/open-apis/bot/v2/hook/admission-rc6-test"
+    curl_log = tmp_path / "rc6-curl-argv"
+    _write_exec(Path(env["CURL_BIN"]), f"#!/bin/bash\nprintf '%s\\n' \\\"$@\\\" > '{curl_log}'\nprintf 200\n")
+    docker_log = Path(env["DOCKER_LOG"])
+    failing_docker = _mock_docker_matrix(docker_log, fail_compose_on=1).replace("exit 23", "exit 6")
+    _write_exec(Path(env["DOCKER_BIN"]), failing_docker)
+    _seed_deferred(env, 245, webhook=webhook)
+    bindir = Path(env["DOCKER_BIN"]).parent
+    env["PATH"] = f"{bindir}{os.pathsep}{env['PATH']}"
+
+    result = _run_converge(env)
+    assert result.returncode == 0, result.stdout + result.stderr
+    intent = json.loads(_intent_path(env).read_text())
+    assert intent["status"] == "failed"
+    rows = [json.loads(line) for line in _events_path(env).read_text().splitlines()]
+    failed = [row for row in rows if row["event"] == "failed"]
+    assert failed[-1]["rc"] == 6
+    assert "P1" in curl_log.read_text()
+    assert webhook not in result.stdout + result.stderr
 
 
 def test_converge_rejects_legacy_script_without_admission_companion(tmp_path):

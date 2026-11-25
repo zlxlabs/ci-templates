@@ -114,7 +114,7 @@ _release_intent_lock() {
 # leaves the published intent + its script unchanged. superseded does not install.
 # After a successful replace, delete the displaced intent's script_ref in-lock.
 _write_deferred_intent_locked() {
-  local existing_run existing_attempt now notify_json run_id_json result
+  local existing_run existing_attempt existing_status now notify_json run_id_json result
   local event_line tmp script_ref companion_ref scripts_dir dest companion_dest old_script_ref=""
 
   if [ -f "$intent_path" ]; then
@@ -124,6 +124,12 @@ _write_deferred_intent_locked() {
     existing_attempt="${existing_attempt%%$'\n'*}"
     old_script_ref="$(sed -n 's/.*"script_ref":"\([^"]*\)".*/\1/p' "$intent_path" 2>/dev/null)" || old_script_ref=""
     old_script_ref="${old_script_ref%%$'\n'*}"
+    existing_status="$(sed -n 's/.*"status":"\([^"]*\)".*/\1/p' "$intent_path" 2>/dev/null)" || existing_status=""
+    existing_status="${existing_status%%$'\n'*}"
+    if ! is_positive_integer "$existing_run" || ! is_positive_integer "$existing_attempt"; then
+      _intent_write_failed
+      return 0
+    fi
     if is_positive_integer "$existing_run" && is_positive_integer "$existing_attempt"; then
       if [ "$existing_run" -gt "$run_number" ] || { [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -gt "$run_attempt" ]; }; then
         now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')" || now=""
@@ -136,7 +142,7 @@ _write_deferred_intent_locked() {
         echo "[deploy][evidence] intent: superseded"
         return 0
       fi
-      if [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -eq "$run_attempt" ]; then
+      if [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -eq "$run_attempt" ] && { [ "$existing_status" = "pending" ] || [ "$existing_status" = "running" ]; }; then
         echo "[deploy][evidence] intent: accepted"
         return 0
       fi
@@ -270,6 +276,10 @@ _admit_online_locked() {
     existing_attempt="${existing_attempt%%$'\n'*}"
     old_script_ref="$(sed -n 's/.*"script_ref":"\([^"]*\)".*/\1/p' "$intent_path" 2>/dev/null)" || old_script_ref=""
     old_script_ref="${old_script_ref%%$'\n'*}"
+    if ! is_positive_integer "$existing_run" || ! is_positive_integer "$existing_attempt"; then
+      _intent_write_failed
+      return 7
+    fi
     if is_positive_integer "$existing_run" && is_positive_integer "$existing_attempt"; then
       if [ "$existing_run" -gt "$run_number" ] || { [ "$existing_run" -eq "$run_number" ] && [ "$existing_attempt" -gt "$run_attempt" ]; }; then
         now="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"

@@ -22,7 +22,7 @@
 ### #104
 - 现有 `~/.d3-converge/intents/<stem>.json` 升级为该目录「最新已接纳请求」的唯一记录；在线部署即使没有 pending 也写入。只有延期请求带可重放载荷。
 - 在线路径：拿齐忙锁与主机锁后、首次线上变更前，短持 intents.lock 比较 `(run_number, run_attempt)`；较新身份返回 rc=6、记 superseded，不做线上变更；否则原子写入 `status=admitted` 的无载荷记录。写入失败返回 rc=7 并 fail closed。
-- 延期写入走同一比较，所以新版本上线后才到的旧请求会被拒；同身份重送为幂等 no-op。
+- 延期写入走同一比较，所以新版本上线后才到的旧请求会被拒；同身份且现有状态为 `pending` / `running` 时重送为幂等 no-op，而 `admitted` 状态的同身份延期重送须写出可重放 `pending` 载荷。
 - 重放：收敛器固化部署脚本时一并固化匹配的 `deferred_intent.sh`，缺少伴侣的旧脚本不执行、置 failed 并 P1 告警。收敛器先将记录置为 running；子脚本拿齐部署锁后，核对记录仍是自己的 running 身份且可执行；不是则以 rc=6 退出，converge 记 superseded 事件，且不改动已属于别人的记录。
 - 已接纳的新版本部署失败并回滚后，旧意图不复活；记录不倒退。接纳之前（构建、预拉）失败则旧意图仍可执行。
 - 同一身份重送幂等。rc=3（忙锁）、superseded、部署失败三者的 rc 与事件可区分；workflow 对 superseded 不报成功。
