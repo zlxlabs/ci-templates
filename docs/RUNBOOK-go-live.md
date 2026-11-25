@@ -541,7 +541,22 @@ file=~/.d3-converge/intents/<stem>.json   # stem 即文件名，ls intents/ 可�
 （需 root）会让意图不再重放——**先撤 caller 的 opt-in，再 disable timer**；顺序反
 过来会出现「延期继续写意图但永不重放、每张卡都是 P1」的窗口。
 
-## 阶段 6：收尾 —— BACKLOG 重评触发条件巡检
+## 阶段 6：单镜像部署凭据迁入 GitHub Environment（可选）
+
+本阶段适用于调用 `build-deploy.yml` 的单镜像服务；不涉及 `build-deploy-release.yml`，也不替业务仓迁移凭据。Environment 名称由 caller 的 `with.environment` 传入，实际绑定在 reusable workflow 的 `build-deploy` job 上。未传或传空串时不绑定 Environment，旧路径不变。
+
+### 动作（顺序不可换）
+
+1. 在业务仓设置中预先创建目标 GitHub Environment，并把允许部署的分支限制为默认分支。不要依赖拼写错误后自动创建的 Environment：自动创建的空 Environment 没有保护规则。
+2. 将需要迁移的部署凭据添加为该 Environment 的 secrets。`CI_TEMPLATES_PAT` 当前没有消费点，不必迁移。
+3. caller 的 `with:` 增加 `environment: <准确的 Environment 名>`。caller 仍须在 `secrets:` 中逐名显式映射原有 secret 名称；不要改成 `inherit`。Environment secret 与映射的 caller secret 同名时，Environment 值优先。必需 secret 的声明不校验值是否非空。
+4. 在默认分支触发 workflow，确认 job 绑定到预期 Environment 且部署成功；不要输出或回显 secret 值。确认之后再删除对应的仓级 secret 副本。非默认分支被 Environment 保护规则拒绝是预期行为。
+
+**验证点**：省略 `environment` 与传 `environment: ""` 都不绑定 Environment；传入正确名称时唯一的 `build-deploy` job 绑定到该 Environment。检查 caller 仍显式传了所需 secret 名称，且 Environment 保护规则只允许默认分支。
+
+**回滚点**：从 caller 的 `with:` 删除 `environment`（或设为空串）即可恢复不绑定 Environment 的行为。迁移验证完成前保留仓级 secret 副本；若已删除且需要回滚，先恢复仓级 secret，再移除 `environment`。
+
+## 阶段 7：收尾 —— BACKLOG 重评触发条件巡检
 
 **动作**：过一遍 [docs/BACKLOG.md](BACKLOG.md) 里每条「接受不修」事项的重评
 触发条件，对照阶段 1-4 实际观察到的情况（canary 探针失败频率、忙锁延期频率、

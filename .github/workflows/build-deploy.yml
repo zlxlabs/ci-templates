@@ -124,6 +124,11 @@ on:
         required: false
         default: "self"
         type: string
+      environment:
+        description: "Optional GitHub Environment for deployment secrets and protection rules"
+        required: false
+        default: ""
+        type: string
     # EXPLICIT secrets only — least privilege. Do NOT add `inherit`.
     secrets:
       ACR_USERNAME:
@@ -159,6 +164,7 @@ concurrency:
 
 jobs:
   build-deploy:
+    environment: ${{ inputs.environment }}
     # Same runs-on ternary shape as zlxlabs/gate's gate-v2.yml `gate` job's
     # control_runner mapping — `self` routes to the general-purpose `ci` lane
     # (`["self-hosted","linux","x64","ci"]`), NOT `codex` (agent_review lane

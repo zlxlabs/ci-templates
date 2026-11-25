@@ -182,6 +182,29 @@ jobs:
       CI_TEMPLATES_PAT: ${{ secrets.CI_TEMPLATES_PAT }} # 仓库已公开，当前版本此 secret 保留但未使用，传任意占位值即可
 ```
 
+### 部署凭据使用 GitHub Environment（可选）
+
+单镜像 caller 可在 `with:` 中传 `environment`，让模板唯一的 `build-deploy` job 绑定到对应的
+GitHub Environment；不传或传空串都不绑定 Environment，保持原有行为。`build-deploy-release.yml`
+不在本特性范围内。
+
+```yaml
+    with:
+      environment: production
+    secrets:  # secret 仍须由 caller 显式逐名传递，不能省略或改成 inherit
+      ACR_USERNAME: ${{ secrets.ACR_USERNAME }}
+      # ...其余显式 secret 同上...
+```
+
+caller 仍须显式传入每个 secret 名称；同名时，绑定的 Environment secret 值优先于 caller 传来的
+secret 值。`environment` 是可选字符串，不会校验它是否非空：拼错名称时 GitHub 会自动创建一个
+没有保护规则的空 Environment，因此**先在仓库设置中创建 Environment，并把部署分支限制为默认分支**，
+再让 workflow 使用它。只把需要的部署凭据迁入 Environment；验证新路径后，才删除对应的仓级
+secret 副本。`CI_TEMPLATES_PAT` 当前没有消费点，不必为本功能迁移。
+
+推荐迁移顺序：预建并限制 Environment → 迁入凭据 → caller 加 `environment` 并验证默认分支部署
+→ 确认凭据取值正确后删除仓级副本。不要先删除仓级凭据再验证。
+
 ### 触发条件与 `paths-ignore`（可选）
 
 默认情况下，`main` 上的每次 push 都会触发部署，包括只改文档或账本的提交。是否配置
