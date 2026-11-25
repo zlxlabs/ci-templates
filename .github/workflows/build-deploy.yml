@@ -164,6 +164,10 @@ concurrency:
 
 jobs:
   build-deploy:
+    # Empty/omitted input = no Environment binding (measured on GitHub Actions,
+    # 2026-11-25: zlxlabs/ci-infra-canary run 45598056601, jobs `omitted` and
+    # `empty` both succeeded, created no deployment, read repo-level secrets;
+    # results table in #106). Existing callers that omit it are unaffected.
     environment: ${{ inputs.environment }}
     # Same runs-on ternary shape as zlxlabs/gate's gate-v2.yml `gate` job's
     # control_runner mapping — `self` routes to the general-purpose `ci` lane
